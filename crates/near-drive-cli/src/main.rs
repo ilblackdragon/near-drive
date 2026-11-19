@@ -6,6 +6,7 @@
 //! near-cli's keychain, and transactions are signed and sent by `near`
 //! (see `nearcli.rs`). Run with no subcommand, or with missing arguments, in a
 //! terminal to be asked for them.
+mod daemon;
 mod interactive;
 mod nearcli;
 
@@ -72,9 +73,33 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
+#[derive(clap::Args, Clone)]
+struct ProxyArgs {
+    #[arg(long, default_value = "127.0.0.1:9000")]
+    listen: std::net::SocketAddr,
+    /// S3 access key (default: generated once and stored in <home>/s3-proxy.json).
+    #[arg(long, env = "NEAR_DRIVE_S3_ACCESS_KEY", requires = "secret_key")]
+    access_key: Option<String>,
+    #[arg(long, env = "NEAR_DRIVE_S3_SECRET_KEY", requires = "access_key", hide_env_values = true)]
+    secret_key: Option<String>,
+    /// Extra namespace to show in ListBuckets; repeatable.
+    #[arg(long = "bucket")]
+    buckets: Vec<String>,
+    /// Store keys under this prefix unencrypted (public data); repeatable.
+    #[arg(long = "public-prefix")]
+    public_prefixes: Vec<String>,
+    /// Largest single request body (PUT / part) accepted, in MiB.
+    #[arg(long, default_value_t = 5120)]
+    max_body_mib: usize,
+    /// Region reported by GetBucketLocation.
+    #[arg(long, default_value = "us-east-1")]
+    region: String,
+}
+
 #[derive(Subcommand, Clone)]
 enum Cmd {
     /// List files under a prefix (default: your whole namespace).
+    /// Paths without `near://` are in your own namespace: `docs/` = `near://<you>/docs/`.
     Ls { uri: Option<String> },
     /// Download a file (to stdout when no destination is given).
     Get {
@@ -84,7 +109,8 @@ enum Cmd {
         #[arg(long)]
         range: Option<String>,
     },
-    /// Upload a file (or `-` for stdin).
+    /// Upload a file (or `-` for stdin): `put notes.txt` stores
+    /// `near://<you>/notes.txt`; `put notes.txt docs/` stores `docs/notes.txt`.
     Put {
         src: Option<String>,
         uri: Option<String>,
@@ -155,28 +181,18 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Run a local S3-compatible endpoint (loopback only) backed by NEAR Drive.
-    /// boto3 / aws-cli: set endpoint_url=http://127.0.0.1:9000 and the printed keys.
+    /// Start the local S3-compatible endpoint in the background (loopback only).
+    /// boto3 / aws-cli: endpoint_url=http://127.0.0.1:9000 and the printed keys.
+    Up {
+        #[command(flatten)]
+        proxy: ProxyArgs,
+    },
+    /// Stop the background S3 endpoint started by `up`.
+    Down,
+    /// Run the local S3-compatible endpoint in the foreground (what `up` runs).
     S3Proxy {
-        #[arg(long, default_value = "127.0.0.1:9000")]
-        listen: std::net::SocketAddr,
-        /// S3 access key (default: generated once and stored in <home>/s3-proxy.json).
-        #[arg(long, env = "NEAR_DRIVE_S3_ACCESS_KEY", requires = "secret_key")]
-        access_key: Option<String>,
-        #[arg(long, env = "NEAR_DRIVE_S3_SECRET_KEY", requires = "access_key", hide_env_values = true)]
-        secret_key: Option<String>,
-        /// Extra namespace to show in ListBuckets; repeatable.
-        #[arg(long = "bucket")]
-        buckets: Vec<String>,
-        /// Store keys under this prefix unencrypted (public data); repeatable.
-        #[arg(long = "public-prefix")]
-        public_prefixes: Vec<String>,
-        /// Largest single request body (PUT / part) accepted, in MiB.
-        #[arg(long, default_value_t = 5120)]
-        max_body_mib: usize,
-        /// Region reported by GetBucketLocation.
-        #[arg(long, default_value = "us-east-1")]
-        region: String,
+        #[command(flatten)]
+        proxy: ProxyArgs,
     },
 }
 
@@ -194,6 +210,8 @@ fn menu() -> Vec<interactive::Choice<Cmd>> {
         choice(Cmd::Keygen { ckd: false, random: false, ckd_contract: None, ckd_domain: None }, "keygen      - Create your encryption key"),
         choice(Cmd::PublishKey, "publish-key - Let others share files with you"),
         choice(Cmd::Gateways, "gateways    - List registered gateways"),
+        choice(Cmd::Up { proxy: ProxyArgs::default() }, "up          - Start the local S3 endpoint (background)"),
+        choice(Cmd::Down, "down        - Stop the local S3 endpoint"),
         choice(Cmd::Logout, "logout      - Remove the NEAR Drive session key"),
     ]
 }
@@ -205,6 +223,14 @@ struct Ctx {
     network_prompted: bool,
     account: Option<String>,
     p: Prompter,
+}
+
+/// `near://ns/path` as is; anything else is a path in `account`'s namespace.
+fn resolve_uri(s: &str, account: &str) -> Result<NearUri> {
+    if s.starts_with("near://") {
+        return Ok(NearUri::parse(s)?);
+    }
+    Ok(NearUri::parse(&format!("near://{account}/{}", s.trim_start_matches('/')))?)
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -359,7 +385,7 @@ impl Ctx {
     /// picked from a listing when the answer ends with `/`.
     async fn object_uri(&mut self, value: Option<String>, msg: &str, c: &Client) -> Result<NearUri> {
         if let Some(v) = value {
-            return Ok(NearUri::parse(&v)?);
+            return resolve_uri(&v, c.account());
         }
         let start = format!("near://{}/", c.account());
         let mut s = self.p.uri(None, msg, &start, Some("end with / to pick from a listing"))?;
@@ -497,8 +523,8 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
         Cmd::Ls { uri } => {
             let c = ctx.client().await?;
             let uri = match uri {
-                Some(u) => NearUri::parse(&u)?,
-                None => NearUri::parse(&format!("near://{}/", c.account()))?,
+                Some(u) => resolve_uri(&u, c.account())?,
+                None => resolve_uri("", c.account())?,
             };
             ctx.echo(&["ls".into(), uri.to_string()]);
             for e in c.list(&uri).await? {
@@ -549,12 +575,16 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             let prompted_src = ctx.p.used;
             let uri = match uri {
                 Some(u) => u,
-                None => {
+                None if prompted_src => {
                     let start = if src == "-" { format!("near://{}/", c.account()) } else { format!("near://{}/{}", c.account(), basename(&src)?) };
                     ctx.p.uri(None, "Save as:", &start, None)?
                 }
+                None if src == "-" => bail!("missing destination path (reading from stdin)"),
+                None => String::new(),
             };
-            let uri = NearUri::parse(&uri)?;
+            // A folder (or nothing) as destination: keep the local file name.
+            let uri = if (uri.is_empty() || uri.ends_with('/')) && src != "-" { format!("{uri}{}", basename(&src)?) } else { uri };
+            let uri = resolve_uri(&uri, c.account())?;
             let public = public || (prompted_src && ctx.p.confirm("Store it unencrypted (public)?", false)?);
             let mut words = vec!["put".to_string(), src.clone(), uri.to_string()];
             if public {
@@ -591,7 +621,7 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             let account = ctx.account()?;
             let asked = uri.is_none();
             let uri = ctx.p.uri(uri, "Folder (prefix) the rule applies to:", &format!("near://{account}/"), Some("{account} matches any account id in that segment"))?;
-            let uri = NearUri::parse(&uri)?;
+            let uri = resolve_uri(&uri, &account)?;
             if uri.namespace != account {
                 bail!("you can only set rules for your own namespace ({account}), not {}", uri.namespace);
             }
@@ -727,8 +757,9 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             write_private(&out, &serde_json::to_string_pretty(&json)?)?;
             println!("{}", keys::format_public_key(&sk.verifying_key()));
         }
-        Cmd::S3Proxy { listen, access_key, secret_key, buckets, public_prefixes, max_body_mib, region } => {
-            use near_drive_s3::{backend::ClientBackend, credentials, sigv4::Credentials, Proxy, ProxyConfig};
+        Cmd::S3Proxy { proxy } => {
+            let ProxyArgs { listen, buckets, public_prefixes, max_body_mib, region, .. } = proxy.clone();
+            use near_drive_s3::{backend::ClientBackend, Proxy, ProxyConfig};
             near_drive_s3::check_loopback(&listen)?;
             tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn,near_drive_s3=info".into()))
@@ -736,27 +767,12 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
                 .init();
             let c = ctx.client().await?;
             ctx.echo(&["s3-proxy".into()]);
-            let home = ctx.drive_home()?;
-            let creds = match (access_key, secret_key) {
-                (Some(a), Some(s)) => Credentials { access_key: a, secret_key: s },
-                _ => {
-                    let path = home.join("s3-proxy.json");
-                    let (creds, created) = credentials::load_or_create(&path)?;
-                    if created {
-                        eprintln!("generated S3 credentials (saved to {}):", path.display());
-                        eprintln!("  aws_access_key_id     = {}", creds.access_key);
-                        eprintln!("  aws_secret_access_key = {}", creds.secret_key);
-                    } else {
-                        eprintln!("using S3 credentials from {} (access key {})", path.display(), creds.access_key);
-                    }
-                    creds
-                }
-            };
+            let creds = s3_credentials(ctx, &proxy)?;
             if c.x25519_public().is_none() && public_prefixes.is_empty() {
                 eprintln!("warning: no root key loaded (run `near drive keygen`); private writes will fail");
             }
             let account = c.account().to_string();
-            let mut cfg = ProxyConfig::new(creds, home.join("s3-staging"));
+            let mut cfg = ProxyConfig::new(creds, ctx.drive_home()?.join("s3-staging"));
             cfg.extra_buckets = buckets;
             cfg.public_prefixes = public_prefixes;
             cfg.max_body_bytes = max_body_mib * 1024 * 1024;
@@ -765,8 +781,37 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             eprintln!("NEAR Drive S3 proxy for {account} on http://{listen} (bucket = namespace, e.g. http://{listen}/{account}/key)");
             near_drive_s3::run(listen, proxy).await?;
         }
+        Cmd::Up { proxy } => daemon::up(ctx, proxy).await?,
+        Cmd::Down => {
+            ctx.echo(&["down".into()]);
+            daemon::down(&ctx.drive_home()?)?;
+        }
     }
     Ok(())
+}
+
+/// `--access-key/--secret-key`, else the ones in `<home>/s3-proxy.json` (created once).
+fn s3_credentials(ctx: &Ctx, proxy: &ProxyArgs) -> Result<near_drive_s3::sigv4::Credentials> {
+    if let (Some(a), Some(s)) = (&proxy.access_key, &proxy.secret_key) {
+        return Ok(near_drive_s3::sigv4::Credentials { access_key: a.clone(), secret_key: s.clone() });
+    }
+    let path = ctx.drive_home()?.join("s3-proxy.json");
+    let (creds, created) = near_drive_s3::credentials::load_or_create(&path)?;
+    if created {
+        eprintln!("generated S3 credentials (saved to {})", path.display());
+    }
+    Ok(creds)
+}
+
+impl Default for ProxyArgs {
+    fn default() -> Self {
+        #[derive(Parser)]
+        struct W {
+            #[command(flatten)]
+            a: ProxyArgs,
+        }
+        W::parse_from(["up"]).a
+    }
 }
 
 fn choose_ckd(ctx: &mut Ctx) -> Result<bool> {

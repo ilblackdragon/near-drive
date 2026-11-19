@@ -11,7 +11,7 @@ See [DESIGN.md](DESIGN.md) for the architecture and roadmap.
 | `near-drive-client` | Rust SDK: chunk + encrypt + sign, verifies everything it reads; streaming `put_file`/`get_to_file`/`get_range` for large objects |
 | `near-drive-gateway` | stateless HTTP gateway; NEAR access-key auth (RPC `view_access_key` or dev keys); blob backends fs / S3 / R2 / MinIO / HTTP blob bridge with storage classes and replication; fs or S3 (multi-gateway CAS) index; chunk cache; `?mode=locate` direct URLs; JSONL usage metering |
 | `near-drive-s3` | S3-compatible local sidecar: SigV4/SigV2 verification, aws-chunked + checksum trailers, S3 ops → native API |
-| `near-drive-cli` | the `near-drive` binary, also `near drive` (near-cli-rs extension): `login`/`logout`, `keygen [--ckd]`, `put`, `get` (streaming, `--range`, `--class`), `ls`, `rm`, `share`, `grant`, `rules`, `publish-key`, `whoami`, `gateways`, `s3-proxy`; interactive when run in a terminal. NEAR keys come from near-cli ([below](#cli-near-drive--near-drive)) |
+| `near-drive-cli` | the `near-drive` binary, also `near drive` (near-cli-rs extension): `login`/`logout`, `keygen [--ckd]`, `put`, `get` (streaming, `--range`, `--class`), `ls`, `rm`, `share`, `grant`, `rules`, `publish-key`, `whoami`, `gateways`, `up`/`down` (S3 endpoint; `s3-proxy` in the foreground); interactive when run in a terminal. NEAR keys come from near-cli ([below](#cli-near-drive--near-drive)) |
 | `near-drive-chain` | NEAR JSON-RPC views + signed function calls (small hand-rolled borsh tx builder) for `drive.near` |
 | `contracts/drive` | the `drive.near` contract: namespace rules, X25519 keys, gateway registry, credential epochs, anchors, stablecoin / NEAR Intents escrow ([docs/payments.md](docs/payments.md)) |
 
@@ -27,7 +27,10 @@ One binary, two ways to run it:
 cargo install --path crates/near-drive-cli        # installs near-drive
 near drive login                                  # pick an account; adds a NEAR Drive session key via near-cli
 near drive keygen --ckd                           # encryption key derived from the account (MPC CKD)
-near drive put ./notes.txt near://alice.near/notes.txt
+near drive put ./notes.txt docs/                  # -> near://<you>/docs/notes.txt (bare paths = your namespace)
+near drive get docs/notes.txt ./notes.txt          # other namespaces: near://bob.near/...
+near drive up                                     # local S3 endpoint in the background; prints AWS_* exports
+near drive down
 near drive                                        # no arguments: menu
 ```
 
@@ -224,13 +227,15 @@ Add a `billing` section to the gateway config to bill each prefix's `payer` in N
 - **Settlement.** `billing::settle::Settlement` is the plug-in point for the NEAR escrow settler (`settle([{payer, amount, gateway, period_id}])`). It ships with `cloud_credits` (default) and `log` (dev: logs lines, gate off) backends.
 - **Limits.** One meter reads one gateway's log, so a payer's bytes must be written and deleted through the same gateway for storage to integrate correctly. A NEAR account is billed to its personal NEAR AI Cloud organization and must have signed in to NEAR AI Cloud once; until then, writes get 402 `unknown_account`.
 
-## S3 sidecar (`near drive s3-proxy`)
+## S3 sidecar (`near drive up` / `down`)
 
 Existing S3 code (boto3, aws-cli, aws-sdk-*) can talk to NEAR Drive by changing only `endpoint_url` and the keys:
 
 ```sh
-near drive s3-proxy                       # 127.0.0.1:9000; loopback only
-#  first start prints the generated keys (stored 0600 in ~/.near-drive/s3-proxy.json)
+near drive up                             # background, 127.0.0.1:9000, loopback only; prints AWS_* exports
+#  keys generated once, stored 0600 in ~/.near-drive/s3-proxy.json; pid/log in ~/.near-drive/s3-proxy.{pid,log}
+near drive down                           # stop it
+near drive s3-proxy                       # same, in the foreground (containers, systemd); takes the same flags
 #  or: --access-key/--secret-key (env NEAR_DRIVE_S3_ACCESS_KEY / NEAR_DRIVE_S3_SECRET_KEY)
 #  --public-prefix weights/public/   store keys under that prefix unencrypted
 #  --bucket other.near               also list this namespace in ListBuckets

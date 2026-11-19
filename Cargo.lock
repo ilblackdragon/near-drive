@@ -2246,6 +2246,7 @@ dependencies = [
  "hex",
  "inquire",
  "keyring",
+ "libc",
  "near-drive-chain",
  "near-drive-ckd",
  "near-drive-client",

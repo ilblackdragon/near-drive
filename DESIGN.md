@@ -111,7 +111,7 @@ The gateway accepts the key if it is one of:
 A timestamp window of ±5 min plus a short replay cache per gateway is enough. Requests are idempotent PUT/GET/DELETE, and content-addressed chunk uploads are harmless to replay.
 
 **S3 API (SigV4)** needs a shared secret, so it runs in two modes:
-- **Local sidecar (recommended, E2E).** `near drive s3-proxy` listens on `127.0.0.1:9000`. Credentials are local config. It encrypts client-side and speaks the native API upstream with the user's NEAR key. boto3 code changes only `endpoint_url`. This is how deltaleague and holonear workers would use it.
+- **Local sidecar (recommended, E2E).** `near drive up` (background; `s3-proxy` in the foreground) listens on `127.0.0.1:9000`. Credentials are local config. It encrypts client-side and speaks the native API upstream with the user's NEAR key. boto3 code changes only `endpoint_url`. This is how deltaleague and holonear workers would use it.
 - **Hosted S3 endpoint (convenience, not E2E).** The user signs a NEP-413 "issue S3 credential" message, and the gateway returns `AKID = base32(account|scope|expiry|gw_id|nonce)`, `secret = HMAC(gateway_secret, AKID)`. This is stateless (any replica of that operator can re-derive the secret) and scoped to a path prefix. Revocation bumps a per-account `cred_epoch` in `drive.near`. Data uses gateway-side encryption, so this should only be offered by TEE-attested gateways (NEAR AI Cloud already runs CVMs). The attestation is published in the registry.
 
 ### 4.2 Namespace policy (onchain in `drive.near`)

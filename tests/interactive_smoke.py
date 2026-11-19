@@ -142,6 +142,41 @@ try:
     assert "notes.txt" not in out, out
     ok("rm: picked, confirmed, deleted")
 
+    # Bare paths are in your own namespace; a folder destination keeps the file name.
+    def nd(*args, **kw):
+        return subprocess.run([f"{BIN}/near-drive", "--no-interactive", "--network", "local", "--account", ACCOUNT, *args],
+                              env=env, cwd=t, stdin=subprocess.DEVNULL, capture_output=True, text=True, **kw)
+    r = nd("put", src, "docs/")
+    assert r.returncode == 0 and "near://alice.local/docs/notes.txt" in r.stderr, r.stderr
+    r = nd("get", "docs/notes.txt")
+    assert r.stdout == "hello from interactive mode\n", r
+    r = nd("put", src)
+    assert r.returncode == 0 and "near://alice.local/notes.txt " in r.stderr, r.stderr
+    ok("bare paths: put notes.txt docs/ -> near://alice.local/docs/notes.txt; get docs/notes.txt")
+
+    # up / down: background S3 endpoint.
+    s3_port = free_port()
+    r = nd("up", "--listen", f"127.0.0.1:{s3_port}", timeout=30)
+    assert r.returncode == 0, r.stderr
+    exports = dict(l[len("export "):].split("=", 1) for l in r.stdout.splitlines() if l.startswith("export "))
+    assert exports["AWS_ENDPOINT_URL"] == f"http://127.0.0.1:{s3_port}", r.stdout
+    r2 = nd("up", "--listen", f"127.0.0.1:{s3_port}")
+    assert r2.returncode == 0 and "already running" in r2.stderr, r2.stderr
+    import boto3
+    s3 = boto3.client("s3", endpoint_url=exports["AWS_ENDPOINT_URL"], aws_access_key_id=exports["AWS_ACCESS_KEY_ID"],
+                      aws_secret_access_key=exports["AWS_SECRET_ACCESS_KEY"], region_name="us-east-1")
+    body = s3.get_object(Bucket=ACCOUNT, Key="docs/notes.txt")["Body"].read()
+    assert body == b"hello from interactive mode\n", body
+    r = nd("down")
+    assert r.returncode == 0 and "stopped" in r.stderr, r.stderr
+    try:
+        socket.create_connection(("127.0.0.1", s3_port), timeout=1).close()
+        raise AssertionError("s3 endpoint still listening after down")
+    except OSError:
+        pass
+    assert "not running" in nd("down").stderr
+    ok("up: background S3 endpoint (boto3 reads docs/notes.txt); down stops it")
+
     # Non-interactive: a missing argument is an error, not a prompt.
     r = subprocess.run([f"{BIN}/near-drive", "--network", "local", "--account", ACCOUNT, "get"], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
     assert r.returncode != 0 and "missing" in r.stderr, r.stderr
