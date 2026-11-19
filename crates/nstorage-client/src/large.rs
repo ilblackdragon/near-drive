@@ -317,14 +317,9 @@ impl Client {
     }
 
     /// Stream the object, in order, into `w` with bounded memory.
-    pub async fn get_to_writer<W: AsyncWrite + Unpin>(&self, uri: &NearUri, mut w: W) -> Result<ObjectHead> {
+    pub async fn get_to_writer<W: AsyncWrite + Unpin>(&self, uri: &NearUri, w: W) -> Result<ObjectHead> {
         let loc = self.locate_or_404(uri).await?;
-        let opener = self.opener(&loc.manifest)?;
-        let mut s = stream::iter(0..loc.manifest.chunks.len()).map(|i| self.plain_chunk(uri, &loc, &opener, i)).buffered(self.parallelism.max(1));
-        while let Some(pt) = s.try_next().await? {
-            w.write_all(&pt).await?;
-        }
-        w.flush().await?;
+        self.write_range(uri, &loc, 0..loc.manifest.size, w).await?;
         Ok(loc.head())
     }
 
@@ -332,25 +327,36 @@ impl Client {
     /// decrypts only the chunks overlapping the range.
     pub async fn get_range(&self, uri: &NearUri, range: Range<u64>) -> Result<Vec<u8>> {
         let loc = self.locate_or_404(uri).await?;
+        let mut out = Vec::new();
+        self.write_range(uri, &loc, range, &mut out).await?;
+        Ok(out)
+    }
+
+    /// Stream plaintext bytes `[range.start, min(range.end, size))` of an
+    /// already-located object into `w`, in order, with bounded memory. Lets
+    /// callers that need the head first (e.g. to send response headers) read
+    /// exactly the version they located.
+    pub async fn write_range<W: AsyncWrite + Unpin>(&self, uri: &NearUri, loc: &Located, range: Range<u64>, mut w: W) -> Result<()> {
         let m = &loc.manifest;
         let (start, end) = (range.start.min(m.size), range.end.min(m.size));
         if start >= end {
-            return Ok(vec![]);
+            w.flush().await?;
+            return Ok(());
         }
         let opener = self.opener(m)?;
         let cs = m.chunk_size;
         let (first, last) = ((start / cs) as usize, ((end - 1) / cs) as usize);
-        let mut out = Vec::with_capacity((end - start) as usize);
-        let mut s = stream::iter(first..=last).map(|i| self.plain_chunk(uri, &loc, &opener, i)).buffered(self.parallelism.max(1));
+        let mut s = stream::iter(first..=last).map(|i| self.plain_chunk(uri, loc, &opener, i)).buffered(self.parallelism.max(1));
         let mut idx = first as u64;
         while let Some(pt) = s.try_next().await? {
             let base = idx * cs;
             let a = start.saturating_sub(base) as usize;
             let b = (end - base).min(pt.len() as u64) as usize;
-            out.extend_from_slice(&pt[a..b]);
+            w.write_all(&pt[a..b]).await?;
             idx += 1;
         }
-        Ok(out)
+        w.flush().await?;
+        Ok(())
     }
 }
 

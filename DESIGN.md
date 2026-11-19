@@ -190,12 +190,14 @@ Metered units:
 
 ## 7. `storage.near` contract (phase 2)
 
-- `register_gateway(url, regions, backends, price, attestation)` / `deregister`
-- `set_policy(rules)`, `get_policy(namespace)`
-- `set_enc_pubkey(x25519_pk)`, `get_enc_pubkey(account)`
-- `bump_cred_epoch()`
+Implemented in `contracts/storage` (method list in README.md; payments in docs/payments.md):
+
+- `register_gateway(info)` / `update_gateway` / `deregister_gateway` / `withdraw_gateway_stake` (NEAR stake, unstake delay), `list_gateways`
+- `set_rules(rules)`, `get_rules(namespace)`
+- `set_enc_key(x25519_pk)`, `get_enc_key(account)`
+- `bump_cred_epoch()`, `get_cred_epoch(account)`
 - `anchor(namespace, root, seq)`: periodic Merkle root of pointer records for rollback detection (phase 3)
-- escrow: `deposit`, `reserve`, `settle_usage`, `withdraw` (phase 2)
+- escrow: deposits via `ft_on_transfer` / `mt_on_transfer` (NEAR Intents), `set_spend_cap`, `settle`, notice-period `withdraw_balance`, `withdraw_earnings`. Prepaid reservations (`reserve`) are not implemented yet.
 
 ## 8. APIs
 

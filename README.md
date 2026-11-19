@@ -10,7 +10,10 @@ See [DESIGN.md](DESIGN.md) for the architecture and roadmap.
 | `nstorage-core` | URIs, chunked XChaCha20-Poly1305 envelope encryption, manifests, signed pointer records, request signing, namespace policy |
 | `nstorage-client` | Rust SDK: chunk + encrypt + sign, verifies everything it reads; streaming `put_file`/`get_to_file`/`get_range` for large objects |
 | `nstorage-gateway` | stateless HTTP gateway; NEAR access-key auth (RPC `view_access_key` or dev keys); blob backends fs / S3 / R2 / MinIO / HTTP blob bridge with storage classes and replication; fs or S3 (multi-gateway CAS) index; chunk cache; `?mode=locate` direct URLs; JSONL usage metering |
-| `nst` | CLI: `keygen`, `dev-key`, `put`, `get` (streaming, `--range`, `--class`), `ls`, `rm` |
+| `nstorage-s3` | S3-compatible local sidecar: SigV4/SigV2 verification, aws-chunked + checksum trailers, S3 ops → native API |
+| `nst` | CLI: `keygen`, `dev-key`, `put`, `get` (streaming, `--range`, `--class`), `ls`, `rm`, `share`, `s3-proxy`, `keygen --ckd`; chain: `grant`, `rules`, `publish-key`, `gateways` |
+| `nstorage-near` | NEAR JSON-RPC views + signed function calls (small hand-rolled borsh tx builder) for `storage.near` |
+| `contracts/storage` | the `storage.near` contract: namespace rules, X25519 keys, gateway registry, credential epochs, anchors, stablecoin / NEAR Intents escrow ([docs/payments.md](docs/payments.md)) |
 
 ## Quickstart (dev)
 
@@ -32,13 +35,52 @@ target/debug/nst get near://alice.near/memory/today.txt
 With real NEAR accounts, set `"rpc_url": "https://rpc.mainnet.near.org"` in the gateway config. Then use
 `~/.near-credentials/mainnet/<account>.json`, which needs a full-access key or a function-call key for `storage_contract`.
 
-Gateway config `policies` stands in for the `storage.near` contract until it exists. For example, an app pays for its users' data:
+With `rpc_url` set, the gateway reads namespace rules from the `storage_contract` (`get_rules`, cached 30 s; set
+`"contract_policies": false` to disable). Config `policies` entries override the contract for their namespaces, and are
+the only policy source without `rpc_url`. For example, an app pays for its users' data:
 
 ```json
 "policies": {"app.near": [
   {"prefix": "users/{account}/", "read": ["{account}"], "write": ["{account}", "app.near"], "payer": "app.near"}
 ]}
 ```
+
+The same rule onchain, plus sharing by account name (`--rpc-url` defaults per `--network`; `--contract` defaults to
+`storage.near`; `NSTORAGE_GATEWAY=auto` picks the fastest healthy gateway from the onchain registry):
+
+```sh
+nst --account app.near grant 'near://app.near/users/{account}/' --read '{account}' --write '{account},app.near' --payer app.near
+nst rules app.near
+nst --account bob.near publish-key            # set_enc_key with bob's x25519 key
+nst --account alice.near share near://alice.near/doc/x bob.near   # looks up bob's key onchain
+nst gateways
+```
+
+Onchain writes attach a NEAR deposit for storage staking (excess refunded), so they need a full-access key.
+
+## storage.near contract
+
+`contracts/` is a separate cargo workspace (wasm). Build and test:
+
+```sh
+contracts/build.sh                                   # cargo near build → contracts/target/near/*/
+cd contracts && cargo test -p nstorage-contract      # unit tests + local sandbox (near-workspaces) tests
+```
+
+Methods (JSON args; `U128` = decimal string):
+
+| area | methods |
+|---|---|
+| policy | `set_rules(rules)` (payable; caller's namespace; ≤32 rules, one `{account}` per prefix), `get_rules(namespace)` |
+| keys | `set_enc_key(key)` / `remove_enc_key()` (payable), `get_enc_key(account_id)` |
+| revocation | `bump_cred_epoch() -> u64` (payable), `get_cred_epoch(account_id) -> u64` |
+| anchors | `anchor(namespace, root, seq)` (owner or active gateway; seq strictly increasing), `get_anchor(namespace)` |
+| registry | `register_gateway(info)` (stake ≥ `gateway_min_stake` + storage), `update_gateway(info)`, `deregister_gateway()`, `withdraw_gateway_stake()` (after delay), `get_gateway(operator)`, `list_gateways(from_index, limit)`, `gateways_count()` |
+| escrow | `ft_on_transfer`, `mt_on_transfer`, `set_spend_cap(per_day)`, `settle(entries)`, `request_withdraw_balance(asset, amount)`, `cancel_withdraw_balance()`, `withdraw_balance()`, `withdraw_earnings()`, `get_payer`, `get_earnings`, `is_settled`, `get_assets`, `get_settlers` |
+| owner | `new(owner_id, assets?, config?)`, `set_config(patch)`, `set_asset(asset)`, `add_settler(account_id, any_gateway)`, `remove_settler`, `set_owner`, `get_config`, `get_owner` |
+
+`info = {url, regions, backends, price_hint, attestation?}`. See [docs/payments.md](docs/payments.md) for funding
+(USDC `ft_transfer_call`, NEAR Intents `mt_transfer_call` / signed `transfer` intent) and settlement.
 
 ## Storage backends, classes and index
 
@@ -129,13 +171,51 @@ Add a `billing` section to the gateway config to bill each prefix's `payer` in N
 - **Settlement.** `billing::settle::Settlement` is the plug-in point for the NEAR escrow settler (`settle([{payer, amount, gateway, period_id}])`). It ships with `cloud_credits` (default) and `log` (dev: logs lines, gate off) backends.
 - **Limits.** One meter reads one gateway's log, so a payer's bytes must be written and deleted through the same gateway for storage to integrate correctly. A NEAR account is billed to its personal NEAR AI Cloud organization and must have signed in to NEAR AI Cloud once; until then, writes get 402 `unknown_account`.
 
+## S3 sidecar (`nst s3-proxy`)
+
+Existing S3 code (boto3, aws-cli, aws-sdk-*) can talk to nstorage by changing only `endpoint_url` and the keys:
+
+```sh
+nst s3-proxy                       # 127.0.0.1:9000; loopback only
+#  first start prints the generated keys (stored 0600 in ~/.nstorage/s3-proxy.json)
+#  or: --access-key/--secret-key (env NSTORAGE_S3_ACCESS_KEY / NSTORAGE_S3_SECRET_KEY)
+#  --public-prefix weights/public/   store keys under that prefix unencrypted
+#  --bucket other.near               also list this namespace in ListBuckets
+```
+
+```python
+s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:9000",
+                  aws_access_key_id=AK, aws_secret_access_key=SK, region_name="us-east-1")
+s3.upload_file("ckpt.bin", "alice.near", "ckpts/step-100.bin")
+```
+
+The proxy encrypts client-side with the account's root key and signs requests with its NEAR key.
+- **Addressing.** Bucket = NEAR namespace and key = object path. Path-style URLs (`http://127.0.0.1:9000/alice.near/key`) work, and so does virtual-host style when the host is `alice.near.localhost`.
+- **Auth.** Accepted: SigV4 header and presigned auth, including signed `aws-chunked` with every chunk signature verified, `UNSIGNED-PAYLOAD` and `STREAMING-UNSIGNED-PAYLOAD-TRAILER`. `x-amz-checksum-{crc32,crc32c,crc64nvme,sha1,sha256}` and `Content-MD5` are checked. SigV2 is also accepted, because botocore < 1.36 presigns with it. Requests fail on a bad signature, a wrong key or more than 15 minutes of clock skew.
+- **Operations.**
+  - Buckets: ListBuckets, Head/Create/DeleteBucket (own namespace only, as no-ops) and GetBucketLocation.
+  - Objects: Put/Get/Head/Delete Object, with Range and the If-* conditions, plus DeleteObjects and CopyObject.
+  - Listing: ListObjects v1/v2 with prefix, delimiter, pagination and `encoding-type=url`.
+  - Multipart: Create/UploadPart/UploadPartCopy/Complete/Abort/ListParts/ListMultipartUploads. Parts are staged in `~/.nstorage/s3-staging` and uploaded with `put_file` on completion.
+  - Not supported (`NotImplemented`): ACLs, policies, tagging, versioning, lifecycle, CORS, SSE-C headers and SigV4a.
+- **Metadata.** Content-Type is kept in the manifest. `x-amz-meta-*` goes into an encrypted sidecar object `<key>.nst-s3meta`, which listings hide; keys ending in that suffix are reserved. ETag is the first 32 hex characters of the manifest cid, quoted (multipart objects have no `-N` suffix). Last-Modified comes from the record timestamp.
+- **Keys.** They must be valid nstorage paths: no empty, `.` or `..` segments and no trailing `/`. Other keys get `InvalidArgument`.
+
+`tests/boto3_smoke.sh` starts a dev gateway and the proxy and runs `tests/boto3_smoke.py`. Set `PYTHON=` to choose the boto3 install and `AWS_CLI=` to also test `aws s3 cp`.
+
 ## Tests
 
 `cargo test` runs the following:
 - unit tests;
 - a gateway+client e2e covering encryption at rest, overwrite/CAS, listing, namespace isolation, app-pays prefixes, and forged or stale record rejection;
 - `tests/streaming.rs`: streaming vs one-shot interop, ranges, storage classes, a blob bridge with direct URLs and fallback;
-- `tests/large.rs`: a large object with bounded memory.
+- `tests/large.rs`: a large object with bounded memory;
+- `crates/nstorage-s3/tests/s3_e2e.rs`: gateway + S3 proxy driven by the AWS Rust SDK (and raw signed requests for chunk signatures, trailers, skew and presigned URLs).
+- `tests/contract_policy.rs`: gateway policy from `storage.near` through a mock RPC (cache, override, failure → 503).
+
+Contract tests (`cd contracts && cargo test`, after `contracts/build.sh`; the sandbox node binary is downloaded on first
+run) include `tests/sandbox.rs` (contract flows with mock FT/MT tokens, plus the `nstorage-near` tx builder) and
+`tests/gateway_chain.rs` (a real gateway resolving keys and rules from the sandbox chain, sharing by account, discovery).
 
 To run the S3 tests against a local MinIO (bind it to localhost only):
 

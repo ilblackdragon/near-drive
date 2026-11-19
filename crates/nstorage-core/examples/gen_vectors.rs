@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     // --- root key derivations ---
-    let roots = vec![root_json(&root(0)), root_json(&root(100)), root_json(&root(200))];
+    let roots = [root_json(&root(0)), root_json(&root(100)), root_json(&root(200))];
 
     // --- uri / path encoding ---
     let uri_valid: Vec<Value> = [
