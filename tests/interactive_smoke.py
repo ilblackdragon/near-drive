@@ -181,8 +181,18 @@ try:
     laptop, desktop = os.path.join(t, "Laptop"), os.path.join(t, "Desktop")
     r = nd("sync", "add", laptop, "Shared")
     assert r.returncode == 0 and "near://alice.local/Shared/" in r.stdout, r
-    r = nd("up", "--no-s3", timeout=30)
+    r = nd("up", "--no-s3", "--file-provider", "Shared", timeout=30)
     assert r.returncode == 0 and laptop in r.stdout, r
+    # The macOS File Provider extension's API is up and answers with the token.
+    for _ in range(40):
+        if os.path.exists(os.path.join(t, "home", "provider.json")):
+            break
+        time.sleep(0.25)
+    with open(os.path.join(t, "home", "provider.json")) as f:
+        ep = json.load(f)
+    assert oct(os.stat(os.path.join(t, "home", "provider.json")).st_mode & 0o777) == "0o600"
+    req = urllib.request.Request(ep["url"] + "/v1/all", headers={"Authorization": "Bearer " + ep["token"]})
+    assert "anchor" in json.load(urllib.request.urlopen(req))
     os.makedirs(os.path.join(laptop, "plans"))
     with open(os.path.join(laptop, "plans", "q1.md"), "w") as f:
         f.write("# Q1\n")
@@ -216,7 +226,7 @@ try:
         assert "unmounted" in p.communicate(timeout=20)[1]
         assert os.listdir(mp) == []
         ok("mount: files listed, downloaded on open; Ctrl-C unmounts")
-    ok("sync: `sync add` + `up --no-s3` syncs in the background; `sync run` pulls into a second folder")
+    ok("sync: `sync add` + `up --no-s3 --file-provider` syncs in the background (provider API up); `sync run` pulls into a second folder")
 
     # Non-interactive: a missing argument is an error, not a prompt.
     r = subprocess.run([f"{BIN}/near-drive", "--network", "local", "--account", ACCOUNT, "get"], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True)

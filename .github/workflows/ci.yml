@@ -28,3 +28,20 @@ jobs:
         run: >
           cargo test --no-fail-fast -p near-drive-core -p near-drive-client -p near-drive-sync -p near-drive-mount -p near-drive-cli
           && cargo test --no-fail-fast -p near-drive-gateway --lib --test e2e --test streaming --test resilience
+
+  macos-file-provider:
+    name: macOS File Provider extension (build)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: generate Xcode project
+        run: brew install xcodegen && cd macos && xcodegen generate
+      - name: build app + extension (unsigned)
+        run: >
+          cd macos && xcodebuild -project NEARDrive.xcodeproj -target NEARDrive -configuration Debug
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: check the extension is embedded
+        run: |
+          app=$(find macos/build -name "NEARDrive.app" -type d | head -1)
+          test -f "$app/Contents/PlugIns/NEARDriveFileProvider.appex/Contents/Info.plist"
+          plutil -p "$app/Contents/PlugIns/NEARDriveFileProvider.appex/Contents/Info.plist" | grep -q com.apple.fileprovider-nonui

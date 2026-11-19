@@ -1,0 +1,62 @@
+# XcodeGen spec: `brew install xcodegen && xcodegen generate` -> NEARDrive.xcodeproj
+#
+# To run it you need an Apple Developer team: set DEVELOPMENT_TEAM and an App
+# Group you own in APP_GROUP (it must match NEAR_DRIVE_APP_GROUP for the Rust
+# background service, default group.ai.near.drive).
+name: NEARDrive
+options:
+  bundleIdPrefix: ai.near.drive
+  deploymentTarget:
+    macOS: "13.0"
+settings:
+  base:
+    APP_GROUP: group.ai.near.drive
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  NEARDrive:
+    type: application
+    platform: macOS
+    sources: [App, Shared]
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: NEAR Drive
+        LSUIElement: true
+        NEARDriveAppGroup: $(APP_GROUP)
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    entitlements:
+      path: App/NEARDrive.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.application-groups: [$(APP_GROUP)]
+    dependencies:
+      - target: NEARDriveFileProvider
+        embed: true
+  NEARDriveFileProvider:
+    type: app-extension
+    platform: macOS
+    sources: [FileProvider, Shared]
+    info:
+      path: FileProvider/Info.plist
+      properties:
+        CFBundleDisplayName: NEAR Drive
+        NEARDriveAppGroup: $(APP_GROUP)
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.fileprovider-nonui
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FileProviderExtension
+          NSExtensionFileProviderDocumentGroup: $(APP_GROUP)
+          NSExtensionFileProviderSupportsEnumeration: true
+    entitlements:
+      path: FileProvider/NEARDriveFileProvider.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+        com.apple.security.application-groups: [$(APP_GROUP)]

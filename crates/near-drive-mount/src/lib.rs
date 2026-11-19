@@ -10,6 +10,7 @@
 //! like OneDrive: the folder shows cloud icons and files download on open).
 #[cfg(windows)]
 mod cfapi;
+pub mod provider;
 #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macfuse")))]
 mod fs;
 

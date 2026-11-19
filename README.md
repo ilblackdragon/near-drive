@@ -109,7 +109,7 @@ Details: [docs/sync.md](docs/sync.md).
 Rather not download everything? Mount it instead; files download when opened:
 
 ```sh
-near drive mount ~/NEAR\ Drive           # Linux (FUSE), macOS (macFUSE / FUSE-T), Windows (Cloud Files, like OneDrive)
+near drive mount ~/NEAR\ Drive           # Linux (FUSE), Windows (Cloud Files, like OneDrive); macOS: Finder via the File Provider app
 ```
 
 Details: [docs/mount.md](docs/mount.md).

@@ -124,7 +124,7 @@ fn abs(p: &Path) -> Result<PathBuf> {
     Ok(std::path::absolute(p)?)
 }
 
-pub async fn up(ctx: &mut Ctx, proxy: ProxyArgs, no_s3: bool) -> Result<()> {
+pub async fn up(ctx: &mut Ctx, proxy: ProxyArgs, no_s3: bool, file_provider: Option<String>) -> Result<()> {
     let home = abs(&ctx.drive_home()?)?;
     std::fs::create_dir_all(&home)?;
     if let Some(st) = read_state(&home).filter(|s| alive(s.pid)) {
@@ -147,6 +147,9 @@ pub async fn up(ctx: &mut Ctx, proxy: ProxyArgs, no_s3: bool) -> Result<()> {
     let mut words = vec!["daemon".to_string(), "--listen".into(), proxy.listen.to_string()];
     if no_s3 {
         words.push("--no-s3".into());
+    }
+    if let Some(r) = &file_provider {
+        words.extend(["--file-provider".into(), r.clone()]);
     }
     for b in &proxy.buckets {
         words.extend(["--bucket".into(), b.clone()]);

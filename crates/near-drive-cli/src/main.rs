@@ -197,6 +197,10 @@ enum Cmd {
         /// Only sync folders; no S3 endpoint.
         #[arg(long)]
         no_s3: bool,
+        /// Also serve the local provider API for the macOS File Provider
+        /// extension (Finder shows the folder, files download on open).
+        #[arg(long, value_name = "REMOTE", num_args = 0..=1, default_missing_value = "Drive/")]
+        file_provider: Option<String>,
     },
     /// Stop the background service started by `up`.
     Down,
@@ -231,6 +235,8 @@ enum Cmd {
         proxy: ProxyArgs,
         #[arg(long)]
         no_s3: bool,
+        #[arg(long)]
+        file_provider: Option<String>,
     },
 }
 
@@ -279,7 +285,7 @@ fn menu() -> Vec<interactive::Choice<Cmd>> {
         choice(Cmd::Gateways, "gateways    - List registered gateways"),
         choice(Cmd::Sync { action: Some(SyncCmd::Add { dir: None, remote: None }) }, "sync add    - Keep a local folder in sync (like Dropbox)"),
         choice(Cmd::Sync { action: Some(SyncCmd::Status { json: false }) }, "sync status - Synced folders and their state"),
-        choice(Cmd::Up { proxy: ProxyArgs::default(), no_s3: false }, "up          - Start syncing + the local S3 endpoint (background)"),
+        choice(Cmd::Up { proxy: ProxyArgs::default(), no_s3: false, file_provider: None }, "up          - Start syncing + the local S3 endpoint (background)"),
         choice(Cmd::Down, "down        - Stop the local S3 endpoint"),
         choice(Cmd::Logout, "logout      - Remove the NEAR Drive session key"),
     ]
@@ -835,10 +841,15 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             ctx.echo(&["s3-proxy".into()]);
             run_s3(ctx, proxy).await?;
         }
-        Cmd::Daemon { proxy, no_s3 } => {
+        Cmd::Daemon { proxy, no_s3, file_provider } => {
             syncs::init_tracing();
             let c = std::sync::Arc::new(ctx.client().await?);
             let (home, account, network) = (ctx.drive_home()?, c.account().to_string(), ctx.network.clone());
+            // Kept alive for the life of the service.
+            let _provider = match file_provider {
+                Some(r) => Some(file_provider_api(c.clone(), &r, &home).await?),
+                None => None,
+            };
             let sync = syncs::supervise(c, home, account, network);
             if no_s3 {
                 sync.await?;
@@ -890,7 +901,7 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
                 }
             }
         }
-        Cmd::Up { proxy, no_s3 } => daemon::up(ctx, proxy, no_s3).await?,
+        Cmd::Up { proxy, no_s3, file_provider } => daemon::up(ctx, proxy, no_s3, file_provider).await?,
         Cmd::Mount { mountpoint, remote, read_only, cache_mib } => {
             if !near_drive_mount::SUPPORTED {
                 bail!("{}", if cfg!(target_os = "macos") {
@@ -927,6 +938,24 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Serve the provider API for the macOS File Provider extension and publish
+/// where to find it: `<home>/provider.json`, and on macOS the App Group
+/// container the extension can read (`NEAR_DRIVE_APP_GROUP`, default
+/// `group.ai.near.drive`).
+async fn file_provider_api(c: std::sync::Arc<near_drive_client::Client>, remote: &str, home: &std::path::Path) -> Result<near_drive_mount::provider::ProviderApi> {
+    let remote = syncs::remote_prefix(Some(remote), c.account())?;
+    let api = near_drive_mount::provider::serve(c, remote, home.join("provider-tmp")).await?;
+    near_drive_mount::provider::publish(&api.endpoint, &home.join("provider.json"))?;
+    if cfg!(target_os = "macos") {
+        let group = std::env::var("NEAR_DRIVE_APP_GROUP").unwrap_or_else(|_| "group.ai.near.drive".into());
+        if let Some(dir) = near_drive_mount::provider::app_group_dir(&group) {
+            near_drive_mount::provider::publish(&api.endpoint, &dir.join("provider.json"))?;
+        }
+    }
+    tracing::info!("file provider API for {} on {}", api.endpoint.remote, api.endpoint.url);
+    Ok(api)
 }
 
 /// The S3 endpoint (foreground `s3-proxy`, or part of the background service).
