@@ -1,0 +1,13 @@
+[package]
+name = "mock-ft"
+description = "test-only mock-ft contract for nstorage sandbox tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+repository = "https://github.com/ilblackdragon/nstorage"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk.workspace = true

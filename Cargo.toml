@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/nstorage-core", "crates/nstorage-client", "crates/nstorage-gateway", "crates/nst"]
+members = ["crates/nstorage-core", "crates/nstorage-client", "crates/nstorage-gateway", "crates/nst", "crates/nstorage-near"]
+# NEAR contracts target wasm and have their own workspace (contracts/Cargo.toml).
+exclude = ["contracts"]
 
 [workspace.package]
 version = "0.1.0"
@@ -32,3 +34,4 @@ tempfile = "3"
 nstorage-core = { path = "crates/nstorage-core" }
 nstorage-client = { path = "crates/nstorage-client" }
 nstorage-gateway = { path = "crates/nstorage-gateway" }
+nstorage-near = { path = "crates/nstorage-near" }
