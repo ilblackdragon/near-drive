@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/nstorage-core", "crates/nstorage-client", "crates/nstorage-gateway", "crates/nst"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+bs58 = "0.5"
+base64 = "0.22"
+hex = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time", "net", "io-util"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+nstorage-core = { path = "crates/nstorage-core" }
+nstorage-client = { path = "crates/nstorage-client" }
+nstorage-gateway = { path = "crates/nstorage-gateway" }

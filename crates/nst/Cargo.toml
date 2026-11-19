@@ -1,0 +1,17 @@
+[package]
+name = "nst"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+nstorage-core.workspace = true
+nstorage-client.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
