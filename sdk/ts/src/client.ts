@@ -3,7 +3,7 @@
  * everything it reads (record signature, manifest cid, chunk cids, AEAD).
  * Uses only `fetch` + Web APIs, so it runs in Node >= 20 and browsers.
  */
-import { base58, cid as cidOf, toBytes } from "./bytes.js";
+import { b64N, base58, bytesToHex, cid as cidOf, toBytes } from "./bytes.js";
 import { canonicalRequest, H_ACCOUNT, H_PUBKEY, H_SIG, H_TS } from "./auth.js";
 import { addRecipient, decryptObject, encryptFor, plaintextChunks, RootKey, type EncInfo, type Recipient } from "./crypto.js";
 import { parsePublicKey, parseSecretKey, parseX25519, publicKeyOf, sign } from "./keys.js";
@@ -56,6 +56,8 @@ export interface PutOptions {
 export interface ObjectHead {
   record: PointerRecord;
   manifest: Manifest;
+  /** Exact stored manifest bytes (base64) when the gateway provides them. */
+  manifest_raw?: string;
 }
 
 export interface ListEntry {
@@ -151,8 +153,9 @@ export class Client {
     const u = NearUri.from(uri);
     const r = await this.#send("GET", objPath(u), "");
     if (r.status === 404) return null;
-    const raw = (await (await Client.#check(r)).json()) as { record: unknown; manifest: unknown };
-    const head = { record: normalizeRecord(raw.record), manifest: normalizeManifest(raw.manifest) };
+    const raw = (await (await Client.#check(r)).json()) as { record: unknown; manifest: unknown; manifest_raw?: unknown };
+    const head: ObjectHead = { record: normalizeRecord(raw.record), manifest: normalizeManifest(raw.manifest) };
+    if (typeof raw.manifest_raw === "string") head.manifest_raw = raw.manifest_raw;
     verifyHead(u, head);
     return head;
   }
@@ -286,7 +289,16 @@ export function verifyHead(uri: NearUri, head: ObjectHead): void {
   const r = head.record;
   if (!r || r.namespace !== uri.namespace || r.path !== uri.path) throw new Error("gateway returned a record for a different object");
   verifyRecordSignature(r);
-  if (manifestCid(head.manifest) !== r.manifest_cid) throw new Error("manifest does not match record");
+  if (head.manifest_raw !== undefined) {
+    // Hash the stored bytes, not a re-serialization: robust to manifest fields
+    // this SDK does not know yet.
+    const bytes = b64N(head.manifest_raw, undefined, "manifest_raw");
+    if (cidOf(bytes) !== r.manifest_cid) throw new Error("manifest does not match record");
+    const parsed = normalizeManifest(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)));
+    if (bytesToHex(manifestToBytes(parsed)) !== bytesToHex(manifestToBytes(head.manifest))) throw new Error("manifest_raw does not match manifest");
+  } else if (manifestCid(head.manifest) !== r.manifest_cid) {
+    throw new Error("manifest does not match record");
+  }
   validateManifest(head.manifest);
   if (head.manifest.size !== r.size) throw new Error("record size does not match manifest");
 }

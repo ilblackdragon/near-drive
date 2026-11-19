@@ -62,6 +62,11 @@ pub struct Config {
     /// NEAR AI Cloud credits billing (metering, reporting, credit gate). Off when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<billing::BillingConfig>,
+    /// Browser origins allowed via CORS (e.g. `["https://app.example"]`, or
+    /// `["*"]`). Empty = no CORS headers. Requests are authenticated by NEAR
+    /// signatures, not cookies, so credentials are never allowed.
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for Config {
@@ -76,6 +81,7 @@ impl Default for Config {
             contract_policies: true,
             storage: StorageConfig::default(),
             billing: None,
+            cors_origins: Vec::new(),
         }
     }
 }
@@ -137,13 +143,48 @@ impl AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let cors = cors_layer(&state.cfg.cors_origins);
+    let r = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/chunk/{ns}/{cid}", put(put_chunk))
         .route("/v1/o/{ns}/{*path}", put(put_object).get(get_object).delete(delete_object))
         .route("/v1/list/{ns}", get(list_objects))
         .layer(DefaultBodyLimit::max(MAX_CHUNK_BYTES as usize + 1024 * 1024))
-        .with_state(state)
+        .with_state(state);
+    match cors {
+        Some(c) => r.layer(c),
+        None => r,
+    }
+}
+
+fn cors_layer(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
+    use axum::http::{header, HeaderName, HeaderValue};
+    use tower_http::cors::{AllowOrigin, CorsLayer};
+    if origins.is_empty() {
+        return None;
+    }
+    let allow = if origins.iter().any(|o| o == "*") {
+        AllowOrigin::any()
+    } else {
+        AllowOrigin::list(origins.iter().filter_map(|o| HeaderValue::from_str(o).ok()))
+    };
+    let h = |s: &'static str| HeaderName::from_static(s);
+    Some(
+        CorsLayer::new()
+            .allow_origin(allow)
+            .allow_methods([Method::GET, Method::PUT, Method::DELETE, Method::HEAD])
+            .allow_headers([
+                h(auth::H_ACCOUNT),
+                h(auth::H_PUBKEY),
+                h(auth::H_TS),
+                h(auth::H_SIG),
+                h("x-nst-class"),
+                header::CONTENT_TYPE,
+                header::RANGE,
+            ])
+            .expose_headers([header::CONTENT_RANGE, header::CONTENT_LENGTH])
+            .max_age(std::time::Duration::from_secs(600)),
+    )
 }
 
 pub struct ApiError(StatusCode, String, Option<serde_json::Value>);
@@ -255,9 +296,17 @@ async fn put_chunk(
 }
 
 async fn load_manifest(st: &AppState, cid: &str) -> Result<(Manifest, u64), ApiError> {
+    let (m, raw) = load_manifest_raw(st, cid).await?;
+    Ok((m, raw.len() as u64))
+}
+
+/// Parsed manifest plus the exact stored bytes. Responses carry the bytes as
+/// `manifest_raw` (base64) so clients hash what was signed rather than a
+/// re-serialization (robust to manifest fields a client does not know yet).
+async fn load_manifest_raw(st: &AppState, cid: &str) -> Result<(Manifest, Vec<u8>), ApiError> {
     let b = st.blobs.get(cid).await?.ok_or_else(|| err(StatusCode::BAD_REQUEST, "manifest chunk not uploaded"))?;
     let m = Manifest::from_bytes(&b).map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid manifest: {e}")))?;
-    Ok((m, b.len() as u64))
+    Ok((m, b.to_vec()))
 }
 
 async fn put_object(
@@ -353,11 +402,12 @@ async fn get_object(
         return Err(err(StatusCode::FORBIDDEN, "no read access"));
     }
     let rec = st.index.get(&ns, &path).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "not found"))?;
-    let (manifest, _) = load_manifest(&st, &rec.manifest_cid).await?;
+    let (manifest, manifest_raw) = load_manifest_raw(&st, &rec.manifest_cid).await?;
+    let manifest_raw = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &manifest_raw);
     match q.chunk {
         None if q.mode.as_deref() == Some("locate") => {
             billing::check(st.billing.as_deref(), &access.payer).await?;
-            let located = locate::locate(&st, rec, manifest).await?;
+            let located = locate::locate(&st, rec, manifest, manifest_raw).await?;
             // Chunks handed out as direct URLs bypass the gateway; meter them as
             // egress here (an upper bound: the client may fetch fewer bytes).
             let direct: u64 = located.chunks.iter().filter(|c| c.url.is_some()).map(|c| c.len).sum();
@@ -366,7 +416,7 @@ async fn get_object(
             }
             Ok(Json(located).into_response())
         }
-        None => Ok(Json(json!({"record": rec, "manifest": manifest})).into_response()),
+        None => Ok(Json(json!({"record": rec, "manifest": manifest, "manifest_raw": manifest_raw})).into_response()),
         Some(cid) => {
             billing::check(st.billing.as_deref(), &access.payer).await?;
             let len = if cid == rec.manifest_cid {

@@ -31,6 +31,9 @@ pub const CLASS_HEADER: &str = "x-nst-class";
 pub struct ObjectHead {
     pub record: PointerRecord,
     pub manifest: Manifest,
+    /// Exact stored manifest bytes (base64), when the gateway provides them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_raw: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,7 +308,15 @@ pub fn verify_head(uri: &NearUri, head: &ObjectHead) -> Result<()> {
     let r = &head.record;
     ensure!(r.namespace == uri.namespace && r.path == uri.path, "gateway returned a record for a different object");
     r.verify_signature()?;
-    ensure!(nstorage_core::cid(&head.manifest.to_bytes()) == r.manifest_cid, "manifest does not match record");
+    match &head.manifest_raw {
+        Some(raw) => {
+            use base64::Engine;
+            let raw = base64::engine::general_purpose::STANDARD.decode(raw).context("bad manifest_raw")?;
+            ensure!(nstorage_core::cid(&raw) == r.manifest_cid, "manifest does not match record");
+            ensure!(Manifest::from_bytes(&raw)? == head.manifest, "manifest_raw does not match manifest");
+        }
+        None => ensure!(nstorage_core::cid(&head.manifest.to_bytes()) == r.manifest_cid, "manifest does not match record"),
+    }
     head.manifest.validate()?;
     ensure!(head.manifest.size == r.size, "record size does not match manifest");
     Ok(())

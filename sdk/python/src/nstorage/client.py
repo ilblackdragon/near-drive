@@ -4,6 +4,7 @@ Verifies everything it reads: record signature, manifest cid, chunk cids, AEAD.
 """
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import time
@@ -53,6 +54,8 @@ class GatewayError(Exception):
 class ObjectHead:
     record: PointerRecord
     manifest: Manifest
+    #: Exact stored manifest bytes (base64) when the gateway provides them.
+    manifest_raw: Optional[str] = None
 
 
 @dataclass
@@ -74,7 +77,15 @@ def verify_head(uri: NearUri, head: ObjectHead) -> None:
     if r.namespace != uri.namespace or r.path != uri.path:
         raise ValueError("gateway returned a record for a different object")
     r.verify_signature()
-    if head.manifest.cid() != r.manifest_cid:
+    if head.manifest_raw is not None:
+        # Hash the stored bytes, not a re-serialization: robust to manifest
+        # fields this SDK does not know yet.
+        raw = base64.b64decode(head.manifest_raw, validate=True)
+        if cid(raw) != r.manifest_cid:
+            raise ValueError("manifest does not match record")
+        if Manifest.from_dict(json.loads(raw)).to_bytes() != head.manifest.to_bytes():
+            raise ValueError("manifest_raw does not match manifest")
+    elif head.manifest.cid() != r.manifest_cid:
         raise ValueError("manifest does not match record")
     head.manifest.validate()
     if head.manifest.size != r.size:
@@ -159,7 +170,12 @@ class Client:
         if r.status_code == 404:
             return None
         raw = self._check(r).json()
-        head = ObjectHead(PointerRecord.from_dict(raw.get("record")), Manifest.from_dict(raw.get("manifest")))
+        mr = raw.get("manifest_raw")
+        head = ObjectHead(
+            PointerRecord.from_dict(raw.get("record")),
+            Manifest.from_dict(raw.get("manifest")),
+            mr if isinstance(mr, str) else None,
+        )
         verify_head(u, head)
         return head
 

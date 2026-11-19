@@ -11,6 +11,10 @@ struct Env {
 }
 
 async fn start() -> Env {
+    start_cfg(|_| {}).await
+}
+
+async fn start_cfg(tweak: impl FnOnce(&mut Config)) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let mut keys = HashMap::new();
     let mut dev_keys = HashMap::new();
@@ -26,7 +30,7 @@ async fn start() -> Env {
         ]}"#,
     )
     .unwrap();
-    let cfg = Config {
+    let mut cfg = Config {
         listen: "127.0.0.1:0".into(),
         data_dir: dir.path().to_path_buf(),
         rpc_url: None,
@@ -35,6 +39,7 @@ async fn start() -> Env {
         policies,
         ..Default::default()
     };
+    tweak(&mut cfg);
     let state = AppState::new(cfg).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -212,4 +217,86 @@ async fn sharing_and_app_writes_for_user() {
     assert_eq!(rec.seq, 2);
     // gateway policy still blocks bob (no grant) -> 403; decryption alone is not access
     assert!(bob.get(&a_uri).await.unwrap_err().to_string().contains("403"));
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+async fn signed(env: &Env, account: &str, method: reqwest::Method, path: &str, body: Vec<u8>) -> reqwest::Response {
+    let h = nstorage_client::nstorage_core::auth::sign_request(account, &env.keys[account], method.as_str(), path, "", now_ms(), &body);
+    reqwest::Client::new()
+        .request(method, format!("{}{}", env.url, path))
+        .header("x-near-account", h.account)
+        .header("x-near-publickey", h.public_key)
+        .header("x-near-timestamp", h.ts_ms.to_string())
+        .header("x-near-signature", h.signature)
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A manifest written by a future client with a field today's `Manifest`
+/// does not know must still verify (clients hash `manifest_raw`, not a
+/// re-serialization).
+#[tokio::test]
+async fn forward_compatible_manifest() {
+    let env = start().await;
+    let cid = nstorage_client::nstorage_core::cid;
+    let data = b"abc".to_vec();
+    let dcid = cid(&data);
+    let manifest = format!(
+        r#"{{"version":1,"size":3,"chunk_size":1024,"chunks":[{{"cid":"{dcid}","len":3}}],"future_field":{{"x":1}}}}"#
+    )
+    .into_bytes();
+    let mcid = cid(&manifest);
+    assert_eq!(signed(&env, "alice.near", reqwest::Method::PUT, &format!("/v1/chunk/alice.near/{dcid}"), data).await.status(), 201);
+    assert_eq!(signed(&env, "alice.near", reqwest::Method::PUT, &format!("/v1/chunk/alice.near/{mcid}"), manifest.clone()).await.status(), 201);
+    let rec = PointerRecord::new_signed("alice.near", "future", &mcid, 3, 3 + manifest.len() as u64, 1, "alice.near", &env.keys["alice.near"], now_ms());
+    let resp = signed(&env, "alice.near", reqwest::Method::PUT, "/v1/o/alice.near/future", serde_json::to_vec(&rec).unwrap()).await;
+    assert_eq!(resp.status(), 201);
+
+    let alice = env.client("alice.near", None);
+    let (head, got) = alice.get(&u("near://alice.near/future")).await.unwrap();
+    assert_eq!(got, b"abc");
+    assert!(head.manifest_raw.is_some());
+    // a gateway that tampers with manifest_raw is caught
+    let mut bad = head.clone();
+    bad.manifest_raw = Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"{}"));
+    assert!(nstorage_client::verify_head(&u("near://alice.near/future"), &bad).is_err());
+}
+
+#[tokio::test]
+async fn cors_preflight() {
+    let env = start_cfg(|c| c.cors_origins = vec!["https://app.example".into()]).await;
+    let http = reqwest::Client::new();
+    let pre = http
+        .request(reqwest::Method::OPTIONS, format!("{}/v1/o/alice.near/x", env.url))
+        .header("origin", "https://app.example")
+        .header("access-control-request-method", "PUT")
+        .header("access-control-request-headers", "x-near-account,x-near-signature,x-near-publickey,x-near-timestamp")
+        .send()
+        .await
+        .unwrap();
+    assert!(pre.status().is_success());
+    assert_eq!(pre.headers()["access-control-allow-origin"], "https://app.example");
+    let other = http
+        .request(reqwest::Method::OPTIONS, format!("{}/v1/o/alice.near/x", env.url))
+        .header("origin", "https://evil.example")
+        .header("access-control-request-method", "PUT")
+        .send()
+        .await
+        .unwrap();
+    assert!(other.headers().get("access-control-allow-origin").is_none());
+    // off by default
+    let plain = start().await;
+    let r = http
+        .request(reqwest::Method::OPTIONS, format!("{}/v1/o/alice.near/x", plain.url))
+        .header("origin", "https://app.example")
+        .header("access-control-request-method", "PUT")
+        .send()
+        .await
+        .unwrap();
+    assert!(r.headers().get("access-control-allow-origin").is_none());
 }

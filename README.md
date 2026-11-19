@@ -3,7 +3,7 @@
 NEAR-account-addressed, end-to-end-encrypted object storage: `near://alice.near/path/to/object`.
 See [DESIGN.md](DESIGN.md) for the architecture and roadmap.
 
-## Phase 0 (this code)
+## Components
 
 | crate | what |
 |---|---|
@@ -137,6 +137,16 @@ dev gateway. The optional `storage` section of the gateway config sets up the fo
   - Updates are `If-Match` CAS writes.
   - A delete writes a CAS tombstone, because plain S3 DELETE is not conditional.
 - **`cache`.** A bounded, LRU, read-through chunk cache on local disk for remote backends. Chunks are checked against their cid before they are cached.
+
+## Browser access (CORS)
+
+Off by default. To let web apps call a gateway directly, list their origins in the gateway config:
+
+```json
+"cors_origins": ["https://app.example"]
+```
+
+`["*"]` allows any origin. Requests are authenticated by NEAR signatures, not cookies, so credentials are never allowed.
 
 ## Large objects
 

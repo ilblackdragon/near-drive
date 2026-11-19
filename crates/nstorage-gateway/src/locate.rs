@@ -26,12 +26,14 @@ pub struct LocatedChunk {
 pub struct Located {
     pub record: PointerRecord,
     pub manifest: Manifest,
+    /// Exact stored manifest bytes, base64.
+    pub manifest_raw: String,
     pub chunks: Vec<LocatedChunk>,
 }
 
 const LOCATE_CONCURRENCY: usize = 32;
 
-pub async fn locate(st: &AppState, record: PointerRecord, manifest: Manifest) -> anyhow::Result<Located> {
+pub async fn locate(st: &AppState, record: PointerRecord, manifest: Manifest, manifest_raw: String) -> anyhow::Result<Located> {
     let refs: Vec<(String, u64)> = manifest.chunks.iter().map(|c| (c.cid.clone(), c.len)).collect();
     let chunks = futures_util::stream::iter(refs)
         .map(move |(cid, len): (String, u64)| async move {
@@ -51,5 +53,5 @@ pub async fn locate(st: &AppState, record: PointerRecord, manifest: Manifest) ->
         .buffered(LOCATE_CONCURRENCY)
         .try_collect()
         .await?;
-    Ok(Located { record, manifest, chunks })
+    Ok(Located { record, manifest, manifest_raw, chunks })
 }

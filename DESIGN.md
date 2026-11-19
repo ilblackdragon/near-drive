@@ -1,6 +1,6 @@
 # nstorage — NEAR storage layer
 
-Status: draft v0.1 (2026-11-18)
+Status: v0.2 (2026-11-19). Phases 0–3 are implemented in this repo; see §9 for what is verified and what is not.
 
 ## 1. What it is
 
@@ -58,7 +58,9 @@ Dedup comes for free: two checkpoints that share a base layer share chunks. This
 key:   (namespace, path)
 value: {manifest_cid, size, seq, writer, writer_pk, ts, sig}
 ```
-`sig` is the writer's ed25519 signature over `(namespace, path, manifest_cid, size, seq, ts)`. Readers check it and reject a record whose writer was not authorized for that path (§4). A malicious gateway or index store can therefore *withhold* data or serve *stale* data, but it cannot forge it. Rollback protection comes from periodic onchain anchoring (phase 3).
+`sig` is the writer's ed25519 signature over
+`"nstorage-record-v1\n{namespace}\n{path}\n{manifest_cid}\n{size}\n{stored_size}\n{seq}\n{writer}\n{writer_pk}\n{ts_ms}"`.
+Gateways return the manifest's exact stored bytes as `manifest_raw` (base64), and clients hash those bytes rather than a re-serialization, so adding manifest fields later does not break older clients. Readers check it and reject a record whose writer was not authorized for that path (§4). A malicious gateway or index store can therefore *withhold* data or serve *stale* data, but it cannot forge it. Rollback protection comes from periodic onchain anchoring (phase 3).
 
 Why per-path records and not a Merkle tree per account: S3 semantics are per-object last-writer-wins. Per-path records map 1:1 onto that, avoid a write hot-spot on a single root (bad for chat and memory workloads), and keep LIST a plain prefix scan.
 
@@ -87,7 +89,7 @@ A placement policy per storage class decides where chunks go:
 |---|---|---|
 | `hot` (default) | R2/S3 ×1 + FOC warm ×1 | read from R2, durability from FOC (PDP proofs, 2 copies) |
 | `bulk` (weights) | FOC warm + FilBeam CDN | ~$2.5/TiB/mo published early pricing; per-GiB egress |
-| `shelby` | Shelby hot storage | once mainnet is live (testnet as of 2026); NEAR Intents already partners with Shelby |
+| `shelby` | Shelby hot storage | public testnet ended 2026-10-01; now an invite-only private beta with an S3-compatible API, which the bridge uses. No mainnet yet |
 | `local` | gateway filesystem | dev / tests |
 
 Users never choose a backend directly. At most they choose a class. The manifest does not record locations; locations are resolved by cid through a placement log the gateways write. Migration is therefore copy-then-update-log.
@@ -98,8 +100,9 @@ Users never choose a backend directly. At most they choose a class. The manifest
 
 **Native API.** Each request carries
 `X-Near-Account`, `X-Near-PublicKey`, `X-Near-Timestamp`, `X-Near-Signature`.
-The signature is ed25519 over
-`"nstorage-v1\n{method}\n{namespace}\n{path}\n{query}\n{ts}\n{blake3(body) or UNSIGNED}"`.
+The signature is ed25519 (base58) over
+`"nstorage-req-v1\n{METHOD}\n{url path as sent, percent-encoded}\n{raw query}\n{account}\n{public_key}\n{ts_ms}\n{hex blake3(body)}"`.
+Clients keep timestamps strictly increasing so two identical requests never share a signature (the gateway keeps a replay cache keyed by signature).
 The gateway accepts the key if it is one of:
 - a **full-access key** of the account (`view_access_key`); or
 - a **function-call key scoped to `storage.near`**. This is the recommended "storage session key". Wallets can add it without touching funds, and revoking it is a normal NEAR key deletion; or
@@ -221,19 +224,20 @@ client.share(uri, account) ; client.grant(prefix, rule)   # onchain policy tx
 
 **S3 mapping:** bucket = namespace (path-style: `http://gw/alice.near/key`), key = path. v0 supports Put/Get/Head/Delete/ListObjectsV2 and multipart.
 
-## 9. Phases
+## 9. Phases and status
 
-| Phase | Scope |
-|---|---|
-| **0 — this repo now** | Rust core (paths, chunking, encryption, manifests, signed records); gateway with native API; NEAR-key auth (RPC + dev keys); fs backend + fs index store; usage log; `nst` CLI (put/get/ls/rm) with local root key |
-| **1** | S3/R2 backend and index store (conditional writes); `nst s3-proxy` sidecar; cloud-credits billing (plus the cloud-api endpoints above); TS and Python SDKs (thin: auth, crypto, chunking); multipart + locate for weights; pilot holonear/deltaleague checkpoints through the sidecar |
-| **2** | `storage.near` contract (policy, enc pubkeys, gateway registry); FOC backend through Synapse; CKD root keys; sharing; app-pays flows |
-| **3** | NEAR Intents escrow; third-party gateways; Shelby backend; onchain anchoring; hosted TEE S3 endpoint |
+| Phase | Scope | Status |
+|---|---|---|
+| **0** | Core (paths, chunking, encryption, manifests, signed records, policy), gateway native API, NEAR-key auth, fs stores, usage log, `nst` CLI | Done |
+| **1** | S3/R2 stores with conditional writes; storage classes and replication; blob-bridge protocol (`docs/blob-bridge.md`); streaming large objects + `?mode=locate` + chunk cache; `nst s3-proxy`; cloud-credits billing (metering, reporting, 402 gate) + cloud-api endpoints; TS and Python SDKs; sharing (X25519 recipients); CORS | Done. Verified against MinIO, boto3 1.34 and 1.44, aws-cli, and a local cloud-api build. Not verified against real AWS S3/R2 or a deployed cloud-api. The cloud-api change needs a schema change in `nearai/cloud-platform` first (see its `docs/storage-billing.md`) |
+| **2** | `storage.near` contract (rules, enc keys, gateway registry, cred epochs, anchors); gateway reads rules from chain; `nst grant/rules/publish-key/gateways`, gateway discovery; CKD root keys (`nst keygen --ckd`); FOC bridge (Synapse) | Done in code. Contract verified in a local sandbox only. CKD verified against the official vectors and live read-only queries, not a real request. FOC bridge type-checked and mock-tested; no funded upload completed |
+| **3** | NEAR Intents / stablecoin escrow (`ft_on_transfer`, `mt_on_transfer`, capped `settle`, delayed withdrawals; `docs/payments.md`); Shelby bridge (S3 mode + experimental SDK mode) | Done in code; sandbox and mock tests only |
+| Not built | hosted TEE S3 endpoint; storage reservations, disputes, stake slashing; chunk garbage collection; placement log; hidden-path mode; keychain-wrapped root key cache; NEAR-escrow settler wired into billing (interface exists); prepaid storage so session keys can set rules | |
 
 ## 10. Open questions
 
 1. **Index store decentralization.** Is an operator quorum enough, or do we want the pointer records on a DA layer? This determines how "trustless" the claim can be.
-2. **CKD availability and cost.** `request_app_private_key` costs ~300 TGas per call (unverified third-party figure). That is fine once per device, but check mainnet availability and the exact interface.
+2. **CKD.** Resolved from the near/mpc source (docs/ckd.md): `v1.signer` / `v1.signer-prod.testnet`, 1 yoctoNEAR deposit and ≥15 TGas, about 0.0015 NEAR per call. Plain accounts can call it; function-call (session) keys cannot, because they can't attach the deposit. Still unverified with a real transaction.
 3. **Retention for unpaid data.** Grace period, then delete? Applies when credits run out.
 4. **Dedup vs privacy for weights.** Is convergent encryption acceptable inside a group?
 5. **Hosted S3 endpoint.** Is the TEE requirement acceptable, or do we offer only the sidecar?

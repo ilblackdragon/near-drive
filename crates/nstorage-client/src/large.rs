@@ -33,13 +33,15 @@ pub struct LocatedChunk {
 pub struct Located {
     pub record: PointerRecord,
     pub manifest: Manifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_raw: Option<String>,
     #[serde(default)]
     pub chunks: Vec<LocatedChunk>,
 }
 
 impl Located {
     pub fn head(&self) -> ObjectHead {
-        ObjectHead { record: self.record.clone(), manifest: self.manifest.clone() }
+        ObjectHead { record: self.record.clone(), manifest: self.manifest.clone(), manifest_raw: self.manifest_raw.clone() }
     }
 
     fn direct_url(&self, idx: usize) -> Option<&str> {
