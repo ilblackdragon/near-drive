@@ -1,12 +1,12 @@
-# Paying for storage: `storage.near` escrow
+# Paying for storage: `drive.near` escrow
 
 Phase 2 of DESIGN.md §6. Payers keep a stablecoin balance in the
-`storage.near` escrow. Approved settlers (the billing service, or gateway
+`drive.near` escrow. Approved settlers (the billing service, or gateway
 operators billing their own usage) charge it for metered usage, and the money
 goes to the serving gateway's earnings.
 
-Source: `contracts/storage/src/escrow.rs`. Tests: `contracts/storage/src/tests.rs`
-(unit) and `contracts/storage/tests/sandbox.rs` (local sandbox, with a mock
+Source: `contracts/drive/src/escrow.rs`. Tests: `contracts/drive/src/tests.rs`
+(unit) and `contracts/drive/tests/sandbox.rs` (local sandbox, with a mock
 NEP-141 token and a mock NEP-245 intents contract).
 
 ## Units and assets
@@ -17,10 +17,10 @@ NEP-141 token and a mock NEP-245 intents contract).
   `usd_micro * 10^(d-6)` token units. USDC has 6 decimals, so 1 micro-USD is
   1 USDC unit.
 - **Asset ids** say where the tokens are held:
-  - `nep141:<token>`: the token is held directly by storage.near, for example
+  - `nep141:<token>`: the token is held directly by drive.near, for example
     `nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1`
     (native USDC on mainnet);
-  - `nep245:<mt contract>:<token id>`: storage.near's own balance *inside* a
+  - `nep245:<mt contract>:<token id>`: drive.near's own balance *inside* a
     NEAR Intents contract, for example
     `nep245:intents.near:nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1`.
 - The default allow-list is exactly those two (mainnet USDC, held directly or
@@ -56,28 +56,28 @@ Below, `USDC=17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1`.
 
 ```sh
 near call $USDC ft_transfer_call \
-  '{"receiver_id":"storage.near","amount":"5000000","msg":"{\"spend_cap_per_day\":\"1000000\"}"}' \
+  '{"receiver_id":"drive.near","amount":"5000000","msg":"{\"spend_cap_per_day\":\"1000000\"}"}' \
   --accountId alice.near --depositYocto 1 --gas 100000000000000
 ```
 
 This credits $5 to alice and caps spending at $1/day. One-time deployment
-step: storage.near must be registered with the token
-(`near call $USDC storage_deposit '{"account_id":"storage.near"}' --deposit 0.00125`).
+step: drive.near must be registered with the token
+(`near call $USDC storage_deposit '{"account_id":"drive.near"}' --deposit 0.00125`).
 
 ### 2. From a NEAR Intents balance with `mt_transfer_call` (NEP-245)
 
 USDC (or anything swapped into USDC) that alice holds in `intents.near` can
 move straight into the escrow. The tokens never leave intents. They become
-storage.near's intents balance.
+drive.near's intents balance.
 
 ```sh
 near call intents.near mt_transfer_call \
-  "{\"receiver_id\":\"storage.near\",\"token_id\":\"nep141:$USDC\",\"amount\":\"5000000\",\"msg\":\"{\\\"spend_cap_per_day\\\":\\\"1000000\\\"}\"}" \
+  "{\"receiver_id\":\"drive.near\",\"token_id\":\"nep141:$USDC\",\"amount\":\"5000000\",\"msg\":\"{\\\"spend_cap_per_day\\\":\\\"1000000\\\"}\"}" \
   --accountId alice.near --depositYocto 1 --gas 100000000000000
 ```
 
-intents.near debits alice, credits storage.near, and then calls
-`storage.near.mt_on_transfer(sender_id: "alice.near", previous_owner_ids:
+intents.near debits alice, credits drive.near, and then calls
+`drive.near.mt_on_transfer(sender_id: "alice.near", previous_owner_ids:
 ["alice.near"], token_ids: ["nep141:$USDC"], amounts: ["5000000"], msg)`.
 The escrow credits asset `nep245:intents.near:nep141:$USDC` and returns
 `["0"]` (nothing unused). If the call panics, intents.near's
@@ -95,7 +95,7 @@ She needs no NEAR for gas:
   "deadline": "2026-12-01T00:00:00Z",
   "intents": [{
     "intent": "transfer",
-    "receiver_id": "storage.near",
+    "receiver_id": "drive.near",
     "tokens": {"nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1": "5000000"},
     "msg": "{\"spend_cap_per_day\":\"1000000\"}"
   }]
@@ -112,11 +112,11 @@ fund storage from any asset intents supports.
 
 ```sh
 near call intents.near ft_withdraw \
-  "{\"token\":\"$USDC\",\"receiver_id\":\"storage.near\",\"amount\":\"5000000\",\"msg\":\"{\\\"payer\\\":\\\"alice.near\\\"}\"}" \
+  "{\"token\":\"$USDC\",\"receiver_id\":\"drive.near\",\"amount\":\"5000000\",\"msg\":\"{\\\"payer\\\":\\\"alice.near\\\"}\"}" \
   --accountId alice.near --depositYocto 1 --gas 100000000000000
 ```
 
-With `msg` set, intents calls `$USDC.ft_transfer_call(storage.near, …, msg)`.
+With `msg` set, intents calls `$USDC.ft_transfer_call(drive.near, …, msg)`.
 In that call **`sender_id` is `intents.near`, not alice**, so `msg.payer` is
 required. The escrow rejects (and the token refunds) any deposit relayed by a
 contract that appears in a `nep245:` asset id when it has no `payer`.
@@ -127,7 +127,7 @@ ends up as a direct `nep141:` balance, so the cap cannot be set here; call
 ## Spend caps
 
 ```sh
-near call storage.near set_spend_cap '{"per_day":"1000000"}' --accountId alice.near --deposit 0.01
+near call drive.near set_spend_cap '{"per_day":"1000000"}' --accountId alice.near --deposit 0.01
 ```
 
 - `per_day: null` blocks all charges. **A payer with no cap cannot be charged
@@ -144,13 +144,13 @@ Only owner-approved settlers can call `settle`:
   billing its own usage. Each entry's `gateway` must equal the settler.
 
 ```sh
-near call storage.near settle '{"entries":[
+near call drive.near settle '{"entries":[
   {"payer":"alice.near","amount":"1250","gateway":"gw1.operator.near","period_id":"2026-11-19T10/gw1"},
   {"payer":"app.near","amount":"98000","gateway":"gw1.operator.near","period_id":"2026-11-19T10/gw1"}
 ]}' --accountId billing.near --deposit 0.1 --gas 300000000000000
 ```
 
-Rust: `nstorage_near::StorageContract::settle(&signer, &[SettleEntry{..}])`.
+Rust: `near_drive_chain::StorageContract::settle(&signer, &[SettleEntry{..}])`.
 
 - **Each entry is applied whole or not at all.** It never charges part of
   an entry, and one bad entry does not fail the batch. The call returns one
@@ -185,9 +185,9 @@ Rust: `nstorage_near::StorageContract::settle(&signer, &[SettleEntry{..}])`.
 Payers give notice before they withdraw:
 
 ```sh
-near call storage.near request_withdraw_balance '{"asset":"nep141:'$USDC'","amount":"5000000"}' --accountId alice.near --deposit 0.01
+near call drive.near request_withdraw_balance '{"asset":"nep141:'$USDC'","amount":"5000000"}' --accountId alice.near --deposit 0.01
 # … after withdraw_delay_sec …
-near call storage.near withdraw_balance '{}' --accountId alice.near --depositYocto 1 --gas 100000000000000
+near call drive.near withdraw_balance '{}' --accountId alice.near --depositYocto 1 --gas 100000000000000
 ```
 
 - `withdraw_balance` pays out min(requested, current balance). Settlements

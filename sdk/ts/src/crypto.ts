@@ -1,13 +1,13 @@
 /**
- * Chunked envelope encryption, byte-compatible with `nstorage_core::crypto`.
+ * Chunked envelope encryption, byte-compatible with `near_drive_core::crypto`.
  *
  * - per-object random 256-bit DEK; chunks sealed with XChaCha20-Poly1305,
  *   nonce = nonce_prefix(16) || chunk_index(u64 BE),
- *   AAD = "nstorage-chunk-v1" || object_id(16) || chunk_index(u64 BE) || is_last(u8).
+ *   AAD = "near-drive-chunk-v1" || object_id(16) || chunk_index(u64 BE) || is_last(u8).
  * - DEK wrapped per recipient:
  *   `kek:<kek_id>` (owner; XChaCha20-Poly1305 under HKDF(root, kek), AAD = object_id) or
- *   `x25519:<base58>` (ephemeral-static X25519, key = HKDF-SHA256(salt="nstorage", ikm=shared,
- *   info="nstorage/v1/wrap-x25519"||epk||pk), AAD = object_id).
+ *   `x25519:<base58>` (ephemeral-static X25519, key = HKDF-SHA256(salt="near-drive", ikm=shared,
+ *   info="near-drive/v1/wrap-x25519"||epk||pk), AAD = object_id).
  */
 import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
 import { x25519 } from "@noble/curves/ed25519.js";
@@ -36,7 +36,7 @@ export interface EncInfo {
   wrapped_keys: WrappedKey[];
 }
 
-const SALT = utf8ToBytes("nstorage");
+const SALT = utf8ToBytes("near-drive");
 
 function derive(ikm: Uint8Array, info: Uint8Array): Uint8Array {
   return hkdf(sha256, ikm, SALT, info, 32);
@@ -78,7 +78,7 @@ export class RootKey {
 
   /** X25519 secret (unclamped bytes, as x25519-dalek StaticSecret stores them). */
   x25519Secret(): Uint8Array {
-    return this.#derive("nstorage/v1/x25519");
+    return this.#derive("near-drive/v1/x25519");
   }
 
   /** `x25519:<base58>`: publish this so others can share objects with the account. */
@@ -87,12 +87,12 @@ export class RootKey {
   }
 
   kek(): Uint8Array {
-    return this.#derive("nstorage/v1/kek");
+    return this.#derive("near-drive/v1/kek");
   }
 
   /** Short public fingerprint of the KEK so readers can pick the right wrapped key. */
   kekId(): string {
-    return bytesToHex(blake3(this.#derive("nstorage/v1/kek-id")).slice(0, 8));
+    return bytesToHex(blake3(this.#derive("near-drive/v1/kek-id")).slice(0, 8));
   }
 }
 
@@ -119,7 +119,7 @@ function dh(sk: Uint8Array, pk: Uint8Array): Uint8Array {
 }
 
 function x25519WrapKey(shared: Uint8Array, epk: Uint8Array, pk: Uint8Array): Uint8Array {
-  return derive(shared, concatBytes(utf8ToBytes("nstorage/v1/wrap-x25519"), epk, pk));
+  return derive(shared, concatBytes(utf8ToBytes("near-drive/v1/wrap-x25519"), epk, pk));
 }
 
 function wrapDek(dek: Uint8Array, objectId: Uint8Array, r: Recipient): WrappedKey {
@@ -169,7 +169,7 @@ function chunkNonce(prefix: Uint8Array, idx: number): Uint8Array {
 }
 
 function chunkAad(objectId: Uint8Array, idx: number, last: boolean): Uint8Array {
-  return concatBytes(utf8ToBytes("nstorage-chunk-v1"), objectId, u64be(idx), new Uint8Array([last ? 1 : 0]));
+  return concatBytes(utf8ToBytes("near-drive-chunk-v1"), objectId, u64be(idx), new Uint8Array([last ? 1 : 0]));
 }
 
 /** Split plaintext into chunks; an empty object is one empty chunk. */

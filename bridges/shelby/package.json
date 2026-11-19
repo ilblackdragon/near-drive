@@ -1,12 +1,12 @@
 {
-  "name": "@nstorage/bridge-shelby",
+  "name": "@near-drive/bridge-shelby",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "bin": { "nstorage-shelby-bridge": "dist/main.js" },
+  "bin": { "near-drive-shelby-bridge": "dist/main.js" },
   "scripts": { "start": "node dist/main.js" },
   "dependencies": {
-    "@nstorage/bridge-common": "0.1.0",
+    "@near-drive/bridge-common": "0.1.0",
     "@aws-sdk/client-s3": "^3.1000.0",
     "@aws-sdk/s3-request-presigner": "^3.1000.0",
     "@shelby-protocol/sdk": "0.11.0",

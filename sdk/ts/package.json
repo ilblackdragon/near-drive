@@ -1,7 +1,7 @@
 {
-  "name": "@nstorage/sdk",
+  "name": "@near-drive/sdk",
   "version": "0.1.0",
-  "description": "TypeScript SDK for nstorage: NEAR-account-addressed, end-to-end-encrypted object storage",
+  "description": "TypeScript SDK for near-drive: NEAR-account-addressed, end-to-end-encrypted object storage",
   "license": "MIT OR Apache-2.0",
   "type": "module",
   "engines": { "node": ">=20" },

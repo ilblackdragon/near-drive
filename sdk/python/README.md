@@ -1,8 +1,8 @@
-# nstorage (Python)
+# NEAR Drive (Python)
 
-Python SDK for [nstorage](../../DESIGN.md): NEAR-account-addressed, end-to-end-encrypted
+Python SDK for [NEAR Drive](../../DESIGN.md): NEAR-account-addressed, end-to-end-encrypted
 object storage (`near://alice.near/path/to/object`). Wire-compatible with the Rust
-`nstorage-client` and the TypeScript `@nstorage/sdk` (checked by `testvectors/`).
+`near-drive-client` and the TypeScript `@near-drive/sdk` (checked by `testvectors/`).
 
 - Python >= 3.10; dependencies: PyNaCl (libsodium: XChaCha20-Poly1305, ed25519, X25519),
   `blake3`, `base58`, `httpx`.
@@ -12,13 +12,13 @@ object storage (`near://alice.near/path/to/object`). Wire-compatible with the Ru
 ## Usage
 
 ```python
-from nstorage import Client, RootKey
+from near_drive import Client, RootKey
 
 client = Client(
     gateway="http://127.0.0.1:8787",
     account_id="alice.near",
     signer="ed25519:...",        # NEAR secret key (full-access or fn-call key for the storage contract)
-    root_key="<64 hex chars>",   # encryption root key; `nst keygen` writes ~/.nstorage/keys/<account>.root
+    root_key="<64 hex chars>",   # encryption root key; `near drive keygen` writes ~/.near-drive/keys/<account>.root
 )
 
 client.put("near://alice.near/memory/today.json", b'{"hello": "world"}', content_type="application/json")
@@ -32,10 +32,10 @@ client.delete("near://alice.near/memory/today.json")
 client.put("near://alice.near/weights/v1.bin", blob, public=True)
 ```
 
-Reuse the `nst` CLI's files:
+Reuse the `near-drive` CLI's files:
 
 ```python
-from nstorage import Client, load_credentials, load_root_key, default_root_key_path
+from near_drive import Client, load_credentials, load_root_key, default_root_key_path
 
 account, sk = load_credentials("/path/alice.json")       # NEAR credentials JSON
 client = Client("http://127.0.0.1:8787", account, sk, load_root_key(default_root_key_path(account)))
@@ -44,7 +44,7 @@ client = Client("http://127.0.0.1:8787", account, sk, load_root_key(default_root
 ### Sharing
 
 ```python
-bob_key = bob.x25519_public()          # "x25519:<base58>"; `nst whoami` prints the same thing
+bob_key = bob.x25519_public()          # "x25519:<base58>"; `near drive whoami` prints the same thing
 
 alice.put("near://alice.near/shared/report.pdf", pdf, share_with=[bob_key])   # at write time
 alice.share("near://alice.near/shared/old.pdf", bob_key)                     # later; chunks reused
@@ -74,8 +74,8 @@ msg = bob.get("near://app.near/users/bob.near/chat/0001.json")
 
 ### CLI
 
-`python -m nstorage` (or the `nst-py` script) mirrors `nst`: `keygen`, `whoami`, `put`, `get`,
-`ls`, `rm`, `share`, with the same `NSTORAGE_*` environment variables and key files.
+`python -m near_drive` (or the `near-drive-py` script) mirrors `near-drive`: `keygen`, `whoami`, `put`, `get`,
+`ls`, `rm`, `share`, with the same `NEAR_DRIVE_*` environment variables and key files.
 
 ## Development
 

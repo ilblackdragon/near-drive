@@ -1,8 +1,8 @@
 # NEAR contracts (wasm). Separate workspace from the root one: build with
-#   cargo near build non-reproducible-wasm --manifest-path contracts/storage/Cargo.toml
+#   cargo near build non-reproducible-wasm --manifest-path contracts/drive/Cargo.toml
 [workspace]
 resolver = "2"
-members = ["storage", "mock-ft", "mock-mt"]
+members = ["drive", "mock-ft", "mock-mt"]
 
 [workspace.dependencies]
 near-sdk = "5.29"

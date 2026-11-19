@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from nstorage import (
+from near_drive import (
     Manifest,
     NearUri,
     PointerRecord,

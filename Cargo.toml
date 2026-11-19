@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nstorage-core", "crates/nstorage-client", "crates/nstorage-gateway", "crates/nstorage-s3", "crates/nstorage-ckd", "crates/nstorage-near", "crates/nst"]
+members = ["crates/near-drive-core", "crates/near-drive-client", "crates/near-drive-gateway", "crates/near-drive-s3", "crates/near-drive-ckd", "crates/near-drive-chain", "crates/near-drive-cli"]
 # NEAR contracts target wasm and have their own workspace (contracts/Cargo.toml).
 exclude = ["contracts"]
 
@@ -36,9 +36,9 @@ async-trait = "0.1"
 bytes = "1"
 futures-util = "0.3"
 object_store = { version = "0.13", default-features = false, features = ["aws"] }
-nstorage-core = { path = "crates/nstorage-core" }
-nstorage-client = { path = "crates/nstorage-client" }
-nstorage-gateway = { path = "crates/nstorage-gateway" }
-nstorage-ckd = { path = "crates/nstorage-ckd" }
-nstorage-s3 = { path = "crates/nstorage-s3" }
-nstorage-near = { path = "crates/nstorage-near" }
+near-drive-core = { path = "crates/near-drive-core" }
+near-drive-client = { path = "crates/near-drive-client" }
+near-drive-gateway = { path = "crates/near-drive-gateway" }
+near-drive-ckd = { path = "crates/near-drive-ckd" }
+near-drive-s3 = { path = "crates/near-drive-s3" }
+near-drive-chain = { path = "crates/near-drive-chain" }

@@ -9,7 +9,7 @@ export interface BlobUrl {
 /**
  * A storage backend as seen by the bridge. Backends have their own content
  * ids (FOC PieceCID, Shelby blob name, …); the bridge keeps the mapping from
- * nstorage cids in its index.
+ * NEAR Drive cids in its index.
  */
 export interface BlobBackend {
   readonly name: string;

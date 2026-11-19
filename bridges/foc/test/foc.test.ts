@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BridgeStore, computeCid, startBridgeServer } from "@nstorage/bridge-common";
+import { BridgeStore, computeCid, startBridgeServer } from "@near-drive/bridge-common";
 import { FocBackend, FOC_MIN_UPLOAD, type FocClient } from "../src/backend.js";
 import { SynapseFocClient } from "../src/synapse.js";
 

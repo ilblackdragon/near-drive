@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""boto3 smoke test against a running `nst s3-proxy`.
+"""boto3 smoke test against a running `near drive s3-proxy`.
 
 Env: S3_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET
 (the proxy's NEAR account). Run via tests/boto3_smoke.sh, which starts a
@@ -172,7 +172,7 @@ ok(sorted(keys) == ["smoke/list/c", "smoke/list/d e+f"], f"paginator keys {keys}
 ok(sorted(prefixes) == ["smoke/list/a/", "smoke/list/b/"], f"paginator common prefixes {prefixes}")
 ok(pages == 2, f"paginated in {pages} pages of 2")
 allkeys = [o["Key"] for p in pag.paginate(Bucket=B, Prefix="smoke/") for o in p.get("Contents", [])]
-ok(not any(k.endswith(".nst-s3meta") for k in allkeys), "metadata sidecars hidden from listings")
+ok(not any(k.endswith(".drive-s3meta") for k in allkeys), "metadata sidecars hidden from listings")
 v1 = s3.list_objects(Bucket=B, Prefix="smoke/list/")
 ok(len(v1["Contents"]) == 5, "list_objects (v1)")
 

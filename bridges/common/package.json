@@ -1,10 +1,10 @@
 {
-  "name": "@nstorage/bridge-common",
+  "name": "@near-drive/bridge-common",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "exports": {
-    ".": { "nstorage-source": "./src/index.ts", "types": "./dist/index.d.ts", "default": "./dist/index.js" }
+    ".": { "near-drive-source": "./src/index.ts", "types": "./dist/index.d.ts", "default": "./dist/index.js" }
   },
   "dependencies": { "@noble/hashes": "^2.0.0" }
 }

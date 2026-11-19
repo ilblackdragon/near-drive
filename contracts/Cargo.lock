@@ -2251,6 +2251,102 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8fd0822ff3a82bdccda49b787cb11530512a929bfd13fd0d9fbd510b6360200"
 
 [[package]]
+name = "near-drive-chain"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bs58 0.5.1",
+ "ed25519-dalek",
+ "near-drive-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "near-drive-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "ed25519-dalek",
+ "futures-util",
+ "near-drive-chain",
+ "near-drive-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "near-drive-contract"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bs58 0.5.1",
+ "ed25519-dalek",
+ "near-drive-chain",
+ "near-drive-client",
+ "near-drive-core",
+ "near-drive-gateway",
+ "near-sdk",
+ "near-workspaces",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "near-drive-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "blake3",
+ "bs58 0.5.1",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "hex",
+ "hkdf",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "near-drive-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "blake3",
+ "bytes",
+ "clap",
+ "futures-util",
+ "hex",
+ "near-drive-chain",
+ "near-drive-core",
+ "object_store",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "near-fmt"
 version = "0.37.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2673,102 +2769,6 @@ dependencies = [
  "serde_json",
  "syn 1.0.109",
  "uriparse",
-]
-
-[[package]]
-name = "nstorage-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bytes",
- "ed25519-dalek",
- "futures-util",
- "nstorage-core",
- "nstorage-near",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "nstorage-contract"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "bs58 0.5.1",
- "ed25519-dalek",
- "near-sdk",
- "near-workspaces",
- "nstorage-client",
- "nstorage-core",
- "nstorage-gateway",
- "nstorage-near",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "nstorage-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "blake3",
- "bs58 0.5.1",
- "chacha20poly1305",
- "ed25519-dalek",
- "hex",
- "hkdf",
- "rand 0.8.8",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.21",
- "x25519-dalek",
-]
-
-[[package]]
-name = "nstorage-gateway"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "blake3",
- "bytes",
- "clap",
- "futures-util",
- "hex",
- "nstorage-core",
- "nstorage-near",
- "object_store",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "nstorage-near"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bs58 0.5.1",
- "ed25519-dalek",
- "nstorage-core",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2 0.10.9",
 ]
 
 [[package]]

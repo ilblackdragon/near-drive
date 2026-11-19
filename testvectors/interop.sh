@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-language interop: Rust (`nst`), TypeScript (@nstorage/sdk) and Python (nstorage)
+# Cross-language interop: Rust (`near-drive`), TypeScript (@near-drive/sdk) and Python (near_drive)
 # against one real gateway on 127.0.0.1.
 #
 #   testvectors/interop.sh            # build everything, run the matrix
@@ -16,8 +16,8 @@ HEAVY="${HEAVY:-/data/illia/nearproof-deps/bin/heavy}"
 [ -x "$HEAVY" ] || HEAVY=""
 TS="$ROOT/sdk/ts"
 PY="$ROOT/sdk/python"
-NST="$ROOT/target/debug/nst"
-GW="$ROOT/target/debug/nstorage-gateway"
+NST="$ROOT/target/debug/near-drive"
+GW="$ROOT/target/debug/near-drive-gateway"
 
 log() { printf '\n== %s\n' "$*"; }
 
@@ -33,7 +33,7 @@ if [ -z "${SKIP_BUILD:-}" ]; then
 fi
 PYBIN="$PY/.venv/bin/python"
 
-WORK="$(mktemp -d -t nst-interop.XXXXXX)"
+WORK="$(mktemp -d -t drive-interop.XXXXXX)"
 GW_PID=""
 cleanup() {
   [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null
@@ -46,29 +46,29 @@ FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  ok   %s\n' "$*"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$*"; }
 
-export NSTORAGE_HOME="$WORK/home"
+export NEAR_DRIVE_HOME="$WORK/home"
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
-export NSTORAGE_GATEWAY="http://127.0.0.1:$PORT"
+export NEAR_DRIVE_GATEWAY="http://127.0.0.1:$PORT"
 
 # run <lang> <account> <args...>
 run() {
   local lang=$1 acct=$2
   shift 2
-  local envs=(NSTORAGE_ACCOUNT="$acct" NSTORAGE_CREDENTIALS="$WORK/$acct.json")
+  local envs=(NEAR_DRIVE_ACCOUNT="$acct" NEAR_DRIVE_CREDENTIALS="$WORK/$acct.json")
   case $lang in
     rs) env "${envs[@]}" "$NST" "$@" ;;
-    ts) env "${envs[@]}" node "$TS/scripts/nst-ts.mjs" "$@" ;;
-    py) env "${envs[@]}" "$PYBIN" -m nstorage "$@" ;;
+    ts) env "${envs[@]}" node "$TS/scripts/drive-ts.mjs" "$@" ;;
+    py) env "${envs[@]}" "$PYBIN" -m near_drive "$@" ;;
   esac
 }
 
 log "accounts + gateway (127.0.0.1:$PORT)"
 declare -A PK
 for a in alice.near bob.near app.near; do
-  PK[$a]="$(NSTORAGE_ACCOUNT=$a "$NST" dev-key --out "$WORK/$a.json")"
+  PK[$a]="$(NEAR_DRIVE_ACCOUNT=$a "$NST" dev-key --out "$WORK/$a.json")"
 done
-NSTORAGE_ACCOUNT=alice.near "$NST" keygen 2>/dev/null
-NSTORAGE_ACCOUNT=bob.near "$NST" keygen 2>/dev/null
+NEAR_DRIVE_ACCOUNT=alice.near "$NST" keygen 2>/dev/null
+NEAR_DRIVE_ACCOUNT=bob.near "$NST" keygen 2>/dev/null
 # app.near deliberately has no root key: it can write for users but never read.
 cat >"$WORK/gw.json" <<JSON
 {"listen":"127.0.0.1:$PORT","data_dir":"$WORK/data",
@@ -79,8 +79,8 @@ cat >"$WORK/gw.json" <<JSON
 JSON
 RUST_LOG=warn "$GW" --config "$WORK/gw.json" >"$WORK/gw.log" 2>&1 &
 GW_PID=$!
-for _ in $(seq 50); do curl -sf "$NSTORAGE_GATEWAY/healthz" >/dev/null && break; sleep 0.1; done
-curl -sf "$NSTORAGE_GATEWAY/healthz" >/dev/null || { cat "$WORK/gw.log"; echo "gateway did not start"; exit 1; }
+for _ in $(seq 50); do curl -sf "$NEAR_DRIVE_GATEWAY/healthz" >/dev/null && break; sleep 0.1; done
+curl -sf "$NEAR_DRIVE_GATEWAY/healthz" >/dev/null || { cat "$WORK/gw.log"; echo "gateway did not start"; exit 1; }
 
 log "whoami: same x25519 key from all three languages"
 for a in alice.near bob.near; do
@@ -185,7 +185,7 @@ log "SDK-encrypted object vectors -> Rust decrypt (offline)"
 for l in ts py; do cp "$ROOT/testvectors/sdk_objects_$l.json" "$WORK/committed_$l.json"; done
 if node "$TS/scripts/emit-objects.mjs" "$ROOT/testvectors/sdk_objects_ts.json" &&
   "$PYBIN" "$PY/scripts/emit_objects.py" "$ROOT/testvectors/sdk_objects_py.json"; then
-  if (cd "$ROOT" && $HEAVY cargo test -j 8 -q -p nstorage-core --test sdk_vectors >"$WORK/cargo-test.log" 2>&1); then
+  if (cd "$ROOT" && $HEAVY cargo test -j 8 -q -p near-drive-core --test sdk_vectors >"$WORK/cargo-test.log" 2>&1); then
     ok "rust decrypts freshly encrypted TS + Python objects"
   else bad "rust sdk_vectors: $(tail -5 "$WORK/cargo-test.log")"; fi
 else

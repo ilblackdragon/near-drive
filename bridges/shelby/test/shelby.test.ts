@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import { BridgeStore, computeCid, startBridgeServer } from "@nstorage/bridge-common";
+import { BridgeStore, computeCid, startBridgeServer } from "@near-drive/bridge-common";
 import { ShelbyS3Backend } from "../src/s3.js";
 import { ShelbySdkBackend } from "../src/sdk.js";
 import { backendFromEnv } from "../src/config.js";
@@ -65,8 +65,8 @@ describe("ShelbyS3Backend against a mock S3", () => {
   it("put is create-only and idempotent; get, ranged get, has", async () => {
     const d = bytes(1000);
     const id = await backend.put("abc", d);
-    expect(id).toBe("nstorage/abc");
-    expect(s3.objects.get("/bkt/nstorage/abc")).toEqual(Buffer.from(d));
+    expect(id).toBe("near-drive/abc");
+    expect(s3.objects.get("/bkt/near-drive/abc")).toEqual(Buffer.from(d));
     expect(await backend.put("abc", d)).toBe(id); // 412 swallowed
     const puts = s3.seen.filter((x) => x.method === "PUT");
     expect(puts.every((p) => p.headers["if-none-match"] === "*")).toBe(true);
@@ -74,14 +74,14 @@ describe("ShelbyS3Backend against a mock S3", () => {
     expect(await backend.get(id)).toEqual(d);
     expect(await backend.get(id, { start: 5, end: 9 })).toEqual(d.subarray(5, 10));
     expect(await backend.has(id)).toBe(true);
-    expect(await backend.has("nstorage/missing")).toBe(false);
-    await expect(backend.get("nstorage/missing")).rejects.toThrow();
+    expect(await backend.has("near-drive/missing")).toBe(false);
+    await expect(backend.get("near-drive/missing")).rejects.toThrow();
   });
 
   it("url is a presigned GET with expiry", async () => {
     const before = Date.now();
-    const u = (await backend.url("nstorage/abc"))!;
-    expect(u.url).toContain(`${endpoint}/bkt/nstorage/abc?`);
+    const u = (await backend.url("near-drive/abc"))!;
+    expect(u.url).toContain(`${endpoint}/bkt/near-drive/abc?`);
     expect(u.url).toContain("X-Amz-Expires=600");
     expect(u.expires_ms).toBeGreaterThanOrEqual(before + 600_000);
     const r = await fetch(u.url);
@@ -95,7 +95,7 @@ describe("ShelbyS3Backend against a mock S3", () => {
     const d = bytes(4096, 5);
     const cid = computeCid(d);
     expect((await fetch(`${srv.url}/blobs/${cid}`, { method: "PUT", body: d })).status).toBe(201);
-    expect(s3.objects.has(`/bkt/nstorage/${cid}`)).toBe(true);
+    expect(s3.objects.has(`/bkt/near-drive/${cid}`)).toBe(true);
     const r = await fetch(`${srv.url}/blobs/${cid}`, { headers: { range: "bytes=0-99" } });
     expect(r.status).toBe(206);
     expect(new Uint8Array(await r.arrayBuffer())).toEqual(d.subarray(0, 100));
@@ -110,8 +110,8 @@ describe("ShelbyS3Backend against a mock S3", () => {
 describe("ShelbySdkBackend (real SDK, offline)", () => {
   it("constructs a shelbynet client and builds RPC blob URLs", async () => {
     const b = new ShelbySdkBackend({ privateKey: "0x" + "11".repeat(32) });
-    const u = (await b.url("nstorage/b3:ab"))!;
-    expect(u.url).toBe(`https://shelby.shelbynet.shelby.xyz/shelby/v1/blobs/${b.signer.accountAddress.toString()}/nstorage/b3%3Aab`);
+    const u = (await b.url("near-drive/b3:ab"))!;
+    expect(u.url).toBe(`https://shelby.shelbynet.shelby.xyz/shelby/v1/blobs/${b.signer.accountAddress.toString()}/near-drive/b3%3Aab`);
   });
 });
 

@@ -1,4 +1,4 @@
-import { BackendNotFound, ByteLru, sliceRange, type BlobBackend, type BlobUrl, type ByteRange } from "@nstorage/bridge-common";
+import { BackendNotFound, ByteLru, sliceRange, type BlobBackend, type BlobUrl, type ByteRange } from "@near-drive/bridge-common";
 
 /** FOC/PDP minimum piece payload (SIZE_CONSTANTS.MIN_UPLOAD_SIZE in synapse-core 0.11). */
 export const FOC_MIN_UPLOAD = 127;

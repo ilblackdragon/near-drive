@@ -1,5 +1,5 @@
 // Encrypt a fixed set of objects with the TS SDK and write them as decrypt-side
-// vectors for the Rust test `crates/nstorage-core/tests/sdk_vectors.rs`.
+// vectors for the Rust test `crates/near-drive-core/tests/sdk_vectors.rs`.
 // Usage: node scripts/emit-objects.mjs ../../testvectors/sdk_objects_ts.json   (after `npm run build`)
 import { readFileSync, writeFileSync } from "node:fs";
 import { addRecipient, cid, encryptFor, manifestCid, manifestToJson, plaintextChunks, RootKey } from "../dist/index.js";

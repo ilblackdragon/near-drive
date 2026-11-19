@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start a dev gateway + `nst s3-proxy` on 127.0.0.1 and run tests/boto3_smoke.py.
+# Start a dev gateway + `near drive s3-proxy` on 127.0.0.1 and run tests/boto3_smoke.py.
 #   PYTHON=/path/to/venv/bin/python tests/boto3_smoke.sh
 # Needs `cargo build` first (BIN defaults to target/debug).
 set -euo pipefail
@@ -15,16 +15,16 @@ port() { "$PY" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); pr
 wait_port() { for _ in $(seq 100); do (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null && return 0; sleep 0.1; done; echo "port $1 not up" >&2; return 1; }
 
 GWP=$(port); PXP=$(port)
-PK=$("$BIN/nst" --account alice.near dev-key --out "$T/alice.json")
+PK=$("$BIN/near-drive" --account alice.near dev-key --out "$T/alice.json")
 cat > "$T/gw.json" <<JSON
 {"listen":"127.0.0.1:$GWP","data_dir":"$T/gw","dev_keys":{"alice.near":["$PK"]}}
 JSON
-"$BIN/nstorage-gateway" --config "$T/gw.json" > "$T/gw.log" 2>&1 & PIDS+=($!)
+"$BIN/near-drive-gateway" --config "$T/gw.json" > "$T/gw.log" 2>&1 & PIDS+=($!)
 wait_port "$GWP"
 
-export NSTORAGE_ACCOUNT=alice.near NSTORAGE_CREDENTIALS="$T/alice.json" NSTORAGE_HOME="$T/home" NSTORAGE_GATEWAY="http://127.0.0.1:$GWP"
-"$BIN/nst" keygen 2>/dev/null
-NO_COLOR=1 RUST_LOG=warn,nstorage_s3=debug "$BIN/nst" s3-proxy --listen "127.0.0.1:$PXP" --public-prefix public/ > "$T/proxy.log" 2>&1 & PIDS+=($!)
+export NEAR_DRIVE_ACCOUNT=alice.near NEAR_DRIVE_CREDENTIALS="$T/alice.json" NEAR_DRIVE_HOME="$T/home" NEAR_DRIVE_GATEWAY="http://127.0.0.1:$GWP"
+"$BIN/near-drive" keygen 2>/dev/null
+NO_COLOR=1 RUST_LOG=warn,near_drive_s3=debug "$BIN/near-drive" s3-proxy --listen "127.0.0.1:$PXP" --public-prefix public/ > "$T/proxy.log" 2>&1 & PIDS+=($!)
 wait_port "$PXP"
 head -3 "$T/proxy.log"
 
@@ -50,5 +50,5 @@ fi
 
 echo "--- payload modes seen by the proxy:"
 grep -o 'payload=[A-Za-z]*' "$T/proxy.log" | sort | uniq -c || true
-grep -E ' -> [0-9]{3} ' "$T/proxy.log" | sed 's/^.*nstorage_s3: //' | sort | uniq -c | head -20 || true
+grep -E ' -> [0-9]{3} ' "$T/proxy.log" | sed 's/^.*near_drive_s3: //' | sort | uniq -c | head -20 || true
 exit $rc

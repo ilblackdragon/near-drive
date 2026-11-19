@@ -1,5 +1,5 @@
 {
-  "name": "nstorage-bridges",
+  "name": "near-drive-bridges",
   "private": true,
   "type": "module",
   "workspaces": [

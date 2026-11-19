@@ -1,5 +1,5 @@
 /**
- * nstorage client: chunking, client-side encryption, request signing. Verifies
+ * NEAR Drive client: chunking, client-side encryption, request signing. Verifies
  * everything it reads (record signature, manifest cid, chunk cids, AEAD).
  * Uses only `fetch` + Web APIs, so it runs in Node >= 20 and browsers.
  */

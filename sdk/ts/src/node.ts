@@ -25,8 +25,8 @@ export function defaultCredentialsPath(account: string, network = "mainnet"): st
   return join(homedir(), ".near-credentials", network, `${account}.json`);
 }
 
-/** Where `nst keygen` keeps root keys: `$NSTORAGE_HOME/keys/<account>.root` (default `~/.nstorage`). */
-export function defaultRootKeyPath(account: string, home = process.env.NSTORAGE_HOME ?? join(homedir(), ".nstorage")): string {
+/** Where `near drive keygen` keeps root keys: `$NEAR_DRIVE_HOME/keys/<account>.root` (default `~/.near-drive`). */
+export function defaultRootKeyPath(account: string, home = process.env.NEAR_DRIVE_HOME ?? join(homedir(), ".near-drive")): string {
   return join(home, "keys", `${account}.root`);
 }
 
@@ -52,7 +52,7 @@ export async function generateRootKeyFile(path: string): Promise<RootKey> {
   return k;
 }
 
-/** Client from a credentials file plus the account's local root key (if any), like `nst`. */
+/** Client from a credentials file plus the account's local root key (if any), like `near-drive`. */
 export async function clientFromFiles(o: { gateway: string; credentials: string; rootKey?: string; chunkSize?: number }): Promise<Client> {
   const c = await loadCredentials(o.credentials);
   const root = await loadRootKey(o.rootKey ?? defaultRootKeyPath(c.account_id));

@@ -10,7 +10,7 @@
     "declaration": true,
     "sourceMap": true,
     "composite": true,
-    "customConditions": ["nstorage-source"],
+    "customConditions": ["near-drive-source"],
     "types": ["node"]
   }
 }

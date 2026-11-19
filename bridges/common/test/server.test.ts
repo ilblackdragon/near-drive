@@ -13,7 +13,7 @@ import {
   parsePackTrailer,
   JsonlIndex,
   type PackingOptions,
-} from "@nstorage/bridge-common";
+} from "@near-drive/bridge-common";
 
 const bytes = (n: number, seed = 1) => {
   const b = new Uint8Array(n);

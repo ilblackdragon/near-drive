@@ -1,0 +1,21 @@
+[package]
+name = "near-drive-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+near-drive-core.workspace = true
+near-drive-chain.workspace = true
+ed25519-dalek.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

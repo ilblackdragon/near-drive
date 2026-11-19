@@ -1,12 +1,12 @@
 # Blob bridge protocol (v1)
 
-A blob bridge is an HTTP service that stores nstorage chunks in some other
+A blob bridge is an HTTP service that stores NEAR Drive chunks in some other
 system, such as Filecoin Onchain Cloud or Shelby. The gateway uses it as one
 more blob backend (`{"type": "bridge"}`, see README). Bridges never see
 plaintext: chunks are opaque, content-addressed ciphertext (or public data).
 
 Reference implementations:
-- client: `crates/nstorage-gateway/src/bridge.rs` (`BridgeBlobStore`)
+- client: `crates/near-drive-gateway/src/bridge.rs` (`BridgeBlobStore`)
 - server: `reference_router` in the same file (fs-backed; used by the tests)
 
 ## Identifiers

@@ -1,13 +1,13 @@
 import { Account, Ed25519PrivateKey, Network } from "@aptos-labs/ts-sdk";
 import { ShelbyNodeClient, isBlobAlreadyExistsError, isBlobNotFoundError } from "@shelby-protocol/sdk/node";
-import { BackendNotFound, type BlobBackend, type BlobUrl, type ByteRange } from "@nstorage/bridge-common";
+import { BackendNotFound, type BlobBackend, type BlobUrl, type ByteRange } from "@near-drive/bridge-common";
 
 export interface ShelbySdkConfig {
   /** Aptos Ed25519 private key (hex or AIP-80 `ed25519-priv-0x…`). Needs APT (gas) + ShelbyUSD (storage). */
   privateKey: string;
   /** Shelby / Aptos API key ("AG-…"). */
   apiKey?: string;
-  /** Blob name prefix (default "nstorage/"). */
+  /** Blob name prefix (default "near-drive/"). */
   prefix?: string;
 }
 
@@ -26,7 +26,7 @@ export class ShelbySdkBackend implements BlobBackend {
   private readonly prefix: string;
 
   constructor(cfg: ShelbySdkConfig) {
-    this.prefix = cfg.prefix ?? "nstorage/";
+    this.prefix = cfg.prefix ?? "near-drive/";
     this.signer = Account.fromPrivateKey({ privateKey: new Ed25519PrivateKey(cfg.privateKey) });
     this.client = new ShelbyNodeClient({ network: Network.SHELBYNET, apiKey: cfg.apiKey });
   }

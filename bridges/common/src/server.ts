@@ -9,7 +9,7 @@ export interface BridgeServerOptions {
   store: BridgeStore;
   /** If set, every /blobs request needs `Authorization: Bearer <token>`. */
   token?: string;
-  /** Max PUT body (default 64 MiB, the max nstorage chunk size). */
+  /** Max PUT body (default 64 MiB, the max NEAR Drive chunk size). */
   maxBodyBytes?: number;
   log?: (msg: string) => void;
 }
@@ -59,7 +59,7 @@ function authorized(req: IncomingMessage, token: string | undefined): boolean {
   return !!m && timingSafeEqual(digest(m[1]!.trim()), digest(token));
 }
 
-/** Request handler implementing the nstorage blob-bridge HTTP spec. */
+/** Request handler implementing the NEAR Drive blob-bridge HTTP spec. */
 export function bridgeHandler(opts: BridgeServerOptions) {
   const { store } = opts;
   const max = opts.maxBodyBytes ?? 64 * 1024 * 1024;

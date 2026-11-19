@@ -1,10 +1,10 @@
 [package]
 name = "mock-ft"
-description = "test-only mock-ft contract for nstorage sandbox tests"
+description = "test-only mock-ft contract for NEAR Drive sandbox tests"
 version = "0.0.0"
 edition = "2021"
 publish = false
-repository = "https://github.com/ilblackdragon/nstorage"
+repository = "https://github.com/ilblackdragon/near-drive"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

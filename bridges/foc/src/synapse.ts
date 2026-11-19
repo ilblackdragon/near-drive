@@ -33,8 +33,8 @@ export class SynapseFocClient implements FocClient {
       chain: this.chain,
       transport: cfg.rpcUrl ? http(cfg.rpcUrl) : undefined,
       withCDN: cfg.withCDN,
-      // Data-set metadata namespace; keeps nstorage data sets apart from other apps on the same wallet.
-      source: "nstorage",
+      // Data-set metadata namespace; keeps NEAR Drive data sets apart from other apps on the same wallet.
+      source: "near-drive",
     });
   }
 
@@ -45,7 +45,7 @@ export class SynapseFocClient implements FocClient {
   async upload(data: Uint8Array, key: string) {
     const r = await this.synapse.storage.upload(data, {
       copies: this.cfg.copies,
-      pieceMetadata: { nstorage: key.slice(0, 64) },
+      pieceMetadata: { "near-drive": key.slice(0, 64) },
     });
     return { pieceCid: r.pieceCid.toString(), complete: r.complete, copies: r.copies.length };
   }

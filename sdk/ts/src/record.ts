@@ -21,7 +21,7 @@ export interface PointerRecord {
 
 export function recordSigningBytes(r: Omit<PointerRecord, "sig">): Uint8Array {
   return utf8ToBytes(
-    `nstorage-record-v1\n${r.namespace}\n${r.path}\n${r.manifest_cid}\n${r.size}\n${r.stored_size}\n${r.seq}\n${r.writer}\n${r.writer_pk}\n${r.ts_ms}`,
+    `near-drive-record-v1\n${r.namespace}\n${r.path}\n${r.manifest_cid}\n${r.size}\n${r.stored_size}\n${r.seq}\n${r.writer}\n${r.writer_pk}\n${r.ts_ms}`,
   );
 }
 

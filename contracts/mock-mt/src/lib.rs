@@ -1,5 +1,5 @@
 //! Minimal NEP-245 multi-token contract standing in for `intents.near` in
-//! sandbox tests. Mirrors the defuse semantics that matter to storage.near:
+//! sandbox tests. Mirrors the defuse semantics that matter to drive.near:
 //! `mt_transfer_call` moves the balance, calls the receiver's
 //! `mt_on_transfer(sender_id, previous_owner_ids, token_ids, amounts, msg)`
 //! and refunds the returned unused amounts in `mt_resolve_transfer`.

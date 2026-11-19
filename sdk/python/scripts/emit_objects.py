@@ -1,5 +1,5 @@
 """Encrypt a fixed set of objects with the Python SDK and write them as decrypt-side
-vectors for the Rust test ``crates/nstorage-core/tests/sdk_vectors.rs``.
+vectors for the Rust test ``crates/near-drive-core/tests/sdk_vectors.rs``.
 
 Usage: python scripts/emit_objects.py ../../testvectors/sdk_objects_py.json
 """
@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from nstorage import ChunkRef, Manifest, RootKey, add_recipient, cid, encrypt_for, plaintext_chunks
+from near_drive import ChunkRef, Manifest, RootKey, add_recipient, cid, encrypt_for, plaintext_chunks
 
 V = json.loads((Path(__file__).resolve().parents[3] / "testvectors" / "vectors.json").read_text())
 R = {k: RootKey.from_hex(r["root_key"]) for k, r in V["roots"].items()}

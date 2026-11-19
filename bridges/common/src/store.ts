@@ -56,7 +56,7 @@ export function buildPack(blobs: { cid: string; data: Uint8Array }[]): {
 
 export function parsePackTrailer(pack: Uint8Array): [string, number, number][] {
   const n = pack.length;
-  if (n < 8 || !PACK_MAGIC.every((c, i) => pack[n - 4 + i] === c)) throw new Error("not an nstorage pack");
+  if (n < 8 || !PACK_MAGIC.every((c, i) => pack[n - 4 + i] === c)) throw new Error("not an NEAR Drive pack");
   const len = new DataView(pack.buffer, pack.byteOffset).getUint32(n - 8, true);
   const t = JSON.parse(new TextDecoder().decode(pack.subarray(n - 8 - len, n - 8))) as { v: number; entries: [string, number, number][] };
   if (t.v !== 1) throw new Error(`unknown pack version ${t.v}`);

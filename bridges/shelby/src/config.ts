@@ -1,4 +1,4 @@
-import type { BlobBackend } from "@nstorage/bridge-common";
+import type { BlobBackend } from "@near-drive/bridge-common";
 import { ShelbyS3Backend } from "./s3.js";
 
 function need(env: NodeJS.ProcessEnv, k: string): string {
@@ -10,7 +10,7 @@ function need(env: NodeJS.ProcessEnv, k: string): string {
 /** Builds the Shelby backend selected by SHELBY_MODE (see main.ts for variables). */
 export async function backendFromEnv(env: NodeJS.ProcessEnv): Promise<BlobBackend> {
   const mode = env.SHELBY_MODE || "s3";
-  const prefix = env.SHELBY_PREFIX ?? "nstorage/";
+  const prefix = env.SHELBY_PREFIX ?? "near-drive/";
   if (mode === "s3") {
     return new ShelbyS3Backend({
       endpoint: env.SHELBY_S3_ENDPOINT || "https://s3.beta.shelby.xyz",

@@ -1,11 +1,11 @@
-# @nstorage/sdk (TypeScript)
+# @near-drive/sdk (TypeScript)
 
-TypeScript SDK for [nstorage](../../DESIGN.md): NEAR-account-addressed, end-to-end-encrypted
+TypeScript SDK for [NEAR Drive](../../DESIGN.md): NEAR-account-addressed, end-to-end-encrypted
 object storage (`near://alice.near/path/to/object`). Wire-compatible with the Rust
-`nstorage-client` and the Python `nstorage` package (checked by `testvectors/`).
+`near-drive-client` and the Python `near_drive` package (checked by `testvectors/`).
 
 - ESM, Node >= 20 and browsers. The core uses only `fetch` and Web APIs; Node-only helpers
-  (credential files, root key files, file upload) live in `@nstorage/sdk/node`.
+  (credential files, root key files, file upload) live in `@near-drive/sdk/node`.
 - Crypto from audited libraries: `@noble/ciphers` (XChaCha20-Poly1305), `@noble/curves`
   (ed25519, X25519), `@noble/hashes` (BLAKE3, HKDF-SHA256), `@scure/base` (base58/base64).
 - Everything read is verified: record signature, manifest cid, chunk cids, AEAD tags.
@@ -13,13 +13,13 @@ object storage (`near://alice.near/path/to/object`). Wire-compatible with the Ru
 ## Usage
 
 ```ts
-import { Client, RootKey } from "@nstorage/sdk";
+import { Client, RootKey } from "@near-drive/sdk";
 
 const client = new Client({
   gateway: "http://127.0.0.1:8787",
   accountId: "alice.near",
   signer: "ed25519:...",          // NEAR secret key (full-access or fn-call key for the storage contract)
-  rootKey: "<64 hex chars>",      // encryption root key (`nst keygen` writes ~/.nstorage/keys/<account>.root)
+  rootKey: "<64 hex chars>",      // encryption root key (`near drive keygen` writes ~/.near-drive/keys/<account>.root)
 });
 
 await client.put("near://alice.near/memory/today.json", JSON.stringify({ hello: "world" }), {
@@ -39,7 +39,7 @@ await client.put("near://alice.near/weights/v1.bin", bytes, { public: true });
 Every account with a root key has an X25519 key for receiving objects:
 
 ```ts
-const bobKey = bob.x25519Public();          // "x25519:<base58>"; `nst whoami` prints the same thing
+const bobKey = bob.x25519Public();          // "x25519:<base58>"; `near drive whoami` prints the same thing
 
 // encrypt to bob at write time ...
 await alice.put("near://alice.near/shared/report.pdf", pdf, { shareWith: [bobKey] });
@@ -60,7 +60,7 @@ on `app.near`, the app pays for storage but can neither decrypt nor (via policy)
 ```ts
 const app = new Client({ gateway, accountId: "app.near", signer: APP_SECRET_KEY /* no rootKey */ });
 await app.put("near://app.near/users/bob.near/chat/0001.json", message, {
-  shareWith: [bobX25519],            // bob's key, e.g. from storage.near or `nst whoami`
+  shareWith: [bobX25519],            // bob's key, e.g. from drive.near or `near drive whoami`
   contentType: "application/json",
 });
 
@@ -83,14 +83,14 @@ const client = new Client({
 ### Node helpers
 
 ```ts
-import { clientFromFiles, putFile, getFile, generateRootKeyFile, defaultRootKeyPath } from "@nstorage/sdk/node";
+import { clientFromFiles, putFile, getFile, generateRootKeyFile, defaultRootKeyPath } from "@near-drive/sdk/node";
 
 const c = await clientFromFiles({ gateway: "http://127.0.0.1:8787", credentials: "/path/alice.json" });
 await putFile(c, "./model.bin", "near://alice.near/weights/model.bin");
 await getFile(c, "near://alice.near/weights/model.bin", "./copy.bin");
 ```
 
-`scripts/nst-ts.mjs` is a small `nst`-compatible CLI (`whoami`, `put`, `get`, `ls`, `rm`, `share`)
+`scripts/drive-ts.mjs` is a small `near-drive`-compatible CLI (`whoami`, `put`, `get`, `ls`, `rm`, `share`)
 used by the interop test.
 
 ## Notes

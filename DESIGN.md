@@ -1,4 +1,4 @@
-# nstorage — NEAR storage layer
+# NEAR Drive — NEAR storage layer
 
 Status: v0.2 (2026-11-19). Phases 0–3 are implemented in this repo; see §9 for what is verified and what is not.
 
@@ -33,7 +33,7 @@ near://alice.near/objects/etc/mystuff
   boto3 / aws-cli ── S3 API ──────┤
         │                         ▼
         │                 ┌────────────────┐   view_access_key / grants / gateway registry
-        │                 │ Gateway (N×,   │◄──────────────── NEAR: storage.near contract
+        │                 │ Gateway (N×,   │◄──────────────── NEAR: drive.near contract
         │                 │  stateless)    │
         │                 └──┬──────────┬──┘
         │       pointer recs │          │ chunks (content-addressed)
@@ -59,7 +59,7 @@ key:   (namespace, path)
 value: {manifest_cid, size, seq, writer, writer_pk, ts, sig}
 ```
 `sig` is the writer's ed25519 signature over
-`"nstorage-record-v1\n{namespace}\n{path}\n{manifest_cid}\n{size}\n{stored_size}\n{seq}\n{writer}\n{writer_pk}\n{ts_ms}"`.
+`"near-drive-record-v1\n{namespace}\n{path}\n{manifest_cid}\n{size}\n{stored_size}\n{seq}\n{writer}\n{writer_pk}\n{ts_ms}"`.
 Gateways return the manifest's exact stored bytes as `manifest_raw` (base64), and clients hash those bytes rather than a re-serialization, so adding manifest fields later does not break older clients. Readers check it and reject a record whose writer was not authorized for that path (§4). A malicious gateway or index store can therefore *withhold* data or serve *stale* data, but it cannot forge it. Rollback protection comes from periodic onchain anchoring (phase 3).
 
 Why per-path records and not a Merkle tree per account: S3 semantics are per-object last-writer-wins. Per-path records map 1:1 onto that, avoid a write hot-spot on a single root (bad for chat and memory workloads), and keep LIST a plain prefix scan.
@@ -79,7 +79,7 @@ A stateless HTTP service. Per request it:
 
 Large reads can skip the gateway: `GET ...?mode=locate` returns the manifest plus per-chunk URLs (presigned R2, FilBeam, Shelby), and the SDK fetches them in parallel with ranges. This matters for weights. Gateways in different regions also act as read-through chunk caches. Chunks are immutable, so caching them is trivially safe.
 
-Gateways register in `storage.near` with `{url, operator, regions, backends, price_hint, attestation?}`. SDKs read the registry, probe latency, and pick a gateway, the same way wallets pick an RPC.
+Gateways register in `drive.near` with `{url, operator, regions, backends, price_hint, attestation?}`. SDKs read the registry, probe latency, and pick a gateway, the same way wallets pick an RPC.
 
 ### 3.4 Backends and placement
 
@@ -101,20 +101,20 @@ Users never choose a backend directly. At most they choose a class. The manifest
 **Native API.** Each request carries
 `X-Near-Account`, `X-Near-PublicKey`, `X-Near-Timestamp`, `X-Near-Signature`.
 The signature is ed25519 (base58) over
-`"nstorage-req-v1\n{METHOD}\n{url path as sent, percent-encoded}\n{raw query}\n{account}\n{public_key}\n{ts_ms}\n{hex blake3(body)}"`.
+`"near-drive-req-v1\n{METHOD}\n{url path as sent, percent-encoded}\n{raw query}\n{account}\n{public_key}\n{ts_ms}\n{hex blake3(body)}"`.
 Clients keep timestamps strictly increasing so two identical requests never share a signature (the gateway keeps a replay cache keyed by signature).
 The gateway accepts the key if it is one of:
 - a **full-access key** of the account (`view_access_key`); or
-- a **function-call key scoped to `storage.near`**. This is the recommended "storage session key". Wallets can add it without touching funds, and revoking it is a normal NEAR key deletion; or
+- a **function-call key scoped to `drive.near`**. This is the recommended "storage session key". Wallets can add it without touching funds, and revoking it is a normal NEAR key deletion; or
 - (dev mode) a key listed in the gateway config.
 
 A timestamp window of ±5 min plus a short replay cache per gateway is enough. Requests are idempotent PUT/GET/DELETE, and content-addressed chunk uploads are harmless to replay.
 
 **S3 API (SigV4)** needs a shared secret, so it runs in two modes:
-- **Local sidecar (recommended, E2E).** `nst s3-proxy` listens on `127.0.0.1:9000`. Credentials are local config. It encrypts client-side and speaks the native API upstream with the user's NEAR key. boto3 code changes only `endpoint_url`. This is how deltaleague and holonear workers would use it.
-- **Hosted S3 endpoint (convenience, not E2E).** The user signs a NEP-413 "issue S3 credential" message, and the gateway returns `AKID = base32(account|scope|expiry|gw_id|nonce)`, `secret = HMAC(gateway_secret, AKID)`. This is stateless (any replica of that operator can re-derive the secret) and scoped to a path prefix. Revocation bumps a per-account `cred_epoch` in `storage.near`. Data uses gateway-side encryption, so this should only be offered by TEE-attested gateways (NEAR AI Cloud already runs CVMs). The attestation is published in the registry.
+- **Local sidecar (recommended, E2E).** `near drive s3-proxy` listens on `127.0.0.1:9000`. Credentials are local config. It encrypts client-side and speaks the native API upstream with the user's NEAR key. boto3 code changes only `endpoint_url`. This is how deltaleague and holonear workers would use it.
+- **Hosted S3 endpoint (convenience, not E2E).** The user signs a NEP-413 "issue S3 credential" message, and the gateway returns `AKID = base32(account|scope|expiry|gw_id|nonce)`, `secret = HMAC(gateway_secret, AKID)`. This is stateless (any replica of that operator can re-derive the secret) and scoped to a path prefix. Revocation bumps a per-account `cred_epoch` in `drive.near`. Data uses gateway-side encryption, so this should only be offered by TEE-attested gateways (NEAR AI Cloud already runs CVMs). The attestation is published in the registry.
 
-### 4.2 Namespace policy (onchain in `storage.near`)
+### 4.2 Namespace policy (onchain in `drive.near`)
 
 Each namespace (account) has an ordered rule list:
 
@@ -144,11 +144,11 @@ Gateway-side read ACLs only stop ciphertext from being *served*. Confidentiality
 - it survives access-key rotation (unlike "derive from the signature of a fixed message", which breaks when keys change and does not work for multisig or MPC-controlled accounts);
 - it is never seen by gateways.
 
-The SDK caches the root key locally, encrypted with an OS keychain or a passphrase. **v0 fallback:** a locally generated root key file (`~/.nstorage/<account>.key`) with export/import. CKD replaces only the key-acquisition step; nothing downstream changes.
+The SDK caches the root key locally, encrypted with an OS keychain or a passphrase. **v0 fallback:** a locally generated root key file (`~/.near-drive/<account>.key`) with export/import. CKD replaces only the key-acquisition step; nothing downstream changes.
 
 Derived keys:
 - `kek = HKDF(root, "kek")` wraps per-object DEKs.
-- `enc_sk = X25519(HKDF(root, "x25519"))`. Its public key is published in `storage.near` so others can share to the account.
+- `enc_sk = X25519(HKDF(root, "x25519"))`. Its public key is published in `drive.near` so others can share to the account.
 - `path_key = HKDF(root, "paths")` is for optional hidden-path mode.
 
 ### 5.2 Objects
@@ -186,14 +186,14 @@ Metered units:
 - Because the usage token is a trusted secret, **phase-1 gateways are NEAR AI-operated** (the registry can still list them).
 
 **Phase 2 — NEAR Intents.**
-- A payer deposits any intents-supported asset. It settles to USDC in an `intents.near` balance, which is then transferred into `storage.near` escrow.
+- A payer deposits any intents-supported asset. It settles to USDC in an `intents.near` balance, which is then transferred into `drive.near` escrow.
 - Storage is prepaid as reservations (`bytes × duration`).
 - Egress is paid by usage receipts that a gateway submits and the contract verifies against per-payer caps. Disputes go through signed request logs.
 - Third-party gateway operators get paid from escrow, so permissionless gateways become viable. Cloud credits remain as one funding source: the cloud-api balance can be bridged to escrow.
 
-## 7. `storage.near` contract (phase 2)
+## 7. `drive.near` contract (phase 2)
 
-Implemented in `contracts/storage` (method list in README.md; payments in docs/payments.md):
+Implemented in `contracts/drive` (method list in README.md; payments in docs/payments.md):
 
 - `register_gateway(info)` / `update_gateway` / `deregister_gateway` / `withdraw_gateway_stake` (NEAR stake, unstake delay), `list_gateways`
 - `set_rules(rules)`, `get_rules(namespace)`
@@ -228,9 +228,9 @@ client.share(uri, account) ; client.grant(prefix, rule)   # onchain policy tx
 
 | Phase | Scope | Status |
 |---|---|---|
-| **0** | Core (paths, chunking, encryption, manifests, signed records, policy), gateway native API, NEAR-key auth, fs stores, usage log, `nst` CLI | Done |
-| **1** | S3/R2 stores with conditional writes; storage classes and replication; blob-bridge protocol (`docs/blob-bridge.md`); streaming large objects + `?mode=locate` + chunk cache; `nst s3-proxy`; cloud-credits billing (metering, reporting, 402 gate) + cloud-api endpoints; TS and Python SDKs; sharing (X25519 recipients); CORS | Done. Verified against MinIO, boto3 1.34 and 1.44, aws-cli, and a local cloud-api build. Not verified against real AWS S3/R2 or a deployed cloud-api. The cloud-api change needs a schema change in `nearai/cloud-platform` first (see its `docs/storage-billing.md`) |
-| **2** | `storage.near` contract (rules, enc keys, gateway registry, cred epochs, anchors); gateway reads rules from chain; `nst grant/rules/publish-key/gateways`, gateway discovery; CKD root keys (`nst keygen --ckd`); FOC bridge (Synapse) | Done in code. Contract verified in a local sandbox only. CKD verified against the official vectors and live read-only queries, not a real request. FOC bridge type-checked and mock-tested; no funded upload completed |
+| **0** | Core (paths, chunking, encryption, manifests, signed records, policy), gateway native API, NEAR-key auth, fs stores, usage log, `near-drive` CLI | Done |
+| **1** | S3/R2 stores with conditional writes; storage classes and replication; blob-bridge protocol (`docs/blob-bridge.md`); streaming large objects + `?mode=locate` + chunk cache; `near drive s3-proxy`; cloud-credits billing (metering, reporting, 402 gate) + cloud-api endpoints; TS and Python SDKs; sharing (X25519 recipients); CORS | Done. Verified against MinIO, boto3 1.34 and 1.44, aws-cli, and a local cloud-api build. Not verified against real AWS S3/R2 or a deployed cloud-api. The cloud-api change needs a schema change in `nearai/cloud-platform` first (see its `docs/storage-billing.md`) |
+| **2** | `drive.near` contract (rules, enc keys, gateway registry, cred epochs, anchors); gateway reads rules from chain; `near drive grant/rules/publish-key/gateways`, gateway discovery; CKD root keys (`near drive keygen --ckd`); FOC bridge (Synapse) | Done in code. Contract verified in a local sandbox only. CKD verified against the official vectors and live read-only queries, not a real request. FOC bridge type-checked and mock-tested; no funded upload completed |
 | **3** | NEAR Intents / stablecoin escrow (`ft_on_transfer`, `mt_on_transfer`, capped `settle`, delayed withdrawals; `docs/payments.md`); Shelby bridge (S3 mode + experimental SDK mode) | Done in code; sandbox and mock tests only |
 | Not built | hosted TEE S3 endpoint; storage reservations, disputes, stake slashing; chunk garbage collection; placement log; hidden-path mode; keychain-wrapped root key cache; NEAR-escrow settler wired into billing (interface exists); prepaid storage so session keys can set rules | |
 

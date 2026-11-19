@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * nstorage blob bridge → Filecoin Onchain Cloud (PDP warm storage + FilBeam).
+ * NEAR Drive blob bridge → Filecoin Onchain Cloud (PDP warm storage + FilBeam).
  *
- *   nstorage-foc-bridge            serve (default)
- *   nstorage-foc-bridge setup      quote deposit/approval; `setup --yes` executes it
- *   nstorage-foc-bridge selftest   upload+download one packed object for real
+ *   near-drive-foc-bridge            serve (default)
+ *   near-drive-foc-bridge setup      quote deposit/approval; `setup --yes` executes it
+ *   near-drive-foc-bridge selftest   upload+download one packed object for real
  *
  * Env: FOC_PRIVATE_KEY (0x…, required), FOC_NETWORK=calibration|mainnet
  * (default calibration; mainnet also needs FOC_ALLOW_MAINNET=1), FOC_RPC_URL,
@@ -13,7 +13,7 @@
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { BridgeStore, commonConfigFromEnv, computeCid, startBridgeServer } from "@nstorage/bridge-common";
+import { BridgeStore, commonConfigFromEnv, computeCid, startBridgeServer } from "@near-drive/bridge-common";
 import { FocBackend } from "./backend.js";
 import { SynapseFocClient } from "./synapse.js";
 
@@ -43,7 +43,7 @@ async function main() {
   const cmd = process.argv[2] ?? "serve";
   const common = commonConfigFromEnv(env, {
     port: 7701,
-    dataDir: join(homedir(), ".nstorage", "bridges", "foc"),
+    dataDir: join(homedir(), ".near-drive", "bridges", "foc"),
     // Every FOC piece costs a fixed on-chain fee (≈$0.011 per single-piece add, per copy),
     // so pack everything below 16 MiB into ~64 MiB pieces.
     packThreshold: 16 * MiB,
@@ -67,7 +67,7 @@ async function main() {
   const backend = new FocBackend(client, { cacheBytes: Number(env.FOC_CACHE_BYTES || 256 * MiB), log });
 
   if (cmd === "selftest") {
-    const data = new TextEncoder().encode(`nstorage foc bridge selftest ${new Date().toISOString()} `.repeat(8));
+    const data = new TextEncoder().encode(`NEAR Drive foc bridge selftest ${new Date().toISOString()} `.repeat(8));
     const id = await backend.put(computeCid(data).slice(3), data);
     const back = await backend.get(id);
     const ok = computeCid(back.subarray(0, data.length)) === computeCid(data);

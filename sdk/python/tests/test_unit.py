@@ -1,6 +1,6 @@
 import pytest
 
-from nstorage import Manifest, RootKey, add_recipient, decrypt_object, encrypt_for, encrypt_object
+from near_drive import Manifest, RootKey, add_recipient, decrypt_object, encrypt_for, encrypt_object
 
 
 def test_roundtrip_and_tamper():
@@ -53,7 +53,7 @@ def test_manifest_normalization():
         Manifest.from_dict({"version": True, "size": 3, "chunk_size": 4, "chunks": []})
 
 
-from nstorage import ChunkRef, NearUri, ObjectHead, PointerRecord, cid, public_key_of, sign, verify_head  # noqa: E402
+from near_drive import ChunkRef, NearUri, ObjectHead, PointerRecord, cid, public_key_of, sign, verify_head  # noqa: E402
 
 SEED = bytes([7]) * 32
 URI = NearUri.parse("near://alice.near/a/b")

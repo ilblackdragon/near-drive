@@ -1738,27 +1738,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "nst"
+name = "near-drive-chain"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "clap",
+ "axum",
+ "base64 0.22.1",
+ "bs58",
  "ed25519-dalek",
- "hex",
- "nstorage-ckd",
- "nstorage-client",
- "nstorage-core",
- "nstorage-near",
- "nstorage-s3",
- "rand 0.8.8",
+ "near-drive-core",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
- "tracing-subscriber",
 ]
 
 [[package]]
-name = "nstorage-ckd"
+name = "near-drive-ckd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1771,7 +1768,7 @@ dependencies = [
  "group",
  "hex",
  "hkdf",
- "nstorage-core",
+ "near-drive-core",
  "pairing",
  "rand 0.8.8",
  "reqwest",
@@ -1784,7 +1781,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "nstorage-client"
+name = "near-drive-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "near-drive-chain",
+ "near-drive-ckd",
+ "near-drive-client",
+ "near-drive-core",
+ "near-drive-s3",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "near-drive-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1792,8 +1809,8 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "futures-util",
- "nstorage-core",
- "nstorage-near",
+ "near-drive-chain",
+ "near-drive-core",
  "reqwest",
  "serde",
  "serde_json",
@@ -1802,7 +1819,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nstorage-core"
+name = "near-drive-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1822,7 +1839,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nstorage-gateway"
+name = "near-drive-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1835,9 +1852,9 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "hex",
- "nstorage-client",
- "nstorage-core",
- "nstorage-near",
+ "near-drive-chain",
+ "near-drive-client",
+ "near-drive-core",
  "object_store",
  "rand 0.8.8",
  "reqwest",
@@ -1851,24 +1868,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nstorage-near"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "bs58",
- "ed25519-dalek",
- "nstorage-core",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
-]
-
-[[package]]
-name = "nstorage-s3"
+name = "near-drive-s3"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1883,8 +1883,8 @@ dependencies = [
  "hmac 0.12.1",
  "httpdate",
  "md-5 0.10.6",
- "nstorage-client",
- "nstorage-gateway",
+ "near-drive-client",
+ "near-drive-gateway",
  "rand 0.8.8",
  "reqwest",
  "serde",

@@ -1,6 +1,6 @@
 import { GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client, S3ServiceException } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { BackendNotFound, type BlobBackend, type BlobUrl, type ByteRange } from "@nstorage/bridge-common";
+import { BackendNotFound, type BlobBackend, type BlobUrl, type ByteRange } from "@near-drive/bridge-common";
 
 export interface ShelbyS3Config {
   /** Default https://s3.beta.shelby.xyz (Shelby Private Beta S3 gateway). */
@@ -10,7 +10,7 @@ export interface ShelbyS3Config {
   secretAccessKey: string;
   /** Shelby uses region "default". */
   region?: string;
-  /** Key prefix inside the bucket (default "nstorage/"). */
+  /** Key prefix inside the bucket (default "near-drive/"). */
   prefix?: string;
   /** Presigned GET lifetime for /url, seconds (Shelby allows 1 s – 7 d). */
   urlTtlSeconds?: number;
@@ -30,7 +30,7 @@ export class ShelbyS3Backend implements BlobBackend {
   private readonly prefix: string;
 
   constructor(private readonly cfg: ShelbyS3Config, s3?: S3Client) {
-    this.prefix = cfg.prefix ?? "nstorage/";
+    this.prefix = cfg.prefix ?? "near-drive/";
     this.s3 =
       s3 ??
       new S3Client({
