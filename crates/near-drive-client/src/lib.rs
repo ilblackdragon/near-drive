@@ -12,6 +12,7 @@ use near_drive_core::{
 };
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
+use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,8 +20,12 @@ pub use near_drive_core;
 
 mod chain;
 mod large;
+mod net;
+mod resume;
 pub use chain::discover_gateway;
 pub use large::{Located, LocatedChunk};
+pub use net::NetConfig;
+use net::{ok_or_attempt, reject, transport, with_retries, Attempt};
 
 pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 pub const DEFAULT_PARALLELISM: usize = 8;
@@ -79,6 +84,9 @@ pub struct PutOptions {
     pub share_with: Vec<String>,
     /// Storage class for the chunks (`hot`, `bulk`, ...); None = gateway default.
     pub class: Option<String>,
+    /// [`Client::put_file`] keeps a journal here so an interrupted upload of the
+    /// same file to the same URI resumes instead of starting over. None = off.
+    pub resume_dir: Option<std::path::PathBuf>,
 }
 
 pub struct Client {
@@ -96,6 +104,13 @@ pub struct Client {
     last_ts: AtomicU64,
     /// `drive.near` access for sharing-by-account and policy grants.
     chain: Option<near_drive_chain::StorageContract>,
+    net: NetConfig,
+}
+
+pub(crate) fn debug(msg: &str) {
+    if std::env::var_os("NEAR_DRIVE_DEBUG").is_some() {
+        eprintln!("near-drive: {msg}");
+    }
 }
 
 fn now_ms() -> u64 {
@@ -117,8 +132,10 @@ pub fn encode_path(p: &str) -> String {
 
 impl Client {
     pub fn new(gateway: impl Into<String>, account: impl Into<String>, sk: SigningKey, root: Option<RootKey>) -> Self {
+        let net = NetConfig::default();
         Self {
-            http: reqwest::Client::new(),
+            http: net.http_client(),
+            net,
             gateway: gateway.into().trim_end_matches('/').to_string(),
             account: account.into(),
             sk,
@@ -143,15 +160,28 @@ impl Client {
         &self.account
     }
 
-    async fn send(&self, method: Method, path: &str, query: &str, body: impl Into<bytes::Bytes>) -> Result<reqwest::Response> {
-        self.send_with(method, path, query, body.into(), None).await
+    /// Timeouts and retry policy (see [`NetConfig`]).
+    pub fn net(&self) -> &NetConfig {
+        &self.net
     }
 
-    async fn send_with(&self, method: Method, path: &str, query: &str, body: bytes::Bytes, class: Option<&str>) -> Result<reqwest::Response> {
+    pub fn set_net(&mut self, net: NetConfig) {
+        self.http = net.http_client();
+        self.net = net;
+    }
+
+    /// One signed request (no retries). `xfer`: payload bytes expected to move
+    /// in either direction, for the request deadline.
+    async fn send(&self, method: Method, path: &str, query: &str, body: impl Into<bytes::Bytes>) -> Result<reqwest::Response> {
+        self.send_with(method, path, query, body.into(), None, 0).await
+    }
+
+    async fn send_with(&self, method: Method, path: &str, query: &str, body: bytes::Bytes, class: Option<&str>, xfer: u64) -> Result<reqwest::Response> {
         let ts = self.next_ts();
         let h = auth::sign_request(&self.account, &self.sk, method.as_str(), path, query, ts, &body);
         let url = if query.is_empty() { format!("{}{}", self.gateway, path) } else { format!("{}{}?{}", self.gateway, path, query) };
-        let mut req = self.http.request(method, url);
+        let timeout = self.net.timeout_for(xfer.max(body.len() as u64));
+        let mut req = self.http.request(method, url).timeout(timeout);
         if let Some(c) = class {
             req = req.header(CLASS_HEADER, c);
         }
@@ -166,15 +196,6 @@ impl Client {
             .context("gateway request failed")
     }
 
-    async fn check(resp: reqwest::Response) -> Result<reqwest::Response> {
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(resp);
-        }
-        let body = resp.text().await.unwrap_or_default();
-        Err(GatewayError { status: status.as_u16(), body }.into())
-    }
-
     fn obj_path(uri: &NearUri) -> String {
         format!("/v1/o/{}/{}", uri.namespace, encode_path(&uri.path))
     }
@@ -184,12 +205,32 @@ impl Client {
         self.upload_chunk(namespace, cid, bytes.into(), class).await
     }
 
+    /// GET returning JSON, retried; `None` on 404.
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, what: &str, path: &str, query: &str) -> Result<Option<T>> {
+        with_retries(&self.net, what, |_| async {
+            let resp = match self.send(Method::GET, path, query, Bytes::new()).await {
+                Ok(r) => r,
+                Err(e) => return transport(e),
+            };
+            if resp.status() == StatusCode::NOT_FOUND {
+                return Attempt::Done(None);
+            }
+            if !resp.status().is_success() {
+                return reject(resp).await;
+            }
+            match resp.bytes().await {
+                Ok(b) => match serde_json::from_slice(&b) {
+                    Ok(v) => Attempt::Done(Some(v)),
+                    Err(e) => Attempt::Fatal(anyhow!("bad response to {what}: {e}")),
+                },
+                Err(e) => transport(e.into()),
+            }
+        })
+        .await
+    }
+
     pub async fn head(&self, uri: &NearUri) -> Result<Option<ObjectHead>> {
-        let resp = self.send(Method::GET, &Self::obj_path(uri), "", vec![]).await?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let head: ObjectHead = Self::check(resp).await?.json().await?;
+        let Some(head): Option<ObjectHead> = self.get_json("head", &Self::obj_path(uri), "").await? else { return Ok(None) };
         verify_head(uri, &head)?;
         Ok(Some(head))
     }
@@ -211,10 +252,13 @@ impl Client {
             let (c, e) = crypto::encrypt_for(&rs, data, self.chunk_size)?;
             (c, Some(e))
         };
-        let mut refs = Vec::with_capacity(chunks.len());
-        for c in chunks {
-            refs.push(self.put_chunk(&uri.namespace, c, opts.class.as_deref()).await?);
-        }
+        use futures_util::{StreamExt, TryStreamExt};
+        let class = opts.class.as_deref();
+        let refs: Vec<ChunkRef> = futures_util::stream::iter(chunks)
+            .map(|c| self.put_chunk(&uri.namespace, c, class))
+            .buffered(self.parallelism.max(1))
+            .try_collect()
+            .await?;
         let manifest = Manifest {
             version: 1,
             size: data.len() as u64,
@@ -227,23 +271,57 @@ impl Client {
     }
 
     /// Publish `manifest` (chunks already uploaded) as the new version of `uri`.
+    ///
+    /// The record PUT is a compare-and-swap on `seq`, so it is the one write
+    /// that is not idempotent. After a transient failure the earlier attempt
+    /// may have landed; a following 409 is then checked against the current
+    /// head, and if that head is this manifest by this key, the write succeeded.
+    /// A conflict with someone else's write is retried once with the new seq.
     async fn commit_manifest(&self, uri: &NearUri, manifest: &Manifest, class: Option<&str>) -> Result<PointerRecord> {
         let mbytes = manifest.to_bytes();
         let stored = manifest.stored_size() + mbytes.len() as u64;
-        let mref = self.put_chunk(&uri.namespace, mbytes, class).await?;
-
-        for attempt in 0..2 {
-            let prev = self.head(uri).await?.map(|h| h.record.seq).unwrap_or(0);
+        // Independent: upload the manifest chunk while reading the current seq.
+        let (mref, head) = tokio::join!(self.put_chunk(&uri.namespace, mbytes, class), self.head(uri));
+        let (mref, mut prev) = (mref?, head?.map(|h| h.record.seq).unwrap_or(0));
+        let my_pk = near_drive_core::keys::format_public_key(&self.sk.verifying_key());
+        let mut maybe_landed = false;
+        let mut conflicts = 0;
+        let mut attempt = 0;
+        loop {
             let rec = PointerRecord::new_signed(&uri.namespace, &uri.path, &mref.cid, manifest.size, stored, prev + 1, &self.account, &self.sk, now_ms());
             // Same class header as the chunks: the gateway records it in the index.
-            let resp = self.send_with(Method::PUT, &Self::obj_path(uri), "", serde_json::to_vec(&rec)?.into(), class).await?;
-            if resp.status() == StatusCode::CONFLICT && attempt == 0 {
-                continue;
+            let r = self.send_with(Method::PUT, &Self::obj_path(uri), "", serde_json::to_vec(&rec)?.into(), class, 0).await;
+            let wait = match r {
+                Ok(resp) if resp.status().is_success() => return Ok(rec),
+                Ok(resp) if resp.status() == StatusCode::CONFLICT => {
+                    let cur = self.head(uri).await?;
+                    if let Some(h) = &cur {
+                        if maybe_landed && h.record.manifest_cid == mref.cid && h.record.writer_pk == my_pk && h.record.seq == prev + 1 {
+                            return Ok(h.record.clone());
+                        }
+                    }
+                    conflicts += 1;
+                    if conflicts >= 2 {
+                        bail!("concurrent write conflict on {uri}");
+                    }
+                    prev = cur.map(|h| h.record.seq).unwrap_or(0);
+                    continue;
+                }
+                Ok(resp) => match reject::<()>(resp).await {
+                    Attempt::Retry(e, w) => (e, w),
+                    Attempt::Fatal(e) => return Err(e),
+                    Attempt::Done(()) => unreachable!("reject never succeeds"),
+                },
+                Err(e) => (e, None),
+            };
+            maybe_landed = true;
+            attempt += 1;
+            if attempt >= self.net.attempts.max(1) {
+                debug(&format!("committing {uri}: giving up after {attempt} attempts"));
+                return Err(wait.0);
             }
-            Self::check(resp).await?;
-            return Ok(rec);
+            tokio::time::sleep(self.net.delay(attempt - 1, wait.1)).await;
         }
-        bail!("concurrent write conflict on {uri}")
     }
 
     /// This account's public key for receiving shared objects.
@@ -273,14 +351,12 @@ impl Client {
 
     /// Fetch and cid-check the stored (possibly encrypted) chunks of a verified head.
     pub async fn fetch_chunks(&self, uri: &NearUri, head: &ObjectHead) -> Result<Vec<Vec<u8>>> {
-        let mut chunks = Vec::with_capacity(head.manifest.chunks.len());
-        for c in &head.manifest.chunks {
-            let resp = self.send(Method::GET, &Self::obj_path(uri), &format!("chunk={}", c.cid), vec![]).await?;
-            let bytes = Self::check(resp).await?.bytes().await?.to_vec();
-            ensure!(near_drive_core::cid(&bytes) == c.cid, "chunk {} content does not match its id", c.cid);
-            chunks.push(bytes);
-        }
-        Ok(chunks)
+        use futures_util::{StreamExt, TryStreamExt};
+        futures_util::stream::iter(head.manifest.chunks.iter().enumerate())
+            .map(|(i, c)| async move { Ok::<_, anyhow::Error>(self.fetch_via_gateway(uri, &c.cid, i, c.len).await?.to_vec()) })
+            .buffered(self.parallelism.max(1))
+            .try_collect()
+            .await
     }
 
     /// Turn the chunks returned by [`Client::fetch_chunks`] into plaintext.
@@ -298,13 +374,27 @@ impl Client {
 
     pub async fn list(&self, prefix: &NearUri) -> Result<Vec<ListEntry>> {
         let q = format!("prefix={}", encode_path(&prefix.path));
-        let resp = self.send(Method::GET, &format!("/v1/list/{}", prefix.namespace), &q, vec![]).await?;
-        Ok(Self::check(resp).await?.json().await?)
+        Ok(self.get_json("list", &format!("/v1/list/{}", prefix.namespace), &q).await?.unwrap_or_default())
     }
 
+    /// Delete `uri`. Retried; a 404 after a failed attempt means that attempt
+    /// already deleted it.
     pub async fn delete(&self, uri: &NearUri) -> Result<()> {
-        Self::check(self.send(Method::DELETE, &Self::obj_path(uri), "", vec![]).await?).await?;
-        Ok(())
+        let path = Self::obj_path(uri);
+        with_retries(&self.net, "delete", |attempt| {
+            let path = path.clone();
+            async move {
+                match self.send(Method::DELETE, &path, "", Bytes::new()).await {
+                    Ok(r) if r.status() == StatusCode::NOT_FOUND && attempt > 0 => Attempt::Done(()),
+                    r => match ok_or_attempt(r).await {
+                        Attempt::Done(_) => Attempt::Done(()),
+                        Attempt::Retry(e, w) => Attempt::Retry(e, w),
+                        Attempt::Fatal(e) => Attempt::Fatal(e),
+                    },
+                }
+            }
+        })
+        .await
     }
 }
 

@@ -188,6 +188,14 @@ dev gateway. The optional `storage` section of the gateway config sets up the fo
   - Updates are `If-Match` CAS writes.
   - A delete writes a CAS tombstone, because plain S3 DELETE is not conditional.
 - **`cache`.** A bounded, LRU, read-through chunk cache on local disk for remote backends. Chunks are checked against their cid before they are cached.
+- **`small_cache`** (on by default) makes small files cheap:
+  - `max_bytes` (64 MiB; 0 = off) of memory for blobs up to `max_item_bytes` (256 KiB): manifests and small
+    chunks. Uploads write through, so the commit right after an upload finds them in memory.
+  - `inline_max_bytes` (64 KiB; 0 = off): `?mode=locate` returns the chunks of objects up to this stored size inline
+    (`"data"`, base64), so a small read is one request. Inlined bytes are metered as egress.
+  - `index_ttl_ms` (0 = off): caches index entries. Writes and deletes through this gateway update it; with several
+    gateways sharing one index a read can be up to the TTL stale, so only raise it for a single writer gateway.
+  - `index_max_entries` (100 000).
 
 ## Browser access (CORS)
 
@@ -217,6 +225,32 @@ near drive --chunk-mib 16 --parallel 16 put --class bulk model.safetensors near:
 near drive get near://alice.near/models/m.safetensors ./m.safetensors
 near drive get --range 0-1048575 near://alice.near/models/m.safetensors > header.bin
 ```
+
+### Bad networks and resuming
+
+Every request has a deadline and is retried on transient failures:
+- **Deadlines:** a 10 s connect timeout, a 60 s idle timeout (no bytes arriving), and a per-request deadline of
+  `30 s + size / 64 KiB/s`, so a stalled connection fails fast while a slow but moving one is not cut off.
+- **Retries:** connection errors, timeouts, truncated bodies, chunks whose bytes don't match their cid, 5xx, 408 and
+  429 are retried with full-jitter exponential backoff (250 ms doubling, capped at 30 s), honouring `Retry-After`.
+  The default is 8 attempts (`NetConfig`, CLI `--retries` / `NEAR_DRIVE_RETRIES`). Each attempt is signed afresh.
+- **Safe writes:** chunk uploads are idempotent (content-addressed). The record commit is a compare-and-swap; if its
+  response is lost, the client checks whether the current version is its own write before retrying, so a lost
+  response never turns into a false conflict or a duplicate version. A lost response to a delete is handled the same way.
+
+Interrupted transfers resume:
+- **Downloads** (`get_to_file`, CLI `get`): the partial `{file}.drive-part` and `{file}.drive-part.json` stay after a
+  failure. Running the same download again checks every chunk already on disk (by re-deriving its cid from the
+  bytes) and fetches only what is missing. A newer version of the object starts over.
+- **Uploads** (`put_file` with `PutOptions::resume_dir`; the CLI uses `~/.near-drive/uploads`, `--no-resume` to
+  disable): a journal records each chunk the gateway stored. Running the same upload again reuses the object's key,
+  so unchanged chunks re-encrypt to the same cids and are skipped. Before a chunk is sent, the journal durably
+  records a hash of its plaintext; if the file changed since (even with the same size and mtime), the journal is
+  discarded and the upload starts over with a fresh key, so a nonce is never reused for different bytes.
+- Uploads from stdin and the one-shot `put`/`get` calls retry but do not resume.
+
+`crates/near-drive-gateway/tests/resilience.rs` runs all of this through a fault-injecting proxy (503s, bodies cut
+mid-transfer, writes whose response is lost, dead links).
 
 ## Billing (NEAR AI Cloud credits)
 
@@ -272,6 +306,7 @@ The proxy encrypts client-side with the account's root key and signs requests wi
 - unit tests;
 - a gateway+client e2e covering encryption at rest, overwrite/CAS, listing, namespace isolation, app-pays prefixes, and forged or stale record rejection;
 - `tests/streaming.rs`: streaming vs one-shot interop, ranges, storage classes, a blob bridge with direct URLs and fallback;
+- `tests/resilience.rs`: a fault-injecting proxy (503s, truncated bodies, lost write responses, dead links); resumed uploads and downloads send/fetch only what is missing; a changed file restarts with a fresh key; small reads take one request;
 - `tests/large.rs`: a large object with bounded memory;
 - `crates/near-drive-s3/tests/s3_e2e.rs`: gateway + S3 proxy driven by the AWS Rust SDK (and raw signed requests for chunk signatures, trailers, skew and presigned URLs).
 - `tests/contract_policy.rs`: gateway policy from `drive.near` through a mock RPC (cache, override, failure → 503).

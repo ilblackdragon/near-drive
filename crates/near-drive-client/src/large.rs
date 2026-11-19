@@ -5,13 +5,14 @@
 //! Memory use is about `(parallelism + 2) * chunk_size` regardless of object
 //! size. The on-the-wire format is identical to [`Client::put`] / [`Client::get`].
 use super::*;
+use crate::resume;
+use crate::net::{ok_or_attempt, transport, with_retries, Attempt};
 use bytes::Bytes;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use near_drive_core::crypto::stream::{chunk_count, chunk_plain_len, ChunkOpener, ChunkSealer};
-use std::{ops::Range, path::Path, sync::Arc, time::Duration};
+use std::{ops::Range, path::Path, sync::Arc};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-const ATTEMPTS: u32 = 3;
 /// Don't use a direct URL that expires sooner than this.
 const URL_MIN_REMAINING_MS: u64 = 30_000;
 
@@ -25,6 +26,10 @@ pub struct LocatedChunk {
     pub url: Option<String>,
     #[serde(default)]
     pub expires_ms: Option<u64>,
+    /// The chunk itself (base64), inlined by the gateway for small objects so
+    /// a small read takes one round trip. Verified against `cid` like any fetch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
 }
 
 /// `GET ...?mode=locate` response. Gateways without locate support answer
@@ -62,6 +67,14 @@ enum Sealer {
     Enc(Arc<ChunkSealer>),
 }
 
+/// An upload backed by a journal (see `resume.rs`).
+struct JournalRun<'a> {
+    journal: &'a resume::Journal,
+    /// Chunks the gateway already stored in an earlier run.
+    done: &'a std::collections::HashMap<u64, ChunkRef>,
+    sealer: Sealer,
+}
+
 #[derive(Clone)]
 enum Opener {
     Plain,
@@ -83,12 +96,32 @@ async fn read_full<R: AsyncRead + Unpin>(r: &mut R, n: usize) -> Result<Vec<u8>>
     Ok(buf)
 }
 
-fn retryable(status: StatusCode) -> bool {
-    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::REQUEST_TIMEOUT
+/// Which version a `.drive-part` file belongs to.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct PartMeta {
+    uri: String,
+    manifest_cid: String,
+    size: u64,
 }
 
-async fn backoff(attempt: u32) {
-    tokio::time::sleep(Duration::from_millis(250 * 4u64.pow(attempt))).await;
+/// For each chunk: are the bytes at its offset in `f` exactly that chunk?
+/// (Re-encrypt / hash them and compare with the manifest's cid.)
+fn chunks_on_disk(f: &std::fs::File, m: &Manifest, opener: &Opener) -> Result<Vec<bool>> {
+    use std::os::unix::fs::FileExt;
+    let n = m.chunks.len();
+    let mut buf = vec![0u8; m.chunk_size as usize];
+    (0..n)
+        .map(|i| {
+            let len = chunk_plain_len(m.size, m.chunk_size, i as u64) as usize;
+            let b = &mut buf[..len];
+            f.read_exact_at(b, i as u64 * m.chunk_size)?;
+            let cid = match opener {
+                Opener::Plain => near_drive_core::cid(b),
+                Opener::Enc(o) => near_drive_core::cid(&o.reseal(i as u64, i + 1 == n, b)?),
+            };
+            Ok(cid == m.chunks[i].cid)
+        })
+        .collect()
 }
 
 impl Client {
@@ -96,79 +129,72 @@ impl Client {
     pub(crate) async fn upload_chunk(&self, namespace: &str, cid: String, bytes: Bytes, class: Option<&str>) -> Result<ChunkRef> {
         let len = bytes.len() as u64;
         let path = format!("/v1/chunk/{namespace}/{cid}");
-        let mut attempt = 0;
-        loop {
-            let r = self.send_with(Method::PUT, &path, "", bytes.clone(), class).await;
-            match r {
-                Ok(resp) if resp.status().is_success() => return Ok(ChunkRef { cid, len }),
-                Ok(resp) if !retryable(resp.status()) || attempt + 1 >= ATTEMPTS => {
-                    Self::check(resp).await?;
-                    unreachable!("check fails on non-success");
-                }
-                Err(e) if attempt + 1 >= ATTEMPTS => return Err(e),
-                _ => {}
-            }
-            backoff(attempt).await;
-            attempt += 1;
-        }
+        let what = format!("upload chunk {cid}");
+        with_retries(&self.net, &what, |_| {
+            let bytes = bytes.clone();
+            let path = &path;
+            async move { ok_or_attempt(self.send_with(Method::PUT, path, "", bytes, class, 0).await).await }
+        })
+        .await?;
+        Ok(ChunkRef { cid, len })
     }
 
     /// Fetch a chunk via the gateway (signed, retried), verifying its cid.
     /// `idx` goes into the (signed) query so that concurrent fetches of a
     /// repeated chunk never produce identical signatures (gateway replay cache).
-    async fn fetch_via_gateway(&self, uri: &NearUri, cid: &str, idx: usize) -> Result<Bytes> {
+    pub(crate) async fn fetch_via_gateway(&self, uri: &NearUri, cid: &str, idx: usize, len: u64) -> Result<Bytes> {
         let q = format!("chunk={cid}&i={idx}");
-        let mut attempt = 0;
-        loop {
-            let res = async {
-                let resp = self.send(Method::GET, &Self::obj_path(uri), &q, Bytes::new()).await?;
-                let status = resp.status();
-                if !status.is_success() {
-                    let retry = retryable(status);
-                    let text = resp.text().await.unwrap_or_default();
-                    return Ok::<_, anyhow::Error>(Err((retry, anyhow!("gateway returned {status}: {text}"))));
+        let path = Self::obj_path(uri);
+        let what = format!("fetch chunk {idx}");
+        with_retries(&self.net, &what, |_| {
+            let (q, path) = (&q, &path);
+            async move {
+                let resp = match ok_or_attempt(self.send_with(Method::GET, path, q, Bytes::new(), None, len).await).await {
+                    Attempt::Done(r) => r,
+                    Attempt::Retry(e, w) => return Attempt::Retry(e, w),
+                    Attempt::Fatal(e) => return Attempt::Fatal(e),
+                };
+                match resp.bytes().await {
+                    Ok(b) if near_drive_core::cid(&b) == cid => Attempt::Done(b),
+                    // corrupted or truncated in transit: fetch again
+                    Ok(_) => Attempt::Retry(anyhow!("chunk {cid} content does not match its id"), None),
+                    Err(e) => transport(e.into()),
                 }
-                Ok(Ok(resp.bytes().await?))
             }
-            .await;
-            match res {
-                Ok(Ok(b)) => {
-                    ensure!(near_drive_core::cid(&b) == cid, "chunk {cid} content does not match its id");
-                    return Ok(b);
-                }
-                Ok(Err((false, e))) => return Err(e),
-                Ok(Err((true, e))) | Err(e) if attempt + 1 >= ATTEMPTS => return Err(e),
-                _ => {}
-            }
-            backoff(attempt).await;
-            attempt += 1;
-        }
+        })
+        .await
     }
 
-    /// Fetch chunk `idx` of a located object: direct URL first, gateway fallback.
+    /// Fetch chunk `idx` of a located object: inlined bytes, else the direct
+    /// URL, else (or on any direct-fetch problem) the gateway.
     async fn fetch_chunk(&self, uri: &NearUri, loc: &Located, idx: usize) -> Result<Bytes> {
-        let cid = &loc.manifest.chunks[idx].cid;
-        if let Some(url) = loc.direct_url(idx) {
-            match self.http.get(url).send().await {
-                Ok(resp) if resp.status() == StatusCode::OK => match resp.bytes().await {
-                    Ok(b) if near_drive_core::cid(&b) == *cid => return Ok(b),
-                    Ok(_) => eprintln_debug(&format!("direct fetch of {cid} returned wrong content; using gateway")),
-                    Err(e) => eprintln_debug(&format!("direct fetch of {cid}: {e}; using gateway")),
-                },
-                Ok(resp) => eprintln_debug(&format!("direct fetch of {cid}: HTTP {}; using gateway", resp.status())),
-                Err(e) => eprintln_debug(&format!("direct fetch of {cid}: {e}; using gateway")),
+        let c = &loc.manifest.chunks[idx];
+        let cid = &c.cid;
+        if let Some(data) = loc.chunks.get(idx).and_then(|l| l.data.as_deref()) {
+            use base64::Engine;
+            match base64::engine::general_purpose::STANDARD.decode(data) {
+                Ok(b) if near_drive_core::cid(&b) == *cid => return Ok(b.into()),
+                _ => debug(&format!("inlined chunk {cid} is invalid; fetching it")),
             }
         }
-        self.fetch_via_gateway(uri, cid, idx).await
+        if let Some(url) = loc.direct_url(idx) {
+            let r = self.http.get(url).timeout(self.net.timeout_for(c.len)).send().await;
+            match r {
+                Ok(resp) if resp.status() == StatusCode::OK => match resp.bytes().await {
+                    Ok(b) if near_drive_core::cid(&b) == *cid => return Ok(b),
+                    Ok(_) => debug(&format!("direct fetch of {cid} returned wrong content; using gateway")),
+                    Err(e) => debug(&format!("direct fetch of {cid}: {e}; using gateway")),
+                },
+                Ok(resp) => debug(&format!("direct fetch of {cid}: HTTP {}; using gateway", resp.status())),
+                Err(e) => debug(&format!("direct fetch of {cid}: {e}; using gateway")),
+            }
+        }
+        self.fetch_via_gateway(uri, cid, idx, c.len).await
     }
 
     /// Record + manifest + per-chunk direct URLs. None if the object does not exist.
     pub async fn locate(&self, uri: &NearUri) -> Result<Option<Located>> {
-        let resp = self.send(Method::GET, &Self::obj_path(uri), "mode=locate", Bytes::new()).await?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let loc: Located = Self::check(resp).await?.json().await?;
+        let Some(loc): Option<Located> = self.get_json("locate", &Self::obj_path(uri), "mode=locate").await? else { return Ok(None) };
         verify_head(uri, &loc.head())?;
         let m = &loc.manifest;
         ensure!(
@@ -179,17 +205,66 @@ impl Client {
         Ok(Some(loc))
     }
 
-    /// Upload a file with bounded memory and `self.parallelism` concurrent chunk uploads.
+    /// Upload a file with bounded memory and `self.parallelism` concurrent
+    /// chunk uploads. With `opts.resume_dir`, an interrupted upload of the same
+    /// file to the same URI resumes where it stopped (see `resume.rs`).
     pub async fn put_file(&self, path: impl AsRef<Path>, uri: &NearUri, opts: &PutOptions) -> Result<PointerRecord> {
         let path = path.as_ref();
         let f = tokio::fs::File::open(path).await.with_context(|| format!("opening {}", path.display()))?;
-        self.put_reader(f, uri, opts).await
+        let Some(dir) = &opts.resume_dir else { return self.put_stream(f, uri, opts, None).await };
+        // Resuming an encrypted upload needs the owner's key to recover the object key.
+        if !opts.public && self.root.is_none() {
+            return self.put_stream(f, uri, opts, None).await;
+        }
+        let key = resume::key_for(&self.account, &uri.to_string(), path, self.chunk_size as u64, opts)?;
+        let jpath = resume::journal_path(dir, &key);
+        let resumed = match resume::load(&jpath, &key) {
+            Some(r) => {
+                let (src, cs) = (key.src.clone(), key.chunk_size);
+                let r = tokio::task::spawn_blocking(move || resume::file_unchanged(&src, cs, &r).map(|ok| ok.then_some(r))).await??;
+                if r.is_none() {
+                    debug("file changed since the interrupted upload; starting over");
+                }
+                r
+            }
+            None => None,
+        };
+        let (sealer, journal, done) = match resumed {
+            Some(r) => {
+                let sealer = match &r.enc {
+                    None => Sealer::Plain,
+                    Some(enc) => Sealer::Enc(Arc::new(ChunkSealer::reopen(self.root.as_ref().expect("checked"), enc)?)),
+                };
+                if !r.done.is_empty() {
+                    debug(&format!("resuming upload of {uri}: {} chunks already stored", r.done.len()));
+                }
+                (sealer, resume::Journal::append(&jpath)?, r.done)
+            }
+            None => {
+                let sealer = self.new_sealer(opts)?;
+                let enc = match &sealer {
+                    Sealer::Plain => None,
+                    Sealer::Enc(s) => Some(s.enc_info().clone()),
+                };
+                (sealer, resume::Journal::create(&jpath, &key, enc)?, Default::default())
+            }
+        };
+        let jr = JournalRun { journal: &journal, done: &done, sealer };
+        let rec = self
+            .put_stream(f, uri, opts, Some(jr))
+            .await
+            .with_context(|| format!("upload of {uri} interrupted; run it again to resume"))?;
+        journal.finish();
+        Ok(rec)
     }
 
     /// Upload everything `reader` yields (size need not be known up front).
-    pub async fn put_reader<R: AsyncRead + Unpin + Send>(&self, mut reader: R, uri: &NearUri, opts: &PutOptions) -> Result<PointerRecord> {
-        NearUri::object(&uri.namespace, &uri.path)?;
-        let sealer = if opts.public {
+    pub async fn put_reader<R: AsyncRead + Unpin + Send>(&self, reader: R, uri: &NearUri, opts: &PutOptions) -> Result<PointerRecord> {
+        self.put_stream(reader, uri, opts, None).await
+    }
+
+    fn new_sealer(&self, opts: &PutOptions) -> Result<Sealer> {
+        Ok(if opts.public {
             Sealer::Plain
         } else {
             let mut rs = Vec::new();
@@ -201,6 +276,14 @@ impl Client {
             }
             ensure!(!rs.is_empty(), "no root key loaded and no share_with recipients; run `near drive keygen` or use --public");
             Sealer::Enc(Arc::new(ChunkSealer::new(&rs)?))
+        })
+    }
+
+    async fn put_stream<R: AsyncRead + Unpin + Send>(&self, mut reader: R, uri: &NearUri, opts: &PutOptions, jr: Option<JournalRun<'_>>) -> Result<PointerRecord> {
+        NearUri::object(&uri.namespace, &uri.path)?;
+        let (sealer, journal, done) = match jr {
+            Some(j) => (j.sealer, Some(j.journal), Some(j.done)),
+            None => (self.new_sealer(opts)?, None, None),
         };
         let cs = self.chunk_size;
         ensure!(cs > 0 && cs as u64 <= near_drive_core::manifest::MAX_CHUNK_BYTES, "bad chunk_size");
@@ -223,6 +306,15 @@ impl Client {
                 let sealer = sealer.clone();
                 async move {
                     let plen = pt.len() as u64;
+                    if let Some(r) = done.and_then(|d| d.get(&idx)) {
+                        seen.lock().unwrap().insert(r.cid.clone());
+                        return Ok((r.clone(), plen));
+                    }
+                    if let Some(j) = journal {
+                        let ph = resume::plain_hash(&pt);
+                        // small write + fdatasync; fine inline next to a chunk upload
+                        j.dispatched(idx, &ph)?;
+                    }
                     let (cid, ct) = tokio::task::spawn_blocking(move || -> Result<(String, Vec<u8>)> {
                         let ct = match sealer {
                             Sealer::Plain => pt,
@@ -234,7 +326,11 @@ impl Client {
                     if !seen.lock().unwrap().insert(cid.clone()) {
                         return Ok((ChunkRef { len: ct.len() as u64, cid }, plen));
                     }
-                    Ok((self.upload_chunk(ns, cid, ct.into(), class).await?, plen))
+                    let r = self.upload_chunk(ns, cid, ct.into(), class).await?;
+                    if let Some(j) = journal {
+                        j.done(idx, &r)?;
+                    }
+                    Ok((r, plen))
                 }
             })
             .try_buffered(self.parallelism.max(1))
@@ -288,19 +384,45 @@ impl Client {
 
     /// Download to `path` with parallel chunk fetches (direct URLs preferred).
     /// Writes `{path}.drive-part` and renames it into place when complete.
+    ///
+    /// Resumable: if a download fails, the part file and
+    /// `{path}.drive-part.json` stay. The next call for the same version of the
+    /// object checks every chunk already on disk (by re-deriving its cid from
+    /// the bytes) and fetches only the missing or damaged ones.
     pub async fn get_to_file(&self, uri: &NearUri, path: impl AsRef<Path>) -> Result<ObjectHead> {
         use std::os::unix::fs::FileExt;
         let path = path.as_ref().to_path_buf();
         let loc = self.locate_or_404(uri).await?;
         let opener = self.opener(&loc.manifest)?;
-        let mut part = path.clone().into_os_string();
-        part.push(".drive-part");
-        let part = std::path::PathBuf::from(part);
-        let file = std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
+        let suffixed = |s: &str| {
+            let mut p = path.clone().into_os_string();
+            p.push(s);
+            std::path::PathBuf::from(p)
+        };
+        let (part, meta_path) = (suffixed(".drive-part"), suffixed(".drive-part.json"));
+        let meta = PartMeta { uri: uri.to_string(), manifest_cid: loc.record.manifest_cid.clone(), size: loc.manifest.size };
+        let resumable = part.exists() && std::fs::read(&meta_path).ok().and_then(|b| serde_json::from_slice::<PartMeta>(&b).ok()).is_some_and(|m| m == meta);
+        let file = if resumable {
+            std::fs::OpenOptions::new().read(true).write(true).open(&part)?
+        } else {
+            let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&part).with_context(|| format!("creating {}", part.display()))?;
+            std::fs::write(&meta_path, serde_json::to_vec(&meta)?)?;
+            f
+        };
         file.set_len(loc.manifest.size)?;
         let file = Arc::new(file);
+        let n = loc.manifest.chunks.len();
+        let have: Vec<bool> = if resumable {
+            let (f, m, o) = (file.clone(), loc.manifest.clone(), opener.clone());
+            tokio::task::spawn_blocking(move || chunks_on_disk(&f, &m, &o)).await??
+        } else {
+            vec![false; n]
+        };
+        if resumable {
+            debug(&format!("resuming download of {uri}: {}/{n} chunks already on disk", have.iter().filter(|h| **h).count()));
+        }
         let cs = loc.manifest.chunk_size;
-        let res: Result<()> = stream::iter(0..loc.manifest.chunks.len())
+        let res: Result<()> = stream::iter((0..n).filter(|i| !have[*i]))
             .map(|i| {
                 let (file, loc, opener) = (file.clone(), &loc, &opener);
                 async move {
@@ -313,11 +435,12 @@ impl Client {
             .try_collect()
             .await;
         if let Err(e) = res {
-            let _ = std::fs::remove_file(&part);
-            return Err(e);
+            let _ = file.sync_data();
+            return Err(e.context(format!("download of {uri} interrupted; partial data kept in {}, run it again to resume", part.display())));
         }
         file.sync_all()?;
         std::fs::rename(&part, &path)?;
+        let _ = std::fs::remove_file(&meta_path);
         Ok(loc.head())
     }
 
@@ -362,11 +485,5 @@ impl Client {
         }
         w.flush().await?;
         Ok(())
-    }
-}
-
-fn eprintln_debug(msg: &str) {
-    if std::env::var_os("NEAR_DRIVE_DEBUG").is_some() {
-        eprintln!("near-drive: {msg}");
     }
 }

@@ -15,6 +15,7 @@ use crate::{
     bridge::{BridgeBlobStore, BridgeConfig},
     cache::{CacheConfig, ChunkCache},
     s3::{ObjectIndexStore, S3BlobStore, S3Config},
+    small::{MemCache, SmallCacheConfig},
     store::{BlobStore, DirectUrl, FsBlobStore, FsIndexStore, IndexStore},
 };
 use anyhow::{anyhow, bail, ensure, Result};
@@ -44,6 +45,9 @@ pub struct StorageConfig {
     /// Local read-through chunk cache (useful in front of remote backends).
     #[serde(default)]
     pub cache: Option<CacheConfig>,
+    /// In-memory cache for small objects, index-entry TTL and locate inlining.
+    #[serde(default)]
+    pub small_cache: SmallCacheConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +216,8 @@ pub struct Placement {
     /// No (or an unknown) class: default class first, then all others.
     any_reads: ReadOrder,
     cache: Option<ChunkCache>,
+    mem: Option<MemCache>,
+    inline_max: u64,
 }
 
 #[derive(Debug)]
@@ -259,7 +265,8 @@ impl Placement {
         }
         let any_reads = order(format!("default class {default_class}"), class_cfgs[&default_class].backends.clone())?;
         let cache = cfg.cache.as_ref().map(|c| ChunkCache::open(c, data_dir)).transpose()?;
-        Ok(Self { classes, default_class, class_reads, any_reads, cache })
+        let mem = MemCache::new(&cfg.small_cache);
+        Ok(Self { classes, default_class, class_reads, any_reads, cache, mem, inline_max: cfg.small_cache.inline_max_bytes })
     }
 
     pub fn default_class(&self) -> &str {
@@ -268,6 +275,11 @@ impl Placement {
 
     pub fn class_names(&self) -> impl Iterator<Item = &str> {
         self.classes.keys().map(String::as_str)
+    }
+
+    /// Objects with at most this many stored bytes get their chunks inlined in `locate`.
+    pub fn inline_max(&self) -> u64 {
+        self.inline_max
     }
 
     pub fn has_class(&self, class: &str) -> bool {
@@ -282,30 +294,48 @@ impl Placement {
     pub async fn put_class(&self, class: Option<&str>, cid: &str, bytes: Bytes) -> Result<Result<(), UnknownClass>> {
         let name = class.unwrap_or(&self.default_class);
         let Some(c) = self.classes.get(name) else { return Ok(Err(UnknownClass(name.to_string()))) };
-        c.put(cid, bytes).await?;
+        c.put(cid, bytes.clone()).await?;
+        // Write-through: the commit that follows reads the manifest and checks the chunks.
+        if let Some(m) = &self.mem {
+            m.insert(cid, &bytes, true);
+        }
         Ok(Ok(()))
     }
 
     /// Store in the default class.
     pub async fn put(&self, cid: &str, bytes: Bytes) -> Result<()> {
-        self.classes[&self.default_class].put(cid, bytes).await
+        self.put_class(None, cid, bytes).await?.map_err(|u| anyhow!("unknown class {}", u.0))
     }
 
     /// Read a chunk of an object stored with `class` (None: unknown).
     pub async fn get(&self, class: Option<&str>, cid: &str) -> Result<Option<Bytes>> {
+        if let Some(b) = self.mem.as_ref().and_then(|m| m.get(cid)) {
+            return Ok(Some(b));
+        }
         if let Some(c) = &self.cache {
             if let Some(b) = c.get(cid).await {
+                if let Some(m) = &self.mem {
+                    m.insert(cid, &b, false);
+                }
                 return Ok(Some(b));
             }
         }
         let b = self.reads(class).get(cid).await?;
-        if let (Some(c), Some(b)) = (&self.cache, &b) {
-            c.insert(cid, b).await;
+        if let Some(b) = &b {
+            if let Some(c) = &self.cache {
+                c.insert(cid, b).await;
+            }
+            if let Some(m) = &self.mem {
+                m.insert(cid, b, false);
+            }
         }
         Ok(b)
     }
 
     pub async fn get_range(&self, class: Option<&str>, cid: &str, range: Range<u64>) -> Result<Option<Bytes>> {
+        if let Some(b) = self.mem.as_ref().and_then(|m| m.get(cid)) {
+            return Ok(Some(crate::store::slice_range(&b, &range)));
+        }
         if let Some(c) = &self.cache {
             if let Some(b) = c.get_range(cid, range.clone()).await {
                 return Ok(Some(b));
@@ -317,6 +347,9 @@ impl Placement {
     }
 
     pub async fn has(&self, class: Option<&str>, cid: &str) -> Result<bool> {
+        if self.mem.as_ref().is_some_and(|m| m.contains(cid)) {
+            return Ok(true);
+        }
         if let Some(c) = &self.cache {
             if c.contains(cid).await {
                 return Ok(true);
@@ -428,7 +461,8 @@ mod tests {
             "classes": {
                 "hot": {"backends": ["new"], "previous": ["old"]},
                 "bulk": {"backends": ["cold"]}
-            }
+            },
+            "small_cache": {"max_bytes": 0}
         }))
         .unwrap();
         let mut p = Placement::from_config(&cfg, dir.path()).unwrap();

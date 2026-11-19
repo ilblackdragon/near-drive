@@ -52,6 +52,16 @@ impl ChunkSealer {
         })
     }
 
+    /// The sealer of an object started earlier, rebuilt from its `enc` (the
+    /// DEK unwrapped with the owner's root key). Resuming an upload with it
+    /// re-creates identical ciphertext for identical plaintext. The caller must
+    /// make sure a chunk index is never sealed with *different* plaintext:
+    /// that would reuse a nonce under the same key.
+    pub fn reopen(root: &RootKey, enc: &EncInfo) -> Result<Self> {
+        let o = ChunkOpener::new(root, enc)?;
+        Ok(Self { cipher: o.cipher, object_id: o.object_id, nonce_prefix: o.nonce_prefix, enc: enc.clone() })
+    }
+
     /// Goes into `Manifest::enc`.
     pub fn enc_info(&self) -> &EncInfo {
         &self.enc
@@ -86,6 +96,15 @@ impl ChunkOpener {
         self.cipher
             .decrypt(&chunk_nonce(&self.nonce_prefix, idx), Payload { msg: ciphertext, aad: &aad })
             .map_err(|_| anyhow!("chunk {idx} failed authentication"))
+    }
+
+    /// Re-encrypt plaintext as chunk `idx` (deterministic), e.g. to check that
+    /// bytes already on disk are exactly chunk `idx` by comparing cids.
+    pub fn reseal(&self, idx: u64, last: bool, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let aad = chunk_aad(&self.object_id, idx, last);
+        self.cipher
+            .encrypt(&chunk_nonce(&self.nonce_prefix, idx), Payload { msg: plaintext, aad: &aad })
+            .map_err(|_| anyhow!("encryption failed"))
     }
 }
 
@@ -126,6 +145,18 @@ mod tests {
                 assert!(decrypt_object(&owner, s.enc_info(), &chunks).is_err(), "truncation must fail");
             }
         }
+    }
+
+    #[test]
+    fn reopen_and_reseal_are_deterministic() {
+        let owner = RootKey::generate();
+        let s = ChunkSealer::new(&[Recipient::Owner(&owner)]).unwrap();
+        let a = s.seal(3, false, b"same bytes").unwrap();
+        let r = ChunkSealer::reopen(&owner, s.enc_info()).unwrap();
+        assert_eq!(r.seal(3, false, b"same bytes").unwrap(), a, "resumed sealer reproduces ciphertext");
+        let o = ChunkOpener::new(&owner, s.enc_info()).unwrap();
+        assert_eq!(o.reseal(3, false, b"same bytes").unwrap(), a);
+        assert!(ChunkSealer::reopen(&RootKey::generate(), s.enc_info()).is_err(), "needs the owner's key");
     }
 
     #[test]

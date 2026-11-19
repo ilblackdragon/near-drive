@@ -99,7 +99,10 @@ struct Env {
 
 impl Env {
     fn client(&self, account: &str) -> Client {
-        Client::new(&self.url, account, self.keys[account].clone(), Some(RootKey::generate()))
+        // 503 billing_unavailable is retried; keep these tests fast.
+        let mut c = Client::new(&self.url, account, self.keys[account].clone(), Some(RootKey::generate()));
+        c.set_net(near_drive_client::NetConfig { attempts: 2, base_delay: std::time::Duration::from_millis(10), ..Default::default() });
+        c
     }
     fn billing(&self) -> &Billing {
         self.state.billing.as_deref().unwrap()

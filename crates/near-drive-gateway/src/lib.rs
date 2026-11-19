@@ -7,6 +7,7 @@ pub mod locate;
 pub mod placement;
 pub mod policies;
 pub mod s3;
+pub mod small;
 pub mod store;
 pub mod usage;
 
@@ -119,7 +120,7 @@ impl AppState {
         Ok(Arc::new(Self {
             billing,
             blobs: Placement::from_config(&cfg.storage, &cfg.data_dir)?,
-            index: cfg.storage.index.build(&cfg.data_dir)?,
+            index: small::CachedIndex::wrap(cfg.storage.index.build(&cfg.data_dir)?, &cfg.storage.small_cache),
             keys: keys::KeyResolver::new(cfg.rpc_url.clone(), cfg.storage_contract.clone(), cfg.dev_keys.clone()),
             policies: policies::PolicySource::new(
                 &cfg.policies,
@@ -417,9 +418,10 @@ async fn get_object(
         None if q.mode.as_deref() == Some("locate") => {
             billing::check(st.billing.as_deref(), &access.payer).await?;
             let located = locate::locate(&st, entry, manifest, manifest_raw).await?;
-            // Chunks handed out as direct URLs bypass the gateway; meter them as
-            // egress here (an upper bound: the client may fetch fewer bytes).
-            let direct: u64 = located.chunks.iter().filter(|c| c.url.is_some()).map(|c| c.len).sum();
+            // Chunks handed out as direct URLs bypass the gateway, and inlined
+            // chunks ride in this response; meter both as egress here (for
+            // URLs an upper bound: the client may fetch fewer bytes).
+            let direct: u64 = located.chunks.iter().filter(|c| c.url.is_some() || c.data.is_some()).map(|c| c.len).sum();
             if direct > 0 {
                 st.usage.record(usage::Event::egress(&ns, &path, &signer.account, &access.payer, direct)).await;
             }

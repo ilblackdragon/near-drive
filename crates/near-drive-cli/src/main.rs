@@ -48,6 +48,9 @@ struct Cli {
     /// Concurrent chunk transfers for put/get.
     #[arg(long, env = "NEAR_DRIVE_PARALLEL", default_value_t = near_drive_client::DEFAULT_PARALLELISM, global = true)]
     parallel: usize,
+    /// Attempts per network request (transient failures are retried with backoff).
+    #[arg(long, env = "NEAR_DRIVE_RETRIES", default_value_t = 8, global = true)]
+    retries: u32,
     /// Chunk size in MiB for uploads (1..=64).
     #[arg(long, env = "NEAR_DRIVE_CHUNK_MIB", default_value_t = 4, global = true)]
     chunk_mib: usize,
@@ -125,6 +128,9 @@ enum Cmd {
         /// Storage class (`hot`, `bulk`, ...); default: the gateway's default.
         #[arg(long)]
         class: Option<String>,
+        /// Start over instead of resuming an interrupted upload of this file.
+        #[arg(long)]
+        no_resume: bool,
     },
     /// Delete a file.
     Rm { uri: Option<String> },
@@ -200,7 +206,7 @@ fn menu() -> Vec<interactive::Choice<Cmd>> {
     vec![
         choice(Cmd::Ls { uri: None }, "ls          - List your files"),
         choice(Cmd::Get { uri: None, dst: None, range: None }, "get         - Download a file"),
-        choice(Cmd::Put { src: None, uri: None, public: false, content_type: None, share: vec![], class: None }, "put         - Upload a file"),
+        choice(Cmd::Put { src: None, uri: None, public: false, content_type: None, share: vec![], class: None, no_resume: false }, "put         - Upload a file"),
         choice(Cmd::Rm { uri: None }, "rm          - Delete a file"),
         choice(Cmd::Share { uri: None, recipient: None }, "share       - Give another account access to a file"),
         choice(Cmd::Grant { uri: None, read: vec![], write: vec![], payer: None }, "grant       - Set who can read/write a folder (onchain rule)"),
@@ -354,6 +360,7 @@ impl Ctx {
             c = c.with_chain(rpc, &self.cli.contract);
         }
         c.parallelism = self.cli.parallel.max(1);
+        c.set_net(near_drive_client::NetConfig { attempts: self.cli.retries.max(1), ..Default::default() });
         c.chunk_size = self.cli.chunk_mib * 1024 * 1024;
         Ok(c)
     }
@@ -566,7 +573,7 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
                 }
             }
         }
-        Cmd::Put { src, uri, public, content_type, share, class } => {
+        Cmd::Put { src, uri, public, content_type, share, class, no_resume } => {
             let c = ctx.client().await?;
             let src = ctx.p.text(src, "File to upload:", "SRC", None, Some("path, or - for stdin"))?;
             if src != "-" && !std::path::Path::new(&src).is_file() {
@@ -594,7 +601,9 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
                 words.extend(["--class".into(), cl.clone()]);
             }
             ctx.echo(&words);
-            let opts = PutOptions { public, content_type, share_with: share, class };
+            // Interrupted file uploads resume from a journal in <home>/uploads.
+            let resume_dir = if src == "-" || no_resume { None } else { Some(ctx.drive_home()?.join("uploads")) };
+            let opts = PutOptions { public, content_type, share_with: share, class, resume_dir };
             // streaming: bounded memory, parallel chunk uploads
             let rec = if src == "-" { c.put_reader(tokio::io::stdin(), &uri, &opts).await? } else { c.put_file(&src, &uri, &opts).await? };
             eprintln!("{uri} seq={} size={} stored={}", rec.seq, rec.size, rec.stored_size);
