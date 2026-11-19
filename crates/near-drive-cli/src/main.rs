@@ -229,12 +229,19 @@ enum SyncCmd {
     Remove { dir: Option<PathBuf> },
     /// Synced folders, last sync, conflicts and errors.
     Status,
+    /// Selective sync: stop syncing a subfolder (e.g. `Videos`) of a synced folder.
+    Exclude { dir: PathBuf, subfolder: String },
+    /// Sync a previously excluded subfolder again.
+    Include { dir: PathBuf, subfolder: String },
     /// Sync a folder now, in the foreground (`--watch`: keep going).
     Run {
         dir: Option<PathBuf>,
         remote: Option<String>,
         #[arg(long)]
         watch: bool,
+        /// Leave this subfolder out; repeatable.
+        #[arg(long)]
+        exclude: Vec<String>,
     },
 }
 
@@ -830,7 +837,7 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
                     vec![
                         choice(SyncCmd::Add { dir: None, remote: None }, "add    - Sync a local folder"),
                         choice(SyncCmd::Status, "status - Synced folders and their state"),
-                        choice(SyncCmd::Run { dir: None, remote: None, watch: false }, "run    - Sync a folder now"),
+                        choice(SyncCmd::Run { dir: None, remote: None, watch: false, exclude: vec![] }, "run    - Sync a folder now"),
                         choice(SyncCmd::Remove { dir: None }, "remove - Stop syncing a folder"),
                     ],
                 )?,
@@ -856,9 +863,11 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
                     syncs::remove(ctx, dir)?;
                 }
                 SyncCmd::Status => syncs::status(ctx)?,
-                SyncCmd::Run { dir, remote, watch } => {
+                SyncCmd::Exclude { dir, subfolder } => syncs::set_excluded(ctx, dir, &subfolder, true)?,
+                SyncCmd::Include { dir, subfolder } => syncs::set_excluded(ctx, dir, &subfolder, false)?,
+                SyncCmd::Run { dir, remote, watch, exclude } => {
                     let dir = PathBuf::from(ctx.p.text(dir.map(|d| d.display().to_string()), "Local folder:", "DIR", None, None)?);
-                    syncs::run(ctx, dir, remote, watch).await?;
+                    syncs::run(ctx, dir, remote, watch, exclude).await?;
                 }
             }
         }

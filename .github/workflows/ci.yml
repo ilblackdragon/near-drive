@@ -21,10 +21,10 @@ jobs:
         run: cargo build -p near-drive-cli
       - name: test (all crates)
         if: runner.os == 'Linux'
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
       - name: test (client, sync, gateway; macOS / Windows)
         if: runner.os != 'Linux'
         # The folder-sync, resilience and e2e suites run a real gateway in-process.
         run: >
-          cargo test -p near-drive-core -p near-drive-client -p near-drive-sync -p near-drive-cli
-          && cargo test -p near-drive-gateway --lib --test e2e --test streaming --test resilience
+          cargo test --no-fail-fast -p near-drive-core -p near-drive-client -p near-drive-sync -p near-drive-cli
+          && cargo test --no-fail-fast -p near-drive-gateway --lib --test e2e --test streaming --test resilience

@@ -324,7 +324,11 @@ pub(crate) async fn pass(client: &Client, folder: &Folder, opts: &Options) -> Re
     // Plan (hashing touched files off the async runtime).
     let now_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
     let settle_ns = opts.settle.as_nanos() as u64;
-    let keys: BTreeSet<String> = state.files.keys().chain(scan.keys()).chain(remote.keys()).cloned().collect();
+    let keys: BTreeSet<String> = state.files.keys().chain(scan.keys()).chain(remote.keys()).filter(|k| !folder.excluded(k)).cloned().collect();
+    // Selective sync: forget what we knew about excluded paths, so including
+    // them again later reconciles from scratch (identical copies merge).
+    let mut state = state;
+    state.files.retain(|k, _| !folder.excluded(k));
     let mut plan = vec![];
     for rel in keys {
         if skipped_remote.contains(&rel) {

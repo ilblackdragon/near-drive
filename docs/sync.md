@@ -9,13 +9,16 @@ near drive up                                 # keep registered folders in sync 
 near drive sync status                        # last sync, conflicts, errors per folder
 near drive sync run ~/NearDrive [--watch]     # sync now in the foreground instead
 near drive sync remove ~/NearDrive            # stop syncing (the files stay)
+near drive sync exclude ~/NearDrive Videos    # selective sync: leave a subfolder out (`include` puts it back)
 ```
 
 ## How it behaves
 
 - **Encrypted** like any other upload: the gateway and storage only see ciphertext. Every device of the account with
   the same encryption key (`keygen --ckd` derives it anywhere) sees the same files.
-- **Changes** on this device are noticed right away (file-system events), changes elsewhere within 30 seconds. A file
+- **Changes** on this device are noticed right away (file-system events). Changes elsewhere are pushed by the gateway
+  (a long-poll `watch`) as soon as they are written through it; writes through other gateways are picked up by a
+  re-list every 30 seconds. A file
   is uploaded once it has been unchanged for 2 seconds, so half-saved files don't go up. Touching a file without
   changing it transfers nothing.
 - **Nothing is overwritten unseen.** An upload or delete only happens if the remote file is still the version this
@@ -34,7 +37,9 @@ near drive sync remove ~/NearDrive            # stop syncing (the files stay)
   folders: `~/.near-drive/sync.json`. The background service re-reads it, so `sync add` / `remove` take effect within
   seconds. Log: `~/.near-drive/daemon.log`.
 
-## Not yet
+## Selective sync
 
-Files on demand (placeholders that download when opened: Windows Cloud Files API, macOS File Provider, FUSE on
-Linux), choosing which subfolders to sync, push notifications instead of polling, and a tray / menu-bar app.
+`sync exclude <folder> <subfolder>` leaves a subfolder out in both directions: its remote files are not downloaded,
+local files there are not uploaded, and nothing in it is deleted on either side. Copies already on this device stay
+(delete them to free space). `sync include` syncs it again; files present on both sides with the same content merge
+without conflicts. `sync run --exclude <subfolder>` does the same for a one-off run.

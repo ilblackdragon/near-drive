@@ -7,6 +7,7 @@ pub mod locate;
 pub mod placement;
 pub mod policies;
 pub mod s3;
+pub mod changes;
 pub mod small;
 pub mod store;
 pub mod usage;
@@ -103,6 +104,7 @@ pub struct AppState {
     pub policies: policies::PolicySource,
     pub usage: usage::UsageSink,
     pub billing: Option<Arc<billing::Billing>>,
+    pub changes: changes::Hub,
     replay: Mutex<HashMap<String, Instant>>,
 }
 
@@ -131,6 +133,7 @@ impl AppState {
             ),
             usage: usage::UsageSink::open(cfg.data_dir.join("usage.jsonl")).await?,
             replay: Mutex::new(HashMap::new()),
+            changes: changes::Hub::default(),
             cfg,
         }))
     }
@@ -150,6 +153,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/chunk/{ns}/{cid}", put(put_chunk))
         .route("/v1/o/{ns}/{*path}", put(put_object).get(get_object).delete(delete_object))
         .route("/v1/list/{ns}", get(list_objects))
+        .route("/v1/watch/{ns}", get(watch))
         .layer(DefaultBodyLimit::max(MAX_CHUNK_BYTES as usize + 1024 * 1024))
         .with_state(state);
     match cors {
@@ -365,6 +369,7 @@ async fn put_object(
         }
         Err(CasError::Other(e)) => return Err(e.into()),
     }
+    st.changes.record(&ns, &path);
     st.usage
         .record(usage::Event::put(&ns, &path, &signer.account, &access.payer, entry.stored_size, prev.map(|p| p.stored_size).unwrap_or(0)))
         .await;
@@ -486,6 +491,7 @@ async fn delete_object(
         Err(CasError::Conflict { .. }) => return Err(err(StatusCode::CONFLICT, "object changed concurrently")),
         Err(CasError::Other(e)) => return Err(e.into()),
     }
+    st.changes.record(&ns, &path);
     st.usage.record(usage::Event::delete(&ns, &path, &signer.account, &access.payer, rec.stored_size)).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -516,4 +522,35 @@ async fn list_objects(
         .map(|r| json!({"path": r.path, "size": r.size, "seq": r.seq, "writer": r.writer, "ts_ms": r.ts_ms, "manifest_cid": r.manifest_cid, "class": r.class}))
         .collect();
     Ok(Json(entries).into_response())
+}
+
+#[derive(Deserialize)]
+struct WatchQuery {
+    #[serde(default)]
+    prefix: String,
+    cursor: Option<String>,
+    #[serde(default)]
+    timeout_ms: u64,
+}
+
+/// Long poll for changes under a prefix (see `changes.rs`).
+async fn watch(
+    State(st): State<Arc<AppState>>,
+    Path(ns): Path<String>,
+    Query(q): Query<WatchQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    check_ns(&ns)?;
+    let signer = authenticate(&st, &method, &uri, &headers, &[]).await?;
+    let rules = st.rules(&ns).await?;
+    // Same visibility as listing: anyone who can read something under the prefix.
+    if !(policy::resolve(&ns, &rules, &q.prefix, &signer.account).read || policy::can_write_somewhere(&ns, &rules, &signer.account)) {
+        return Err(err(StatusCode::FORBIDDEN, "no read access"));
+    }
+    let mut r = st.changes.wait(&ns, &q.prefix, q.cursor.as_deref(), Duration::from_millis(q.timeout_ms)).await;
+    // Only reveal paths the caller may read.
+    r.paths.retain(|p| policy::resolve(&ns, &rules, p, &signer.account).read);
+    Ok(Json(r).into_response())
 }

@@ -422,7 +422,7 @@ mod tests {
         write(
             &cfg_path,
             &format!(
-                "version = \"4\"\ncredentials_home_dir = \"{}\"\n[network_connection.local]\nnetwork_name = \"localnet\"\nrpc_url = \"http://127.0.0.1:1/\"\nwallet_url = \"x\"\nexplorer_transaction_url = \"x\"\n",
+                "version = \"4\"\ncredentials_home_dir = '{}'\n[network_connection.local]\nnetwork_name = \"localnet\"\nrpc_url = \"http://127.0.0.1:1/\"\nwallet_url = \"x\"\nexplorer_transaction_url = \"x\"\n",
                 creds.display()
             ),
         );

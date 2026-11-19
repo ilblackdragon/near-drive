@@ -151,7 +151,9 @@ fn u(s: &str) -> NearUri {
 #[tokio::test]
 async fn every_operation_survives_a_flaky_network() {
     let env = setup().await;
-    let c = env.client(8, 4);
+    // Half of all requests fail, so give each one enough attempts that a
+    // run of bad luck (0.5^n per request) never decides the test.
+    let c = env.client(24, 4);
     env.proxy.set(Mode::Flaky);
     let h = write_pattern_file(&env.path("big"), 7, 1_000_000);
     let big = u("near://alice.near/big.bin");

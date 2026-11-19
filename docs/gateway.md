@@ -147,6 +147,14 @@ Add a `billing` section to bill each folder's `payer` in NEAR AI Cloud credits. 
   Cloud once; until then, writes get 402 `unknown_account`.
 - Payment in stablecoins / NEAR Intents through the contract: [payments.md](payments.md).
 
+## Change notifications
+
+`GET /v1/watch/{account}?prefix=&cursor=&timeout_ms=` is a long poll (up to 60 s) that returns as soon as a file under
+the prefix is written or deleted through this gateway; folder sync uses it instead of polling. The feed is in memory
+per gateway process, so the gateway stays stateless: a cursor from another process (after a restart, or another
+gateway) simply answers "changed" and the client re-lists, and writes made through other gateways reach clients at
+their periodic re-list.
+
 ## Registering
 
 Register the gateway in `drive.near` so clients with `--gateway auto` can find it: `register_gateway({url, regions,

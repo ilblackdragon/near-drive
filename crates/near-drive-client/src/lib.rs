@@ -44,6 +44,15 @@ pub struct ObjectHead {
     pub class: Option<String>,
 }
 
+/// Answer of [`Client::watch`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchResult {
+    pub cursor: String,
+    pub changed: bool,
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListEntry {
     pub path: String,
@@ -397,6 +406,30 @@ impl Client {
         };
         ensure!(data.len() as u64 == head.manifest.size, "size mismatch");
         Ok(data)
+    }
+
+    /// Long poll: returns when something under `prefix` changes (through
+    /// this gateway) or after `timeout`. Pass `None` first to get a cursor,
+    /// then the returned cursor each time. `changed` with no `paths` means
+    /// "re-list". `Ok(None)`: the gateway has no watch support.
+    pub async fn watch(&self, prefix: &NearUri, cursor: Option<&str>, timeout: std::time::Duration) -> Result<Option<WatchResult>> {
+        let mut q = format!("prefix={}&timeout_ms={}", encode_path(&prefix.path), timeout.as_millis());
+        if let Some(c) = cursor {
+            q.push_str(&format!("&cursor={}", encode_path(c)));
+        }
+        let path = format!("/v1/watch/{}", prefix.namespace);
+        let resp = self
+            // request deadline = base + the long-poll wait
+            .send_with(Method::GET, &path, &q, Bytes::new(), None, timeout.as_secs().saturating_mul(self.net.min_throughput))
+            .await
+            .map_err(|e| e.context("watch"))?;
+        if resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::METHOD_NOT_ALLOWED {
+            return Ok(None);
+        }
+        match ok_or_attempt(Ok(resp)).await {
+            Attempt::Done(r) => Ok(Some(r.json().await?)),
+            Attempt::Retry(e, _) | Attempt::Fatal(e) => Err(e),
+        }
     }
 
     pub async fn list(&self, prefix: &NearUri) -> Result<Vec<ListEntry>> {

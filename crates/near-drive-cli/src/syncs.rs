@@ -19,6 +19,9 @@ pub struct SyncEntry {
     pub remote: String,
     pub account: String,
     pub network: String,
+    /// Selective sync: subfolders left out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -76,7 +79,7 @@ pub async fn add(ctx: &mut Ctx, dir: PathBuf, remote: Option<String>) -> Result<
             bail!("{} overlaps the synced folder {}", local.display(), f.local.display());
         }
     }
-    cfg.folders.push(SyncEntry { local: local.clone(), remote: remote.to_string(), account, network: ctx.network.clone() });
+    cfg.folders.push(SyncEntry { local: local.clone(), remote: remote.to_string(), account, network: ctx.network.clone(), exclude: vec![] });
     cfg.save(&home)?;
     println!("{} <-> {remote}", local.display());
     if crate::daemon::running(&home) {
@@ -101,6 +104,28 @@ pub fn remove(ctx: &Ctx, dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Selective sync: leave `sub` out of a registered folder (or put it back).
+pub fn set_excluded(ctx: &Ctx, dir: PathBuf, sub: &str, exclude: bool) -> Result<()> {
+    let home = ctx.drive_home()?;
+    let mut cfg = SyncConfig::load(&home)?;
+    let local = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let f = cfg.folders.iter_mut().find(|f| f.local == local).with_context(|| format!("{} is not a synced folder", local.display()))?;
+    // Accept a path inside the folder as well as a relative one.
+    let rel = Path::new(sub).strip_prefix(&local).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| sub.to_string());
+    let rel = near_drive_sync::normalize_folder(&rel);
+    if rel.is_empty() {
+        bail!("name a subfolder of {}", local.display());
+    }
+    f.exclude.retain(|e| near_drive_sync::normalize_folder(e) != rel);
+    if exclude {
+        f.exclude.push(rel.clone());
+        println!("{rel} is no longer synced in {} (local files there stay; delete them to free space)", local.display());
+    } else {
+        println!("{rel} is synced again in {}", local.display());
+    }
+    cfg.save(&home)
+}
+
 pub fn status(ctx: &Ctx) -> Result<()> {
     let home = ctx.drive_home()?;
     let cfg = SyncConfig::load(&home)?;
@@ -111,6 +136,9 @@ pub fn status(ctx: &Ctx) -> Result<()> {
     println!("background service: {}", if crate::daemon::running(&home) { "running" } else { "stopped (`near drive up`)" });
     for f in &cfg.folders {
         println!("\n{} <-> {} ({} on {})", f.local.display(), f.remote, f.account, f.network);
+        if !f.exclude.is_empty() {
+            println!("  not synced: {}", f.exclude.join(", "));
+        }
         match near_drive_sync::read_status(&f.local) {
             None => println!("  not synced yet"),
             Some(s) => {
@@ -164,10 +192,10 @@ fn print_report(f: &Folder, r: &near_drive_sync::Report) {
 }
 
 /// `sync run`: one pass (repeated while something is pending), or `--watch`.
-pub async fn run(ctx: &mut Ctx, dir: PathBuf, remote: Option<String>, watch: bool) -> Result<()> {
+pub async fn run(ctx: &mut Ctx, dir: PathBuf, remote: Option<String>, watch: bool, exclude: Vec<String>) -> Result<()> {
     let c = ctx.client().await?;
     let remote = remote_prefix(remote.as_deref(), c.account())?;
-    let folder = Folder::new(&dir, remote)?;
+    let folder = Folder::new(&dir, remote)?.with_exclude(exclude);
     let opts = Options { parallel: 4, ..Default::default() };
     if watch {
         init_tracing();
@@ -201,7 +229,8 @@ pub fn init_tracing() {
 /// Background: keep every registered folder of `account` on `network` in
 /// sync, re-reading `sync.json` so `sync add` / `remove` take effect live.
 pub async fn supervise(client: Arc<Client>, home: PathBuf, account: String, network: String) -> Result<()> {
-    type Running = (tokio::sync::oneshot::Sender<()>, String, tokio::task::JoinHandle<()>);
+    // (stop, what it was started with, task)
+    type Running = (tokio::sync::oneshot::Sender<()>, (String, Vec<String>), tokio::task::JoinHandle<()>);
     let mut running: HashMap<PathBuf, Running> = HashMap::new();
     loop {
         let wanted: Vec<SyncEntry> = match SyncConfig::load(&home) {
@@ -213,12 +242,12 @@ pub async fn supervise(client: Arc<Client>, home: PathBuf, account: String, netw
         };
         // Stop removed (or re-pointed) folders (dropping the sender stops the
         // loop); restart ones whose loop ended with an error.
-        running.retain(|local, (_, remote, task)| !task.is_finished() && wanted.iter().any(|w| &w.local == local && &w.remote == remote));
+        running.retain(|local, (_, started, task)| !task.is_finished() && wanted.iter().any(|w| &w.local == local && (&w.remote, &w.exclude) == (&started.0, &started.1)));
         for w in wanted {
             if running.contains_key(&w.local) {
                 continue;
             }
-            let folder = match near_drive_client::near_drive_core::NearUri::parse(&w.remote).map_err(anyhow::Error::from).and_then(|r| Folder::new(&w.local, r)) {
+            let folder = match near_drive_client::near_drive_core::NearUri::parse(&w.remote).map_err(anyhow::Error::from).and_then(|r| Folder::new(&w.local, r)).map(|f| f.with_exclude(&w.exclude)) {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::warn!("{}: {e:#}", w.local.display());
@@ -237,7 +266,7 @@ pub async fn supervise(client: Arc<Client>, home: PathBuf, account: String, netw
                     tracing::error!("{}: {e:#}", folder.local.display());
                 }
             });
-            running.insert(w.local.clone(), (tx, w.remote.clone(), task));
+            running.insert(w.local.clone(), (tx, (w.remote.clone(), w.exclude.clone()), task));
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }

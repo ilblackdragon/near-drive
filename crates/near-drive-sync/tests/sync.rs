@@ -227,3 +227,49 @@ async fn run_loop_picks_up_local_changes() {
     stop_tx.send(()).unwrap();
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn remote_changes_are_pushed_not_polled() {
+    let env = setup().await;
+    let (a, b) = (env.device("a"), env.device("b"));
+    // Poll interval far longer than the test: only the gateway's watch can wake b.
+    let o = Options { settle: Duration::from_millis(100), poll: Duration::from_secs(600), ..Default::default() };
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let (cb, fb, ob) = (env.client(), b.clone(), o.clone());
+    let task = tokio::spawn(async move { near_drive_sync::run(&cb, &fb, &ob, async { let _ = stop_rx.await; }).await });
+    tokio::time::sleep(Duration::from_millis(500)).await; // first pass + watch cursor
+    write(&a, "pushed.txt", b"from a");
+    sync_once(&env.client(), &a, &opts()).await.unwrap();
+    let t0 = std::time::Instant::now();
+    while read(&b, "pushed.txt").is_none() && t0.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(read(&b, "pushed.txt").as_deref(), Some(&b"from a"[..]), "not delivered within 10 s");
+    stop_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn selective_sync_leaves_excluded_folders_alone() {
+    let env = setup().await;
+    let c = env.client();
+    let a = env.device("a");
+    let b = env.device("b").with_exclude(["Videos", "/Work/old/"]);
+    write(&a, "Videos/trip.mp4", b"huge");
+    write(&a, "Work/old/archive.zip", b"old");
+    write(&a, "Work/new.txt", b"new");
+    sync_once(&c, &a, &opts()).await.unwrap();
+    let r = sync_once(&c, &b, &opts()).await.unwrap();
+    assert_eq!(r.downloaded, vec!["Work/new.txt"], "{r:?}");
+    assert!(read(&b, "Videos/trip.mp4").is_none());
+    // A local file in an excluded folder is not uploaded, and its absence remotely deletes nothing.
+    write(&b, "Videos/local-only.mp4", b"mine");
+    assert!(!sync_once(&c, &b, &opts()).await.unwrap().changed());
+    sync_once(&c, &a, &opts()).await.unwrap();
+    assert!(read(&a, "Videos/local-only.mp4").is_none() && read(&a, "Videos/trip.mp4").is_some());
+    // Including it again: remote files come down, the local one goes up.
+    let b = Folder { exclude: vec![], ..b };
+    let r = sync_once(&c, &b, &opts()).await.unwrap();
+    assert_eq!(r.downloaded.len(), 2, "{r:?}");
+    assert_eq!(r.uploaded, vec!["Videos/local-only.mp4"]);
+}

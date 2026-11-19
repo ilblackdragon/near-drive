@@ -26,6 +26,10 @@ pub struct Folder {
     pub local: PathBuf,
     /// `near://<namespace>/` or `near://<namespace>/<prefix>/`.
     pub remote: NearUri,
+    /// Selective sync: subfolders (relative, e.g. `Photos/2019`) left out in
+    /// both directions. Excluded files are neither downloaded, uploaded nor
+    /// deleted; local copies already present stay as they are.
+    pub exclude: Vec<String>,
 }
 
 impl Folder {
@@ -36,7 +40,18 @@ impl Folder {
         }
         std::fs::create_dir_all(&local)?;
         let local = std::fs::canonicalize(&local)?;
-        Ok(Self { local, remote })
+        Ok(Self { local, remote, exclude: vec![] })
+    }
+
+    /// Leave these subfolders out (see [`Folder::exclude`]).
+    pub fn with_exclude(mut self, exclude: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        self.exclude = exclude.into_iter().map(|e| normalize_folder(e.as_ref())).filter(|e| !e.is_empty()).collect();
+        self
+    }
+
+    /// Is `rel` inside an excluded subfolder?
+    pub fn excluded(&self, rel: &str) -> bool {
+        self.exclude.iter().any(|e| rel.starts_with(e.as_str()))
     }
 
     pub fn meta_dir(&self) -> PathBuf {
@@ -57,6 +72,17 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self { parallel: 4, poll: Duration::from_secs(30), settle: Duration::from_secs(2) }
+    }
+}
+
+/// `Photos\\2019`, `/Photos/2019/` -> `Photos/2019/` (NFC, '/'-separated).
+pub fn normalize_folder(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let parts: Vec<String> = s.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").map(|p| p.nfc().collect()).collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", parts.join("/"))
     }
 }
 
@@ -130,8 +156,9 @@ fn write_status(folder: &Folder, s: &Status) {
 }
 
 /// Keep `folder` in sync until `stop` resolves: a pass at start, after local
-/// changes (debounced), every `poll`, and with backoff after failures (e.g.
-/// offline: local edits wait and go up once the gateway is reachable).
+/// changes (debounced), when the gateway reports a remote change (long-poll
+/// `watch`), every `poll`, and with backoff after failures (e.g. offline:
+/// local edits wait and go up once the gateway is reachable).
 pub async fn run(client: &Client, folder: &Folder, opts: &Options, stop: impl std::future::Future<Output = ()>) -> Result<()> {
     use notify::{RecursiveMode, Watcher};
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -147,6 +174,9 @@ pub async fn run(client: &Client, folder: &Folder, opts: &Options, stop: impl st
     })?;
     watcher.watch(&folder.local, RecursiveMode::Recursive)?;
     tokio::pin!(stop);
+    let (rtx, mut rrx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let remote = watch_remote(client, folder, rtx);
+    tokio::pin!(remote);
     let mut failures = 0u32;
     loop {
         let (wait, status) = match sync_once(client, folder, opts).await {
@@ -171,10 +201,40 @@ pub async fn run(client: &Client, folder: &Folder, opts: &Options, stop: impl st
         write_status(folder, &status);
         tokio::select! {
             _ = &mut stop => return Ok(()),
+            _ = &mut remote => {}
             _ = tokio::time::sleep(wait) => {}
             Some(()) = rx.recv() => {
                 // Debounce bursts (a save is several events; a copy is many).
                 while tokio::time::timeout(Duration::from_millis(500), rx.recv()).await.is_ok_and(|v| v.is_some()) {}
+            }
+            Some(()) = rrx.recv() => {
+                // A burst of remote writes (e.g. another device's sync pass): wait for it to settle.
+                while tokio::time::timeout(Duration::from_millis(300), rrx.recv()).await.is_ok_and(|v| v.is_some()) {}
+            }
+        }
+    }
+}
+
+/// Long-poll the gateway for changes under the folder's prefix and signal
+/// each one. Never returns while watching works; on a gateway without watch
+/// support it parks (the periodic poll still runs).
+async fn watch_remote(client: &Client, folder: &Folder, tx: tokio::sync::mpsc::UnboundedSender<()>) {
+    let mut cursor: Option<String> = None;
+    let mut failures = 0u32;
+    loop {
+        match client.watch(&folder.remote, cursor.as_deref(), Duration::from_secs(25)).await {
+            Ok(Some(r)) => {
+                failures = 0;
+                if r.changed && cursor.is_some() {
+                    let _ = tx.send(());
+                }
+                cursor = Some(r.cursor);
+            }
+            Ok(None) => return std::future::pending().await,
+            Err(e) => {
+                failures += 1;
+                tracing::debug!("watch {}: {e:#}", folder.remote);
+                tokio::time::sleep((Duration::from_secs(1) * 2u32.saturating_pow(failures.min(6))).min(Duration::from_secs(60))).await;
             }
         }
     }
