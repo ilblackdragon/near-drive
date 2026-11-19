@@ -22,6 +22,8 @@ const SK: &str = "testsecretkey0123456789abcdefghijklmnopq";
 
 struct Env {
     url: String,
+    gw_url: String,
+    alice: SigningKey,
     gw_dir: tempfile::TempDir,
     _home: tempfile::TempDir,
     s3: S3,
@@ -40,6 +42,7 @@ async fn start() -> Env {
         storage_contract: "storage.near".into(),
         dev_keys,
         policies,
+        ..Default::default()
     };
     let state = AppState::new(cfg).await.unwrap();
     let gl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -47,7 +50,7 @@ async fn start() -> Env {
     tokio::spawn(async move { axum::serve(gl, gw_router(state)).await.unwrap() });
 
     let home = tempfile::tempdir().unwrap();
-    let mut client = Client::new(&gw_url, "alice.near", alice, Some(RootKey::from_bytes([9; 32])));
+    let mut client = Client::new(&gw_url, "alice.near", alice.clone(), Some(RootKey::from_bytes([9; 32])));
     client.chunk_size = 64 * 1024; // multi-chunk objects in tests
     let mut pcfg = ProxyConfig::new(sigv4::Credentials { access_key: AK.into(), secret_key: SK.into() }, home.path().join("s3-staging"));
     pcfg.public_prefixes = vec!["public/".into()];
@@ -57,7 +60,7 @@ async fn start() -> Env {
     let url = format!("http://{}", pl.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(pl, nstorage_s3::router(proxy)).await.unwrap() });
     let s3 = s3_client(&url, AK, SK);
-    Env { url, gw_dir, _home: home, s3 }
+    Env { url, gw_url, alice, gw_dir, _home: home, s3 }
 }
 
 fn s3_client(url: &str, ak: &str, sk: &str) -> S3 {
@@ -527,6 +530,39 @@ async fn auth_presigned_bad_signatures_and_streaming() {
     vh.put_object().bucket(B).key("vh/key").body(ByteStream::from_static(b"vhost")).send().await.unwrap_or_else(|e| panic!("{e:?}"));
     let g = s3.get_object().bucket(B).key("vh/key").send().await.unwrap();
     assert_eq!(body(g).await, b"vhost");
+}
+
+#[tokio::test]
+async fn large_objects_stream_and_foreign_keys() {
+    let env = start().await;
+    let s3 = &env.s3;
+    // > STREAM_THRESHOLD: GET is streamed to the client
+    let big = data(9 * 1024 * 1024 + 4321, 21);
+    s3.put_object().bucket(B).key("big/blob").metadata("m", "1").body(ByteStream::from(big.clone())).send().await.unwrap();
+    let g = s3.get_object().bucket(B).key("big/blob").send().await.unwrap();
+    assert_eq!(g.content_length(), Some(big.len() as i64));
+    assert_eq!(body(g).await, big);
+    // large range (streamed) and small range (buffered) not chunk-aligned
+    let r = s3.get_object().bucket(B).key("big/blob").range("bytes=1000-9000999").send().await.unwrap();
+    assert_eq!(body(r).await, &big[1000..9_001_000]);
+    let r = s3.get_object().bucket(B).key("big/blob").range("bytes=65530-65545").send().await.unwrap();
+    assert_eq!(body(r).await, &big[65530..65546]);
+    // large copy goes through a spooled temp file
+    s3.copy_object().bucket(B).key("big/copy").copy_source(format!("{B}/big/blob")).send().await.unwrap();
+    let g = s3.get_object().bucket(B).key("big/copy").send().await.unwrap();
+    assert_eq!(g.metadata().unwrap().get("m").map(String::as_str), Some("1"));
+    assert_eq!(body(g).await, big);
+
+    // objects encrypted to a different root key -> AccessDenied (small and streamed paths)
+    let mut other = Client::new(&env.gw_url, "alice.near", env.alice.clone(), Some(RootKey::from_bytes([1; 32])));
+    other.chunk_size = 64 * 1024;
+    let opts = nstorage_client::PutOptions::default();
+    other.put(&nstorage_client::nstorage_core::NearUri::parse("near://alice.near/foreign/small").unwrap(), b"x", &opts).await.unwrap();
+    other.put(&nstorage_client::nstorage_core::NearUri::parse("near://alice.near/foreign/big").unwrap(), &big, &opts).await.unwrap();
+    for k in ["foreign/small", "foreign/big"] {
+        let e = s3.get_object().bucket(B).key(k).send().await.unwrap_err();
+        assert_eq!(code(&e), "AccessDenied", "{k}");
+    }
 }
 
 /// Virtual-host addressing: the SDK sends `Host: alice.near.localhost:<port>`

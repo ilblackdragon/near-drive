@@ -1,5 +1,10 @@
 //! nstorage gateway: stateless HTTP front for the index store and blob backends.
+pub mod bridge;
+pub mod cache;
 pub mod keys;
+pub mod locate;
+pub mod placement;
+pub mod s3;
 pub mod store;
 pub mod usage;
 
@@ -26,7 +31,8 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use store::{BlobStore, CasError, FsBlobStore, FsIndexStore, IndexStore};
+use placement::{Placement, StorageConfig};
+use store::{CasError, IndexStore};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +50,23 @@ pub struct Config {
     /// namespace -> ordered rules. Stand-in for the `storage.near` contract.
     #[serde(default)]
     pub policies: HashMap<String, Vec<Rule>>,
+    /// Blob backends, storage classes, index store, chunk cache (see README).
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            listen: "127.0.0.1:8787".into(),
+            data_dir: "./nst-data".into(),
+            rpc_url: None,
+            storage_contract: default_contract(),
+            dev_keys: HashMap::new(),
+            policies: HashMap::new(),
+            storage: StorageConfig::default(),
+        }
+    }
 }
 
 fn default_contract() -> String {
@@ -52,8 +75,8 @@ fn default_contract() -> String {
 
 pub struct AppState {
     pub cfg: Config,
-    pub blobs: FsBlobStore,
-    pub index: FsIndexStore,
+    pub blobs: Placement,
+    pub index: Arc<dyn IndexStore>,
     pub keys: keys::KeyResolver,
     pub usage: usage::UsageSink,
     replay: Mutex<HashMap<String, Instant>>,
@@ -63,8 +86,8 @@ impl AppState {
     pub async fn new(cfg: Config) -> anyhow::Result<Arc<Self>> {
         tokio::fs::create_dir_all(&cfg.data_dir).await?;
         Ok(Arc::new(Self {
-            blobs: FsBlobStore::new(cfg.data_dir.join("chunks")),
-            index: FsIndexStore::new(cfg.data_dir.join("index")),
+            blobs: Placement::from_config(&cfg.storage, &cfg.data_dir)?,
+            index: cfg.storage.index.build(&cfg.data_dir)?,
             keys: keys::KeyResolver::new(cfg.rpc_url.clone(), cfg.storage_contract.clone(), cfg.dev_keys.clone()),
             usage: usage::UsageSink::open(cfg.data_dir.join("usage.jsonl")).await?,
             replay: Mutex::new(HashMap::new()),
@@ -106,7 +129,7 @@ fn err(code: StatusCode, msg: impl Into<String>) -> ApiError {
     ApiError(code, msg.into())
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
@@ -175,7 +198,10 @@ async fn put_chunk(
     if body.len() as u64 > MAX_CHUNK_BYTES + 64 {
         return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "chunk too large"));
     }
-    st.blobs.put(&cid, &body).await?;
+    let class = headers.get(placement::CLASS_HEADER).and_then(|v| v.to_str().ok());
+    if let Err(placement::UnknownClass(c)) = st.blobs.put_class(class, &cid, body).await? {
+        return Err(err(StatusCode::BAD_REQUEST, format!("unknown storage class {c:?}")));
+    }
     Ok(StatusCode::CREATED)
 }
 
@@ -217,10 +243,8 @@ async fn put_object(
     if m.size != rec.size || m.stored_size() + mlen != rec.stored_size {
         return bad("record sizes do not match manifest");
     }
-    for c in &m.chunks {
-        if !st.blobs.has(&c.cid).await? {
-            return Err(err(StatusCode::BAD_REQUEST, format!("chunk {} not uploaded", c.cid)));
-        }
+    if let Some(missing) = missing_chunk(&st, &m).await? {
+        return Err(err(StatusCode::BAD_REQUEST, format!("chunk {missing} not uploaded")));
     }
     let prev = st.index.get(&ns, &path).await?;
     match st.index.cas_put(&rec).await {
@@ -236,9 +260,29 @@ async fn put_object(
     Ok((StatusCode::CREATED, Json(json!({"seq": rec.seq}))).into_response())
 }
 
+/// First chunk of `m` that no backend has (checked concurrently).
+async fn missing_chunk(st: &AppState, m: &Manifest) -> anyhow::Result<Option<String>> {
+    use futures_util::{StreamExt, TryStreamExt};
+    let cids: Vec<String> = m.chunks.iter().map(|c| c.cid.clone()).collect();
+    let mut s = futures_util::stream::iter(cids)
+        .map(move |cid: String| async move {
+            let has = st.blobs.has(&cid).await?;
+            Ok::<_, anyhow::Error>((cid, has))
+        })
+        .buffer_unordered(32);
+    while let Some((cid, has)) = s.try_next().await? {
+        if !has {
+            return Ok(Some(cid));
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Deserialize)]
 struct GetQuery {
     chunk: Option<String>,
+    /// `locate`: also return per-chunk direct-fetch URLs.
+    mode: Option<String>,
 }
 
 async fn get_object(
@@ -258,14 +302,32 @@ async fn get_object(
     let rec = st.index.get(&ns, &path).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "not found"))?;
     let (manifest, _) = load_manifest(&st, &rec.manifest_cid).await?;
     match q.chunk {
+        None if q.mode.as_deref() == Some("locate") => Ok(Json(locate::locate(&st, rec, manifest).await?).into_response()),
         None => Ok(Json(json!({"record": rec, "manifest": manifest})).into_response()),
         Some(cid) => {
-            if cid != rec.manifest_cid && !manifest.chunks.iter().any(|c| c.cid == cid) {
-                return Err(err(StatusCode::NOT_FOUND, "chunk is not part of this object"));
-            }
-            let bytes = st.blobs.get(&cid).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "chunk missing from backend"))?;
-            st.usage.record(usage::Event::egress(&ns, &path, &signer.account, &access.payer, bytes.len() as u64)).await;
-            Ok(([("content-type", "application/octet-stream")], bytes).into_response())
+            let len = if cid == rec.manifest_cid {
+                None
+            } else {
+                Some(manifest.chunks.iter().find(|c| c.cid == cid).ok_or_else(|| err(StatusCode::NOT_FOUND, "chunk is not part of this object"))?.len)
+            };
+            let missing = || err(StatusCode::NOT_FOUND, "chunk missing from backend");
+            let range_h = headers.get(axum::http::header::RANGE).and_then(|v| v.to_str().ok());
+            let resp = match (len, range_h) {
+                // ranged read of a data chunk: fetch only the range from the backend
+                (Some(len), Some(h)) => match bridge::parse_range(Some(h), len) {
+                    Ok(Some(r)) => {
+                        let bytes = st.blobs.get_range(&cid, r.clone()).await?.ok_or_else(missing)?;
+                        let cr = format!("bytes {}-{}/{len}", r.start, r.end - 1);
+                        (StatusCode::PARTIAL_CONTENT, [("content-type", "application/octet-stream".to_string()), ("content-range", cr)], bytes).into_response()
+                    }
+                    Ok(None) => bridge::ranged_response(&headers, st.blobs.get(&cid).await?.ok_or_else(missing)?),
+                    Err(bridge::Unsatisfiable) => return Err(err(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable")),
+                },
+                _ => bridge::ranged_response(&headers, st.blobs.get(&cid).await?.ok_or_else(missing)?),
+            };
+            let served = axum::body::HttpBody::size_hint(resp.body()).exact().unwrap_or(0);
+            st.usage.record(usage::Event::egress(&ns, &path, &signer.account, &access.payer, served)).await;
+            Ok(resp)
         }
     }
 }

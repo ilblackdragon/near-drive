@@ -28,7 +28,7 @@ use axum::{
     response::Response,
     Router,
 };
-use backend::{BackendError, GetResult, ListItem, ObjectBackend, ObjectInfo, PutParams, PutSource, RangeSpec};
+use backend::{BackendError, GetResult, ListItem, ObjectBackend, ObjectData, ObjectInfo, PutParams, PutSource, RangeSpec};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
 use error::{S3Error, S3Result};
 use multipart::{Staging, UploadMeta};
@@ -457,12 +457,39 @@ impl<B: ObjectBackend> Proxy<B> {
         Ok(info)
     }
 
+    /// Turn object data into an upload source: small data stays in memory,
+    /// streams are spooled to a temp file in the staging dir (bounded memory).
+    async fn spool(&self, data: ObjectData) -> S3Result<PutSource> {
+        use futures_util::TryStreamExt;
+        use tokio::io::AsyncWriteExt;
+        match data {
+            ObjectData::Mem(v) => Ok(PutSource::Mem(v)),
+            ObjectData::Stream(mut s) => {
+                tokio::fs::create_dir_all(&self.cfg.staging_dir).await?;
+                let path = self.cfg.staging_dir.join(format!("copy-{}.tmp", hex::encode(rand::random::<[u8; 8]>())));
+                let mut f = tokio::fs::File::create(&path).await?;
+                let res: std::io::Result<()> = async {
+                    while let Some(b) = s.try_next().await? {
+                        f.write_all(&b).await?;
+                    }
+                    f.flush().await
+                }
+                .await;
+                if let Err(e) = res {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    return Err(e.into());
+                }
+                Ok(PutSource::File(path))
+            }
+        }
+    }
+
     async fn load_meta(&self, bucket: &str, key: &str, info: &ObjectInfo) -> BTreeMap<String, String> {
         if !split_ct(info.content_type.as_deref()).1 {
             return BTreeMap::new();
         }
         match self.backend.get(bucket, &format!("{key}{META_SUFFIX}"), None).await {
-            Ok(GetResult { data, .. }) => match serde_json::from_slice::<MetaSidecar>(&data) {
+            Ok(GetResult { data, .. }) => match serde_json::from_slice::<MetaSidecar>(&data.into_vec().await.unwrap_or_default()) {
                 Ok(s) if s.for_cid == info.manifest_cid => s.meta,
                 _ => BTreeMap::new(),
             },
@@ -741,7 +768,8 @@ impl<B: ObjectBackend> Proxy<B> {
             }
         }
         let body = match data {
-            Some(d) if !head_only => Body::from(d),
+            Some(ObjectData::Mem(d)) if !head_only => Body::from(d),
+            Some(ObjectData::Stream(s)) if !head_only => Body::from_stream(s),
             _ => Body::empty(),
         };
         Ok(b.body(body).unwrap())
@@ -814,7 +842,8 @@ impl<B: ObjectBackend> Proxy<B> {
         } else {
             (split_ct(src.info.content_type.as_deref()).0, self.load_meta(&sb, &sk, &src.info).await)
         };
-        let info = self.store(bucket, key, PutSource::Mem(src.data), ct, meta).await?;
+        let data = self.spool(src.data).await?;
+        let info = self.store(bucket, key, data, ct, meta).await?;
         Ok(xml_response(
             StatusCode::OK,
             format!(
@@ -862,7 +891,7 @@ impl<B: ObjectBackend> Proxy<B> {
                 Some(r) => Some(RangeSpec::parse(r).ok_or_else(|| S3Error::invalid_argument("bad x-amz-copy-source-range"))?),
             };
             let src = self.backend.get(&sb, &sk, range).await.map_err(map_backend)?;
-            let et = self.staging.put_part(id, n, &src.data).await?;
+            let et = self.staging.put_part(id, n, &src.data.into_vec().await?).await?;
             return Ok(xml_response(
                 StatusCode::OK,
                 format!("<CopyPartResult xmlns=\"{NS}\"><LastModified>{}</LastModified><ETag>\"{et}\"</ETag></CopyPartResult>", iso8601(now_ms())),

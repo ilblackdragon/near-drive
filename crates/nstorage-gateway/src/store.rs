@@ -1,9 +1,15 @@
 //! Storage traits and filesystem implementations (dev / single node).
-//! Production: S3/R2 index store with conditional writes; FOC/Shelby/R2 blobs.
+//! Other backends: `s3` (S3/R2/MinIO), `bridge` (HTTP blob bridge), `placement`, `cache`.
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use bytes::Bytes;
 use nstorage_core::record::PointerRecord;
-use std::path::PathBuf;
-use tokio::sync::Mutex;
+use serde::{Deserialize, Serialize};
+use std::{ops::Range, path::PathBuf};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt},
+    sync::Mutex,
+};
 
 #[derive(Debug)]
 pub enum CasError {
@@ -18,19 +24,54 @@ impl From<anyhow::Error> for CasError {
     }
 }
 
-pub trait BlobStore: Send + Sync {
-    fn put(&self, cid: &str, bytes: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send;
-    fn get(&self, cid: &str) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> + Send;
-    fn has(&self, cid: &str) -> impl std::future::Future<Output = Result<bool>> + Send;
+/// A direct-fetch URL for a chunk (presigned S3 URL, bridge CDN URL, ...).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirectUrl {
+    pub url: String,
+    /// Unix ms after which the URL stops working; None = does not expire.
+    pub expires_ms: Option<u64>,
 }
 
+/// Content-addressed chunk storage (DESIGN.md §3.1 L0). Implementations:
+/// fs ([`FsBlobStore`]), S3/R2/MinIO ([`crate::s3::S3BlobStore`]), HTTP blob
+/// bridge ([`crate::bridge::BridgeBlobStore`]), and the combinators
+/// [`crate::placement::Replicated`] / [`crate::cache::CachedBlobStore`].
+#[async_trait]
+pub trait BlobStore: Send + Sync {
+    /// Idempotent: storing an existing cid is a no-op success.
+    async fn put(&self, cid: &str, bytes: Bytes) -> Result<()>;
+    async fn get(&self, cid: &str) -> Result<Option<Bytes>>;
+    /// Bytes `[range.start, min(range.end, len))`; None if the chunk is absent.
+    async fn get_range(&self, cid: &str, range: Range<u64>) -> Result<Option<Bytes>> {
+        Ok(self.get(cid).await?.map(|b| slice_range(&b, &range)))
+    }
+    async fn has(&self, cid: &str) -> Result<bool>;
+    /// A URL a client can fetch the chunk from without going through the gateway.
+    async fn direct_url(&self, _cid: &str) -> Result<Option<DirectUrl>> {
+        Ok(None)
+    }
+}
+
+/// Clamp `range` to `b` and slice.
+pub fn slice_range(b: &Bytes, range: &Range<u64>) -> Bytes {
+    let len = b.len() as u64;
+    let s = range.start.min(len) as usize;
+    let e = range.end.clamp(range.start.min(len), len) as usize;
+    b.slice(s..e)
+}
+
+/// Mutable pointer-record index (DESIGN.md §3.2). Implementations: fs
+/// ([`FsIndexStore`], single gateway) and object-store / S3 with conditional
+/// writes ([`crate::s3::ObjectIndexStore`], safe with many gateways).
+#[async_trait]
 pub trait IndexStore: Send + Sync {
-    fn get(&self, ns: &str, path: &str) -> impl std::future::Future<Output = Result<Option<PointerRecord>>> + Send;
+    async fn get(&self, ns: &str, path: &str) -> Result<Option<PointerRecord>>;
     /// Store `rec` iff the current seq equals `rec.seq - 1` (0 = absent).
-    fn cas_put(&self, rec: &PointerRecord) -> impl std::future::Future<Output = Result<(), CasError>> + Send;
+    async fn cas_put(&self, rec: &PointerRecord) -> Result<(), CasError>;
     /// Delete iff current seq == `expected_seq`.
-    fn delete(&self, ns: &str, path: &str, expected_seq: u64) -> impl std::future::Future<Output = Result<(), CasError>> + Send;
-    fn list(&self, ns: &str, prefix: &str) -> impl std::future::Future<Output = Result<Vec<PointerRecord>>> + Send;
+    async fn delete(&self, ns: &str, path: &str, expected_seq: u64) -> Result<(), CasError>;
+    /// All live records in `ns` whose path starts with `prefix`, sorted by path.
+    async fn list(&self, ns: &str, prefix: &str) -> Result<Vec<PointerRecord>>;
 }
 
 pub struct FsBlobStore {
@@ -50,7 +91,7 @@ impl FsBlobStore {
     }
 }
 
-async fn write_atomic(path: &PathBuf, bytes: &[u8]) -> Result<()> {
+pub(crate) async fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap();
     tokio::fs::create_dir_all(dir).await?;
     let tmp = dir.join(format!(".tmp-{}", rand_suffix()));
@@ -65,24 +106,44 @@ fn rand_suffix() -> String {
     format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed))
 }
 
+#[async_trait]
 impl BlobStore for FsBlobStore {
-    async fn put(&self, cid: &str, bytes: &[u8]) -> Result<()> {
+    async fn put(&self, cid: &str, bytes: Bytes) -> Result<()> {
         let p = self.path(cid)?;
         if tokio::fs::try_exists(&p).await? {
             return Ok(()); // content-addressed: already there
         }
-        write_atomic(&p, bytes).await
+        write_atomic(&p, &bytes).await
     }
-    async fn get(&self, cid: &str) -> Result<Option<Vec<u8>>> {
+    async fn get(&self, cid: &str) -> Result<Option<Bytes>> {
         match tokio::fs::read(self.path(cid)?).await {
-            Ok(b) => Ok(Some(b)),
+            Ok(b) => Ok(Some(b.into())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
+    async fn get_range(&self, cid: &str, range: Range<u64>) -> Result<Option<Bytes>> {
+        read_file_range(&self.path(cid)?, range).await
+    }
     async fn has(&self, cid: &str) -> Result<bool> {
         Ok(tokio::fs::try_exists(self.path(cid)?).await?)
     }
+}
+
+/// Read `[start, min(end, len))` of a file; None if it does not exist.
+pub(crate) async fn read_file_range(path: &std::path::Path, range: Range<u64>) -> Result<Option<Bytes>> {
+    let mut f = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let len = f.metadata().await?.len();
+    let start = range.start.min(len);
+    let end = range.end.clamp(start, len);
+    f.seek(std::io::SeekFrom::Start(start)).await?;
+    let mut buf = vec![0u8; (end - start) as usize];
+    f.read_exact(&mut buf).await?;
+    Ok(Some(buf.into()))
 }
 
 /// One file per record, named hex(path), under `<root>/<namespace>/`.
@@ -108,6 +169,7 @@ impl FsIndexStore {
     }
 }
 
+#[async_trait]
 impl IndexStore for FsIndexStore {
     async fn get(&self, ns: &str, path: &str) -> Result<Option<PointerRecord>> {
         self.read(ns, path).await

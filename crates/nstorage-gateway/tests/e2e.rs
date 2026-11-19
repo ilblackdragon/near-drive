@@ -33,6 +33,7 @@ async fn start() -> Env {
         storage_contract: "storage.near".into(),
         dev_keys,
         policies,
+        ..Default::default()
     };
     let state = AppState::new(cfg).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

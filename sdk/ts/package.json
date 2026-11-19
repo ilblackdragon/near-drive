@@ -1,0 +1,32 @@
+{
+  "name": "@nstorage/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for nstorage: NEAR-account-addressed, end-to-end-encrypted object storage",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./node": { "types": "./dist/node.d.ts", "import": "./dist/node.js" }
+  },
+  "files": ["dist", "src", "README.md"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.0.0",
+    "@noble/curves": "^2.0.0",
+    "@noble/hashes": "^2.0.0",
+    "@scure/base": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  }
+}
