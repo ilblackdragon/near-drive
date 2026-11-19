@@ -36,8 +36,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create the account's encryption root key (v0: local; later NEAR MPC CKD).
-    Keygen,
+    /// Create the account's encryption root key: random local key, or with
+    /// `--ckd` derive it via NEAR MPC Confidential Key Derivation (sends one
+    /// `request_app_private_key` tx on `--network`; same key on every device).
+    Keygen {
+        #[arg(long)]
+        ckd: bool,
+        /// MPC contract (default: v1.signer / v1.signer-prod.testnet by --network).
+        #[arg(long, requires = "ckd")]
+        ckd_contract: Option<String>,
+        /// NEAR RPC URL (default: rpc.<network>.near.org).
+        #[arg(long, requires = "ckd")]
+        ckd_rpc: Option<String>,
+        /// CKD domain id (default 2).
+        #[arg(long, requires = "ckd")]
+        ckd_domain: Option<u64>,
+    },
     /// Generate an ed25519 key in NEAR credentials format (for dev gateways).
     DevKey {
         #[arg(long)]
@@ -122,13 +136,16 @@ fn account(cli: &Cli) -> Result<String> {
     cli.account.clone().context("--account (or NSTORAGE_ACCOUNT) is required")
 }
 
-fn client(cli: &Cli) -> Result<Client> {
-    let account = account(cli)?;
-    let cred_path = match &cli.credentials {
+fn credentials_path(cli: &Cli, account: &str) -> Result<PathBuf> {
+    Ok(match &cli.credentials {
         Some(p) => p.clone(),
         None => home_dir()?.join(".near-credentials").join(&cli.network).join(format!("{account}.json")),
-    };
-    let (cred_account, sk) = keys::NearCredentials::load(&cred_path)?;
+    })
+}
+
+fn client(cli: &Cli) -> Result<Client> {
+    let account = account(cli)?;
+    let (cred_account, sk) = keys::NearCredentials::load(&credentials_path(cli, &account)?)?;
     if cred_account != account {
         bail!("credentials are for {cred_account}, not {account}");
     }
@@ -146,7 +163,24 @@ fn client(cli: &Cli) -> Result<Client> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
-        Cmd::Keygen => {
+        Cmd::Keygen { ckd: true, ckd_contract, ckd_rpc, ckd_domain } => {
+            let account = account(&cli)?;
+            let path = root_key_path(&cli, &account)?;
+            if path.exists() {
+                bail!("{} already exists; refusing to overwrite", path.display());
+            }
+            let net = nstorage_ckd::CkdNetwork::resolve(&cli.network, ckd_contract.clone(), ckd_rpc.clone(), *ckd_domain)?;
+            let (cred_account, key) = keys::NearCredentials::load(&credentials_path(&cli, &account)?)?;
+            if cred_account != account {
+                bail!("credentials are for {cred_account}, not {account}");
+            }
+            eprintln!("requesting CKD root key from {} (domain {}) on {} as {account} (1 yoctoNEAR + gas)…", net.contract, net.domain_id, net.network);
+            let signer = nstorage_ckd::near::Signer { account_id: account.clone(), key };
+            let root = nstorage_ckd::near::request_root_key(&net, &signer, nstorage_ckd::DERIVATION_PATH).await?;
+            write_private(&path, &hex::encode(root.as_bytes()))?;
+            eprintln!("CKD root key cached at {}; rerun `nst keygen --ckd` on any device to recover it", path.display());
+        }
+        Cmd::Keygen { ckd: false, .. } => {
             let account = account(&cli)?;
             let path = root_key_path(&cli, &account)?;
             write_private(&path, &hex::encode(RootKey::generate().as_bytes()))?;

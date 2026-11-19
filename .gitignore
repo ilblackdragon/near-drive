@@ -1,2 +1,7 @@
 target/
 *.root
+node_modules/
+dist/
+*.tsbuildinfo
+.bridge-data/
+coverage/
