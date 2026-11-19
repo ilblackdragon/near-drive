@@ -15,3 +15,5 @@ nstorage-client.workspace = true
 hex.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
+nstorage-s3.workspace = true
+tracing-subscriber.workspace = true

@@ -316,7 +316,7 @@ async fn list_objects(
         .await?
         .into_iter()
         .filter(|r| policy::resolve(&ns, rules, &r.path, &signer.account).read)
-        .map(|r| json!({"path": r.path, "size": r.size, "seq": r.seq, "writer": r.writer, "ts_ms": r.ts_ms}))
+        .map(|r| json!({"path": r.path, "size": r.size, "seq": r.seq, "writer": r.writer, "ts_ms": r.ts_ms, "manifest_cid": r.manifest_cid}))
         .collect();
     Ok(Json(entries).into_response())
 }

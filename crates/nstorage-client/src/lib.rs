@@ -12,6 +12,7 @@ use nstorage_core::{
 };
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use nstorage_core;
@@ -31,7 +32,28 @@ pub struct ListEntry {
     pub seq: u64,
     pub writer: String,
     pub ts_ms: u64,
+    /// Present on gateways that report it; lets callers derive an ETag without a HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_cid: Option<String>,
 }
+
+/// Non-2xx answer from the gateway. `Display` keeps the historical
+/// "gateway returned {status}: {body}" text; callers can downcast
+/// (`err.downcast_ref::<GatewayError>()`) to get the status code.
+#[derive(Debug, Clone)]
+pub struct GatewayError {
+    pub status: u16,
+    pub body: String,
+}
+
+impl std::fmt::Display for GatewayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let st = StatusCode::from_u16(self.status).map(|s| s.to_string()).unwrap_or_else(|_| self.status.to_string());
+        write!(f, "gateway returned {st}: {}", self.body)
+    }
+}
+
+impl std::error::Error for GatewayError {}
 
 #[derive(Debug, Clone, Default)]
 pub struct PutOptions {
@@ -50,6 +72,10 @@ pub struct Client {
     sk: SigningKey,
     root: Option<RootKey>,
     pub chunk_size: usize,
+    /// Last request timestamp; keeps timestamps strictly increasing so two
+    /// identical concurrent requests never produce the same signature (the
+    /// gateway's replay cache would reject the second one).
+    last_ts: AtomicU64,
 }
 
 fn now_ms() -> u64 {
@@ -78,7 +104,17 @@ impl Client {
             sk,
             root,
             chunk_size: DEFAULT_CHUNK_SIZE,
+            last_ts: AtomicU64::new(0),
         }
+    }
+
+    fn next_ts(&self) -> u64 {
+        let now = now_ms();
+        let prev = self.last_ts.fetch_max(now, Ordering::SeqCst);
+        if prev < now {
+            return now;
+        }
+        self.last_ts.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     pub fn account(&self) -> &str {
@@ -86,7 +122,7 @@ impl Client {
     }
 
     async fn send(&self, method: Method, path: &str, query: &str, body: Vec<u8>) -> Result<reqwest::Response> {
-        let ts = now_ms();
+        let ts = self.next_ts();
         let h = auth::sign_request(&self.account, &self.sk, method.as_str(), path, query, ts, &body);
         let url = if query.is_empty() { format!("{}{}", self.gateway, path) } else { format!("{}{}?{}", self.gateway, path, query) };
         self.http
@@ -106,8 +142,8 @@ impl Client {
         if status.is_success() {
             return Ok(resp);
         }
-        let text = resp.text().await.unwrap_or_default();
-        bail!("gateway returned {status}: {text}")
+        let body = resp.text().await.unwrap_or_default();
+        Err(GatewayError { status: status.as_u16(), body }.into())
     }
 
     fn obj_path(uri: &NearUri) -> String {
@@ -202,6 +238,13 @@ impl Client {
 
     pub async fn get(&self, uri: &NearUri) -> Result<(ObjectHead, Vec<u8>)> {
         let head = self.head(uri).await?.ok_or_else(|| anyhow!("{uri} not found"))?;
+        let chunks = self.fetch_chunks(uri, &head).await?;
+        let data = self.decrypt(&head, &chunks)?;
+        Ok((head, data))
+    }
+
+    /// Fetch and cid-check the stored (possibly encrypted) chunks of a verified head.
+    pub async fn fetch_chunks(&self, uri: &NearUri, head: &ObjectHead) -> Result<Vec<Vec<u8>>> {
         let mut chunks = Vec::with_capacity(head.manifest.chunks.len());
         for c in &head.manifest.chunks {
             let resp = self.send(Method::GET, &Self::obj_path(uri), &format!("chunk={}", c.cid), vec![]).await?;
@@ -209,15 +252,20 @@ impl Client {
             ensure!(nstorage_core::cid(&bytes) == c.cid, "chunk {} content does not match its id", c.cid);
             chunks.push(bytes);
         }
+        Ok(chunks)
+    }
+
+    /// Turn the chunks returned by [`Client::fetch_chunks`] into plaintext.
+    pub fn decrypt(&self, head: &ObjectHead, chunks: &[Vec<u8>]) -> Result<Vec<u8>> {
         let data = match &head.manifest.enc {
             None => chunks.concat(),
             Some(enc) => {
                 let root = self.root.as_ref().ok_or_else(|| anyhow!("object is encrypted and no root key is loaded"))?;
-                crypto::decrypt_object(root, enc, &chunks)?
+                crypto::decrypt_object(root, enc, chunks)?
             }
         };
         ensure!(data.len() as u64 == head.manifest.size, "size mismatch");
-        Ok((head, data))
+        Ok(data)
     }
 
     pub async fn list(&self, prefix: &NearUri) -> Result<Vec<ListEntry>> {
