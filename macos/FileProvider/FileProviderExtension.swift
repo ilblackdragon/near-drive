@@ -14,11 +14,11 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     func invalidate() {}
 
     /// Run `body` and report through `done`, returning a Progress for the system.
-    private func run(_ units: Int64 = 1, _ body: @escaping () async throws -> Void, onError: @escaping (Error) -> Void) -> Progress {
-        let progress = Progress(totalUnitCount: units)
+    private func run(_ body: @escaping () async throws -> Void, onError: @escaping (Error) -> Void) -> Progress {
+        let progress = Progress(totalUnitCount: 1)
         Task {
             do { try await body() } catch { onError(error.fileProviderError) }
-            progress.completedUnitCount = units
+            progress.completedUnitCount = 1
         }
         return progress
     }

@@ -128,7 +128,8 @@ impl Provider {
     /// Folders are populated eagerly by `refresh` (the whole tree as
     /// placeholders), so they never need an on-demand listing.
     fn dir_info(name: &str) -> PlaceholderCreateInfo {
-        PlaceholderCreateInfo::new(name).metadata(Metadata::directory()).has_no_children().mark_in_sync()
+        // Every placeholder needs a file identity (a blob); folders get an empty version.
+        PlaceholderCreateInfo::new(name).metadata(Metadata::directory()).blob(Blob::default().bytes()).has_no_children().mark_in_sync()
     }
 
     /// Placeholders for the direct children of `dir` (rel, "" = root).
@@ -323,7 +324,12 @@ impl SyncFilter for Provider {
             .collect();
         let r = ticket.pass_with_placeholders(&mut items);
         tracing::debug!("fetch_placeholders {dir:?}: {} new, {r:?}", items.len());
-        r.map_err(|e| cerr(e.into()))
+        // One bad entry must not hide the whole folder: finish population
+        // with what was created (the refresh loop retries the rest).
+        if let Err(e) = r {
+            tracing::warn!("listing {dir:?}: {e}");
+        }
+        Ok(())
     }
 
     fn fetch_data(&self, request: Request, ticket: ticket::FetchData, info: info::FetchData) -> CResult<()> {
