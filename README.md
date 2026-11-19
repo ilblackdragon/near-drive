@@ -74,6 +74,9 @@ curl -fsSL https://github.com/ilblackdragon/near-drive/releases/latest/download/
 irm https://github.com/ilblackdragon/near-drive/releases/latest/download/install.ps1 | iex
 ```
 
+Or with a package manager: `brew tap ilblackdragon/near-drive https://github.com/ilblackdragon/near-drive && brew
+install near-drive` (macOS, Linux), `winget install ilblackdragon.NEARDrive` (Windows).
+
 Prebuilt for Linux (x86_64, arm64), macOS (universal) and Windows (x64); the installers verify checksums. NEAR Drive
 uses [near-cli-rs](https://github.com/near/near-cli-rs) for your NEAR keys; the installer tells you how to get it if
 `near` is missing. Manual downloads, building from source and uninstalling: [docs/install.md](docs/install.md).
@@ -158,7 +161,7 @@ All three SDKs read and write the same format and use the same keys as the CLI.
 
 | | |
 |---|---|
-| [docs/install.md](docs/install.md) | installers, manual downloads, building from source |
+| [docs/install.md](docs/install.md) | installers, Homebrew, winget, manual downloads, building from source |
 | [docs/cli.md](docs/cli.md) | every command, paths, keys and near-cli, sharing and access rules, large files |
 | [docs/sync.md](docs/sync.md) | synced folders: behaviour, conflicts, deletes, file names |
 | [docs/mount.md](docs/mount.md) | files on demand (`near drive mount`) |

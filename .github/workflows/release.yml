@@ -143,3 +143,13 @@ jobs:
           ./install.ps1
           & "$env:LOCALAPPDATA\NEAR Drive\bin\near-drive.exe" --version
           & "$env:LOCALAPPDATA\NEAR Drive\bin\near-drive-gateway.exe" --version
+
+
+  # Homebrew formula + winget manifests, committed to main and test-installed.
+  packaging:
+    needs: publish
+    uses: ./.github/workflows/packaging.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+    permissions:
+      contents: write

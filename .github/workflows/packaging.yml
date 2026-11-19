@@ -1,0 +1,77 @@
+name: packaging
+# Homebrew formula (Formula/, this repo is the tap) and winget manifests
+# (packaging/winget/) for a published release. Called by release.yml; run it
+# by hand for an existing release from the Actions tab.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published release tag, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: generate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release download "$TAG" --pattern SHA256SUMS --dir /tmp/rel
+          python3 packaging/generate.py "$TAG" /tmp/rel/SHA256SUMS
+      - name: validate winget manifests
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          pip install --quiet jsonschema pyyaml
+          for k in version installer defaultLocale; do curl -sfL -o /tmp/$k.json https://aka.ms/winget-manifest.$k.1.6.0.schema.json; done
+          python3 - <<'PY'
+          import json, os, yaml, jsonschema
+          d = f"packaging/winget/manifests/i/ilblackdragon/NEARDrive/{os.environ['TAG'].lstrip('v')}/"
+          for f, k in [("ilblackdragon.NEARDrive.yaml", "version"), ("ilblackdragon.NEARDrive.installer.yaml", "installer"), ("ilblackdragon.NEARDrive.locale.en-US.yaml", "defaultLocale")]:
+              jsonschema.validate(yaml.safe_load(open(d + f)), json.load(open(f"/tmp/{k}.json")))
+              print("valid", f)
+          PY
+      - name: commit
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula packaging/winget
+          git diff --cached --quiet && exit 0
+          git commit -m "Homebrew formula and winget manifests for $TAG [skip ci]"
+          git push origin HEAD:main
+
+  # The formula installs and passes `brew test` (this repo is the tap).
+  brew:
+    needs: packaging
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: brew install + test
+        run: |
+          eval "$($(command -v brew || echo /home/linuxbrew/.linuxbrew/bin/brew) shellenv)"
+          brew tap ilblackdragon/near-drive "$GITHUB_WORKSPACE"
+          brew install ilblackdragon/near-drive/near-drive
+          brew test ilblackdragon/near-drive/near-drive
+          near-drive --version

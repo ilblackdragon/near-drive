@@ -33,6 +33,31 @@ Installs into `%LOCALAPPDATA%\NEAR Drive\bin` and adds it to your user `PATH` (o
 Both installers verify the archive against `SHA256SUMS` before installing, and accept `NEAR_DRIVE_VERSION=v0.1.0` to
 pin a version. Running them again upgrades in place.
 
+## Homebrew (macOS, Linux)
+
+This repository is also a Homebrew tap:
+
+```sh
+brew tap ilblackdragon/near-drive https://github.com/ilblackdragon/near-drive
+brew install near-drive
+```
+
+`brew upgrade near-drive` picks up new releases (the formula in `Formula/` is regenerated for every release).
+
+## winget (Windows)
+
+```powershell
+winget install ilblackdragon.NEARDrive
+```
+
+The manifests live in `packaging/winget/manifests/` and are submitted to
+[microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) for each release; until a version is merged there,
+install it from the manifest directly (needs `winget settings --enable LocalManifestFiles` once, as administrator):
+
+```powershell
+winget install --manifest packaging\winget\manifests\i\ilblackdragon\NEARDrive\0.1.0
+```
+
 ## Then
 
 1. Install [near-cli-rs](https://github.com/near/near-cli-rs), which keeps your NEAR keys (the installers print the
@@ -85,6 +110,14 @@ and settings are in `~/.near-drive`; synced folders keep their files.
 
 ## Releasing (maintainers)
 
-Push a tag: `git tag v0.2.0 && git push origin v0.2.0`. `.github/workflows/release.yml` builds all platforms,
-publishes the release with `SHA256SUMS`, `install.sh` and `install.ps1`, then installs it with both installers on
-Linux, macOS and Windows as a check. Bump `version` in the workspace `Cargo.toml` first.
+Push a tag: `git tag v0.2.0 && git push origin v0.2.0`. `.github/workflows/release.yml`:
+1. builds all platforms and publishes the release with `SHA256SUMS`, `install.sh` and `install.ps1`;
+2. installs it with both installers on Linux, macOS and Windows as a check;
+3. runs `packaging.yml`: regenerates `Formula/near-drive.rb` and the winget manifests from the release's checksums
+   (`packaging/generate.py`), validates the manifests against the winget schema, commits them to `main`, and
+   installs + tests the formula with Homebrew on macOS and Linux.
+
+Then submit the winget manifests (once per release), e.g. with
+[wingetcreate](https://github.com/microsoft/winget-create):
+`wingetcreate submit packaging/winget/manifests/i/ilblackdragon/NEARDrive/<version>` (or open a PR to
+microsoft/winget-pkgs with that folder). Bump `version` in the workspace `Cargo.toml` before tagging.
