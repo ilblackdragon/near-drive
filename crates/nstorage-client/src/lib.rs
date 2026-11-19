@@ -16,7 +16,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use nstorage_core;
 
+mod large;
+pub use large::{Located, LocatedChunk};
+
 pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+pub const DEFAULT_PARALLELISM: usize = 8;
+/// Request header choosing the storage class of an uploaded chunk.
+pub const CLASS_HEADER: &str = "x-nst-class";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectHead {
@@ -41,6 +47,8 @@ pub struct PutOptions {
     /// Extra recipients (`x25519:<base58>` keys) who can decrypt. Lets an app
     /// write data only the user can read: no owner root key + `share_with`.
     pub share_with: Vec<String>,
+    /// Storage class for the chunks (`hot`, `bulk`, ...); None = gateway default.
+    pub class: Option<String>,
 }
 
 pub struct Client {
@@ -50,6 +58,8 @@ pub struct Client {
     sk: SigningKey,
     root: Option<RootKey>,
     pub chunk_size: usize,
+    /// Concurrent chunk transfers for put_file / put_reader / get_to_file / get_range.
+    pub parallelism: usize,
 }
 
 fn now_ms() -> u64 {
@@ -78,6 +88,7 @@ impl Client {
             sk,
             root,
             chunk_size: DEFAULT_CHUNK_SIZE,
+            parallelism: DEFAULT_PARALLELISM,
         }
     }
 
@@ -85,12 +96,19 @@ impl Client {
         &self.account
     }
 
-    async fn send(&self, method: Method, path: &str, query: &str, body: Vec<u8>) -> Result<reqwest::Response> {
+    async fn send(&self, method: Method, path: &str, query: &str, body: impl Into<bytes::Bytes>) -> Result<reqwest::Response> {
+        self.send_with(method, path, query, body.into(), None).await
+    }
+
+    async fn send_with(&self, method: Method, path: &str, query: &str, body: bytes::Bytes, class: Option<&str>) -> Result<reqwest::Response> {
         let ts = now_ms();
         let h = auth::sign_request(&self.account, &self.sk, method.as_str(), path, query, ts, &body);
         let url = if query.is_empty() { format!("{}{}", self.gateway, path) } else { format!("{}{}?{}", self.gateway, path, query) };
-        self.http
-            .request(method, url)
+        let mut req = self.http.request(method, url);
+        if let Some(c) = class {
+            req = req.header(CLASS_HEADER, c);
+        }
+        req
             .header(auth::H_ACCOUNT, h.account)
             .header(auth::H_PUBKEY, h.public_key)
             .header(auth::H_TS, h.ts_ms.to_string())
@@ -114,12 +132,9 @@ impl Client {
         format!("/v1/o/{}/{}", uri.namespace, encode_path(&uri.path))
     }
 
-    async fn put_chunk(&self, namespace: &str, bytes: Vec<u8>) -> Result<ChunkRef> {
+    async fn put_chunk(&self, namespace: &str, bytes: Vec<u8>, class: Option<&str>) -> Result<ChunkRef> {
         let cid = nstorage_core::cid(&bytes);
-        let len = bytes.len() as u64;
-        let path = format!("/v1/chunk/{namespace}/{cid}");
-        Self::check(self.send(Method::PUT, &path, "", bytes).await?).await?;
-        Ok(ChunkRef { cid, len })
+        self.upload_chunk(namespace, cid, bytes.into(), class).await
     }
 
     pub async fn head(&self, uri: &NearUri) -> Result<Option<ObjectHead>> {
@@ -151,7 +166,7 @@ impl Client {
         };
         let mut refs = Vec::with_capacity(chunks.len());
         for c in chunks {
-            refs.push(self.put_chunk(&uri.namespace, c).await?);
+            refs.push(self.put_chunk(&uri.namespace, c, opts.class.as_deref()).await?);
         }
         let manifest = Manifest {
             version: 1,
@@ -161,14 +176,14 @@ impl Client {
             enc,
             content_type: opts.content_type.clone(),
         };
-        self.commit_manifest(uri, &manifest).await
+        self.commit_manifest(uri, &manifest, opts.class.as_deref()).await
     }
 
     /// Publish `manifest` (chunks already uploaded) as the new version of `uri`.
-    async fn commit_manifest(&self, uri: &NearUri, manifest: &Manifest) -> Result<PointerRecord> {
+    async fn commit_manifest(&self, uri: &NearUri, manifest: &Manifest, class: Option<&str>) -> Result<PointerRecord> {
         let mbytes = manifest.to_bytes();
         let stored = manifest.stored_size() + mbytes.len() as u64;
-        let mref = self.put_chunk(&uri.namespace, mbytes).await?;
+        let mref = self.put_chunk(&uri.namespace, mbytes, class).await?;
 
         for attempt in 0..2 {
             let prev = self.head(uri).await?.map(|h| h.record.seq).unwrap_or(0);
@@ -197,7 +212,7 @@ impl Client {
         let enc = head.manifest.enc.as_ref().ok_or_else(|| anyhow!("{uri} is public; nothing to share"))?;
         let enc = crypto::add_recipient(root, enc, &crypto::Recipient::X25519(crypto::parse_x25519(recipient)?))?;
         let manifest = Manifest { enc: Some(enc), ..head.manifest };
-        self.commit_manifest(uri, &manifest).await
+        self.commit_manifest(uri, &manifest, None).await
     }
 
     pub async fn get(&self, uri: &NearUri) -> Result<(ObjectHead, Vec<u8>)> {

@@ -1,0 +1,12 @@
+export { Client, DEFAULT_CHUNK_SIZE, GatewayError, keySigner, verifyHead } from "./client.js";
+export type { ClientOptions, ListEntry, ObjectHead, PutOptions, Signer } from "./client.js";
+export { ALG, TAG_LEN, RootKey, addRecipient, decryptObject, encryptFor, encryptObject, plaintextChunks } from "./crypto.js";
+export type { EncInfo, Recipient, WrappedKey } from "./crypto.js";
+export { MAX_CHUNK_BYTES, manifestCid, manifestToBytes, manifestToJson, normalizeManifest, parseManifest, storedSize, validateManifest } from "./manifest.js";
+export type { ChunkRef, Manifest } from "./manifest.js";
+export { normalizeRecord, recordSigningBytes, recordToJson, verifyRecordSignature } from "./record.js";
+export type { PointerRecord } from "./record.js";
+export { canonicalRequest } from "./auth.js";
+export { formatPublicKey, formatSecretKey, formatX25519, generateSecretKey, parsePublicKey, parseSecretKey, parseX25519, publicKeyOf, sign, verify } from "./keys.js";
+export { NearUri, UriError, encodePath, isValidAccountId, validateAccountId, validatePath } from "./uri.js";
+export { cid, isValidCid } from "./bytes.js";

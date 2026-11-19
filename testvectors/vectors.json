@@ -1,0 +1,646 @@
+{
+  "canonical_requests": [
+    {
+      "account": "alice.near",
+      "body_hex": "616263",
+      "canonical": "nstorage-req-v1\nPUT\n/v1/chunk/alice.near/b3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85\n\nalice.near\ned25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj\n1763456789012\n6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+      "method": "PUT",
+      "path": "/v1/chunk/alice.near/b3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+      "public_key": "ed25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj",
+      "query": "",
+      "signature": "5C4wBZVWnpRze3ZFCwpkV4PKhSpLyJ3wpesUFJA9u4jwZgC4BWw7DqQF9noufGx4g2SFSB3GFMLpd38YkTQwXPZz",
+      "ts_ms": 1763456789012
+    },
+    {
+      "account": "alice.near",
+      "body_hex": "",
+      "canonical": "nstorage-req-v1\nGET\n/v1/o/alice.near/x%20y/%C3%BC.txt\n\nalice.near\ned25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj\n1763456789012\naf1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+      "method": "GET",
+      "path": "/v1/o/alice.near/x%20y/%C3%BC.txt",
+      "public_key": "ed25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj",
+      "query": "",
+      "signature": "2jcNbmH1jFUWMjwuHg9dApHD29WyRMPRvU5TC4LNoVcregfP6LthBXgqVfDHH72hC4hTMGjzLA4Jj6tggstRNYTa",
+      "ts_ms": 1763456789012
+    },
+    {
+      "account": "alice.near",
+      "body_hex": "",
+      "canonical": "nstorage-req-v1\nGET\n/v1/o/alice.near/memory/today.txt\nchunk=b3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85\nalice.near\ned25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj\n1763456789012\naf1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+      "method": "GET",
+      "path": "/v1/o/alice.near/memory/today.txt",
+      "public_key": "ed25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj",
+      "query": "chunk=b3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+      "signature": "39kYcXziqJhw85jb9QSjoW1G3Dc1HVzYV7eLD64rod6eSduBuBRFo1mWccfB2qcdKsmoTfJuqY4QjEWfWMAVMZxP",
+      "ts_ms": 1763456789012
+    },
+    {
+      "account": "alice.near",
+      "body_hex": "",
+      "canonical": "nstorage-req-v1\nGET\n/v1/list/alice.near\nprefix=memory/a%20b\nalice.near\ned25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj\n1763456789012\naf1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+      "method": "GET",
+      "path": "/v1/list/alice.near",
+      "public_key": "ed25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj",
+      "query": "prefix=memory/a%20b",
+      "signature": "5Jmr18n2UMDgihABRBvUK1gnSQViAfrxzfqRXbSSN7pKFDHBRYB7bAh37apWJ6amSQwUVjhwTjXC5KetZ6MHpqEw",
+      "ts_ms": 1763456789012
+    },
+    {
+      "account": "alice.near",
+      "body_hex": "",
+      "canonical": "nstorage-req-v1\nDELETE\n/v1/o/alice.near/memory/today.txt\n\nalice.near\ned25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj\n1763456789012\naf1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+      "method": "DELETE",
+      "path": "/v1/o/alice.near/memory/today.txt",
+      "public_key": "ed25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj",
+      "query": "",
+      "signature": "4nmaWzEoCg95Rz3zeeprdWxyiZZw16N7VLxk4ZBhHkrVQQFZa3jbnVgfFxLQPSPPFrD14eiv2dtRPtBpuZPePCv1",
+      "ts_ms": 1763456789012
+    },
+    {
+      "account": "alice.near",
+      "body_hex": "7b226b223a317d",
+      "canonical": "nstorage-req-v1\nPUT\n/v1/o/alice.near/memory/today.txt\n\nalice.near\ned25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj\n1763456789012\nb79160c54b974355ff03936be3e6f1b60c71d3e9e821557713893e924a97728a",
+      "method": "put",
+      "path": "/v1/o/alice.near/memory/today.txt",
+      "public_key": "ed25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj",
+      "query": "",
+      "signature": "4Dt4gFyqK2gFD8CSfSzRekxc4NTfVfM1zbNNzPZH2yJBFpn7ixjTw64b6jbf3999kko8riCkEQZ94epi9wc5fQUd",
+      "ts_ms": 1763456789012
+    }
+  ],
+  "cid": [
+    {
+      "cid": "b3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+      "input_hex": ""
+    },
+    {
+      "cid": "b3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+      "input_hex": "616263"
+    },
+    {
+      "cid": "b3:baf6769a44b85c56c35b202085ddb42f124a93a82c5923712b8be3cf9b6f7340",
+      "input_hex": "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e151c232a31383f464d54"
+    }
+  ],
+  "comment": "Generated by `cargo run -p nstorage-core --example gen_vectors`. `objects` use random DEKs/nonces: decrypt-side vectors.",
+  "ed25519": {
+    "public_key": "ed25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj",
+    "secret_key": "ed25519:2Ana1pUpv2ZbMVkwF5FXapYeBEjdxDatLn7nvJkhgTSdZd8hbDHTd21as7EAsg7ypityqfsw2pMQKJcVDVcAEsd",
+    "secret_key_32": "ed25519:4wBqpZM9xaSheZzJSMawUKKwhdpChKbZ5eu5ky4Vigw",
+    "seed_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    "signatures": [
+      {
+        "msg_hex": "68656c6c6f",
+        "sig": "37GedKAoaDKpKKKMomW3JhqqL59f28efft13o2jUmJACX39Zc8XvzT1asCfLvZs3eW3hwDA6ho7AJcyUfi3fyw4h"
+      },
+      {
+        "msg_hex": "",
+        "sig": "5LwyKrdE2XvjmYi1xXwcJJDVMJSfGd1XWLiHPszwvDKDmGfjKrRMbPogxPZ2vPkyz2hSTKcMfGudHbJtgVBmfnKt"
+      }
+    ]
+  },
+  "manifests": [
+    {
+      "cid": "b3:8b6c2dd2d4d3743755e40a19e1a89a513175dba683ac70b73f9591933818392e",
+      "json": "{\"version\":1,\"size\":3,\"chunk_size\":4194304,\"chunks\":[{\"cid\":\"b3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85\",\"len\":3}]}",
+      "manifest": {
+        "chunk_size": 4194304,
+        "chunks": [
+          {
+            "cid": "b3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+            "len": 3
+          }
+        ],
+        "size": 3,
+        "version": 1
+      }
+    },
+    {
+      "cid": "b3:a8e3625fc716d754a7d3aa32f90d412d1becb82ce8531475749ad95d9f313ec1",
+      "json": "{\"version\":1,\"size\":10,\"chunk_size\":8,\"chunks\":[{\"cid\":\"b3:d63bd9a826af91c1fea371965a64e11ee20f13e46b5f52c59901136605b3a487\",\"len\":24},{\"cid\":\"b3:813e9b729141e7f385afa0a2d0df3e6c3789e427ffe4aeef566a565bc8f2fe3d\",\"len\":18}],\"enc\":{\"alg\":\"xchacha20poly1305-chunked-v1\",\"object_id\":\"00112233445566778899aabbccddeeff\",\"nonce_prefix\":\"ffeeddccbbaa99887766554433221100\",\"wrapped_keys\":[{\"recipient\":\"kek:0123456789abcdef\",\"nonce\":\"AAAA\",\"ct\":\"BBBB\"},{\"recipient\":\"x25519:11111111111111111111111111111111\",\"epk\":\"2222\",\"nonce\":\"CC==\",\"ct\":\"DD/+\"}]},\"content_type\":\"text/plain; charset=\\\"utf-8\\\" \\\\ \\n\\t\\u0001 ü🙂 </x>\"}",
+      "manifest": {
+        "chunk_size": 8,
+        "chunks": [
+          {
+            "cid": "b3:d63bd9a826af91c1fea371965a64e11ee20f13e46b5f52c59901136605b3a487",
+            "len": 24
+          },
+          {
+            "cid": "b3:813e9b729141e7f385afa0a2d0df3e6c3789e427ffe4aeef566a565bc8f2fe3d",
+            "len": 18
+          }
+        ],
+        "content_type": "text/plain; charset=\"utf-8\" \\ \n\t\u0001 ü🙂 </x>",
+        "enc": {
+          "alg": "xchacha20poly1305-chunked-v1",
+          "nonce_prefix": "ffeeddccbbaa99887766554433221100",
+          "object_id": "00112233445566778899aabbccddeeff",
+          "wrapped_keys": [
+            {
+              "ct": "BBBB",
+              "nonce": "AAAA",
+              "recipient": "kek:0123456789abcdef"
+            },
+            {
+              "ct": "DD/+",
+              "epk": "2222",
+              "nonce": "CC==",
+              "recipient": "x25519:11111111111111111111111111111111"
+            }
+          ]
+        },
+        "size": 10,
+        "version": 1
+      }
+    }
+  ],
+  "objects": [
+    {
+      "chunk_size": 4194304,
+      "chunks_hex": [
+        "894b289001c57a1a5a5c6e4121f282abd653b655cb6ca66d9ceb036dc4ff"
+      ],
+      "manifest": {
+        "chunk_size": 4194304,
+        "chunks": [
+          {
+            "cid": "b3:6ccf14586d9779d0e19f86bf9483c8d49248327e8d43ef972ff185a0357fbbbb",
+            "len": 30
+          }
+        ],
+        "content_type": "text/plain",
+        "enc": {
+          "alg": "xchacha20poly1305-chunked-v1",
+          "nonce_prefix": "72887d42586b57f6cc921329e3875e31",
+          "object_id": "6aeda8edde321abd9eaa91079fbd1940",
+          "wrapped_keys": [
+            {
+              "ct": "XOYBcXd8xKlLbgPVRMEPPF4AXlNx9ZlGiU6BJWS5JyyAbT+GVTvuL+EF+x2w0Nav",
+              "nonce": "j4cOfRFfNrmLpo90PmYI9fz0qIpxOeWW",
+              "recipient": "kek:cd17cb52ad5eb92c"
+            }
+          ]
+        },
+        "size": 14,
+        "version": 1
+      },
+      "manifest_cid": "b3:41014a7bc4f40f6a117f04ecadaca441ae0c15c3ca5e7fd532324da61a60ab39",
+      "manifest_json": "{\"version\":1,\"size\":14,\"chunk_size\":4194304,\"chunks\":[{\"cid\":\"b3:6ccf14586d9779d0e19f86bf9483c8d49248327e8d43ef972ff185a0357fbbbb\",\"len\":30}],\"enc\":{\"alg\":\"xchacha20poly1305-chunked-v1\",\"object_id\":\"6aeda8edde321abd9eaa91079fbd1940\",\"nonce_prefix\":\"72887d42586b57f6cc921329e3875e31\",\"wrapped_keys\":[{\"recipient\":\"kek:cd17cb52ad5eb92c\",\"nonce\":\"j4cOfRFfNrmLpo90PmYI9fz0qIpxOeWW\",\"ct\":\"XOYBcXd8xKlLbgPVRMEPPF4AXlNx9ZlGiU6BJWS5JyyAbT+GVTvuL+EF+x2w0Nav\"}]},\"content_type\":\"text/plain\"}",
+      "name": "single_chunk_owner",
+      "not_readable_by": [
+        "friend",
+        "stranger"
+      ],
+      "plaintext_hex": "68656c6c6f206e73746f72616765",
+      "readable_by": [
+        "owner"
+      ]
+    },
+    {
+      "chunk_size": 256,
+      "chunks_hex": [
+        "569121f926113216d67d6f45c5439215077bda8d165007ed3219901bd9758ed863fa2aa79f5a08fbfe66c63a45dbbd8879b4c6e4813eccb88b16cbd5fb2bf2a8e5fd4650b99c2c41c39a2da29f7d8b901749fb357e444a2f9f93548321aa84da17847db941b02f392e0ad7ebb926bf7f1b6e4d7dc0c7f25999950edb78b2646381ce3c6e6be990c38029e0c77d2300efe2eac967f957594e23ba417aad622375063ca132aa7e1a3e02e441a2b06b7558cfb98ff46bf138be43a8ea33b99f3272266b63caeb5b22c0cc694f2e06a7e813c80169a0ac22ecaff56cf4538ed0da7cc4050f083d36986da44b7b6eb25c1d552424a9eb56f559a661d01263cc8348812089662483f1e233dd70946238b74724",
+        "c609e7c61cbc695fbd55db716335475c467e1b123bd904c7bdbd66b073f57e62c29cf57815d24412b9833eb9abbea8f1f0dd9ad1fdcf7099122db7417dba2b9dabce0f89c7f3e53f5ed066ff9adbae3e8c289adac8543dfbe14311378119aac143f24734cef18cd3febfaac88e8c98f7e3e3515e777e2b43d46152c0fa0c8496091f64c76d4cc375ff39fd0a1502c9d604015ff5cc8fc77f881a2c8fd08da44803ec7cfd5a9c6e6b947aa72c873bc25337d396f57fc3c125b6c385204338bb62ede3048f9fc85aded24bb9c37c138ad90f26c386ace9dcf96b535c138e87ce82e47dae21d7dc7f117416ae7455d9d30d8a8adc42d303f4a8492dc2b9c57f8e232affe20ce8d01dc082a60784899ce25a",
+        "ec93eb0036b2099ea398c9b794f711ce0fa745a562a19cd1fc3b3ae920e9520bc0d6a63fe7baeabd6aaffeb8e0a01064c15f176610049508febf06d6f32ed6e33b0af8c3c74acf51f3a287dcd55c623c408786fffd087c33e9c82eea344017616459491a62122413fc5ff47939746a757fabcdb177192e9e7ec593ac56eff51ba89150464051760aadbbb0f2823d5d6514e2cacbc6fcb3b85b39c5d3959c1f81b39be744fd069beefddb1bc7b6ac3b5b81b747d2bfeb3f75abb35284eb0785de0b14876e6120f4f29de7c9a24d2f3bf36580e28242642b7a063b12582485b10d3792c8962f622ea9fe8bfa482b766f3c820513d26694bf9098216d05fa3f845d1ae5399c4cec695cccf5ef43395d97ff",
+        "0933193ced73f53bc37500b06985bef52641679c9dd1c1a1b95601b10fdda90f7691d3f5b13c89613ce92baa569cc6a62fedd3be0a532fe262282eb08050078a7938ddfe121a32c830e9e42fd3331a1271541e4d1badfb657277f8dff2c2c92634e3476cc8fc6c46b6815b1d704fd475b8da5aa82d91c299cf8b8c7889d5c0c0cec7f10f171bf6ae8d45524f709f24a62a8c951e1452c721eb0d694db1f945b72a1b53577c086e86cc10fe4709cd59a70a13d3b4373e68b4faef48e07aa8b6fc9c800849cbff184d713e102016ad7029a3b79ef4240ed9487ee4ab21b06f31032207322350d8beaab5fec1876456df694dea9bd9549fbfc2"
+      ],
+      "manifest": {
+        "chunk_size": 256,
+        "chunks": [
+          {
+            "cid": "b3:4a5dbd702816db8d16ee0384802c4fae66dccea386936a799b07fff94599ed58",
+            "len": 272
+          },
+          {
+            "cid": "b3:74b8de6668507e4d3676a8dc61c8ffc6da9ff4cd1156dfa998d757f5af0ec2e1",
+            "len": 272
+          },
+          {
+            "cid": "b3:726fb649004fe525c862035942d58dae70e29a5827f9910a70c356f4f5887695",
+            "len": 272
+          },
+          {
+            "cid": "b3:ec630466ea84b4f057df2706a856ae654ce568ebc0164e374c597830817bf3b5",
+            "len": 248
+          }
+        ],
+        "enc": {
+          "alg": "xchacha20poly1305-chunked-v1",
+          "nonce_prefix": "8a5e13dcaa7ee577bba60d68562d3447",
+          "object_id": "9b8d4c92e4ad3ba6915dcdc192541b4b",
+          "wrapped_keys": [
+            {
+              "ct": "qwiNcwy4BWX9Qw8W5N++QdCj5qnl3Oq5aH8rnHNmNaD6NbP/hDkvw5CDHh5g+pA9",
+              "nonce": "LUU8xUoxybZPlNF463nWUkxQ2UoEdSlU",
+              "recipient": "kek:cd17cb52ad5eb92c"
+            }
+          ]
+        },
+        "size": 1000,
+        "version": 1
+      },
+      "manifest_cid": "b3:5aabc49c0f2954e2fc91fe9b503e4fbbaacecf71d0d839aeee4d436b1b44d8ef",
+      "manifest_json": "{\"version\":1,\"size\":1000,\"chunk_size\":256,\"chunks\":[{\"cid\":\"b3:4a5dbd702816db8d16ee0384802c4fae66dccea386936a799b07fff94599ed58\",\"len\":272},{\"cid\":\"b3:74b8de6668507e4d3676a8dc61c8ffc6da9ff4cd1156dfa998d757f5af0ec2e1\",\"len\":272},{\"cid\":\"b3:726fb649004fe525c862035942d58dae70e29a5827f9910a70c356f4f5887695\",\"len\":272},{\"cid\":\"b3:ec630466ea84b4f057df2706a856ae654ce568ebc0164e374c597830817bf3b5\",\"len\":248}],\"enc\":{\"alg\":\"xchacha20poly1305-chunked-v1\",\"object_id\":\"9b8d4c92e4ad3ba6915dcdc192541b4b\",\"nonce_prefix\":\"8a5e13dcaa7ee577bba60d68562d3447\",\"wrapped_keys\":[{\"recipient\":\"kek:cd17cb52ad5eb92c\",\"nonce\":\"LUU8xUoxybZPlNF463nWUkxQ2UoEdSlU\",\"ct\":\"qwiNcwy4BWX9Qw8W5N++QdCj5qnl3Oq5aH8rnHNmNaD6NbP/hDkvw5CDHh5g+pA9\"}]}}",
+      "name": "multi_chunk_owner",
+      "not_readable_by": [
+        "friend",
+        "stranger"
+      ],
+      "plaintext_hex": "05121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b3845525f6c798693a0adbac7d4e1eefb0815222f3c495663707d8a97a4b1becbd8e5f2ff0c192633404d5a6774818e9ba8b5c2cfdce9f603101d2a3744515e6b7885929facb9c6d3e0edfa0714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9aa7b4c1cedbe8f5020f1c293643505d6a7784919eabb8c5d2dfecf90613202d3a4754616e7b8895a2afbcc9d6e3f0fd0a1724313e4b5865727f8c99a6b3c0cddae7f4010e1b2835424f5c697683909daab7c4d1deebf805121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b3845525f6c798693a0adbac7d4e1eefb0815222f3c495663707d8a97a4b1becbd8e5f2ff0c192633404d5a6774818e9ba8b5c2cfdce9f603101d2a3744515e6b7885929facb9c6d3e0edfa0714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9aa7b4c1cedbe8f5020f1c293643505d6a7784919eabb8c5d2dfecf90613202d3a4754616e7b8895a2afbcc9d6e3f0fd0a1724313e4b5865727f8c99a6b3c0cddae7f4010e1b2835424f5c697683909daab7c4d1deebf805121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b3845525f6c798693a0adbac7d4e1eefb0815222f3c495663707d8a97a4b1becbd8e5f2ff0c192633404d5a6774818e9ba8b5c2cfdce9f603101d2a3744515e6b7885929facb9c6d3e0edfa0714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9aa7b4c1cedbe8f5020f1c293643505d6a7784919eabb8c5d2dfecf90613202d3a4754616e7b8895a2afbcc9d6e3f0fd0a1724313e4b5865727f8c99a6b3c0cddae7f4010e1b2835424f5c697683909daab7c4d1deebf805121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b3845525f6c798693a0adbac7d4e1eefb0815222f3c495663707d8a97a4b1becbd8e5f2ff0c192633404d5a6774818e9ba8b5c2cfdce9f603101d2a3744515e6b7885929facb9c6d3e0edfa0714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9aa7b4c1cedbe8f5020f1c293643505d6a7784919eabb8c5d2dfecf90613202d3a4754616e7b8895a2afbcc9d6e3f0fd0a1724313e4b5865727f8c99a6b3c0",
+      "readable_by": [
+        "owner"
+      ]
+    },
+    {
+      "chunk_size": 256,
+      "chunks_hex": [
+        "35d15c9547cd06fb577aae51e43cae5debb06ae4f386989b6af03de5fbe3ef83deeaaf6a749c6d69c5a927e2854950ea90cad60f91f897f7064edeb6a83be755156f44be63d9dadaa36c6959d25f8b1ecb913ab7e04bf7841bf79ed7c19c9cce19158256984d9a166994c5544cc0af3b0051a8a630d5991cd788c174bf5d697fb74ce61ad682876943ec3dbf89cf2a01480468bf3f0019819383aa8a67d44004712ff362c9c28ac49f52574970481d65bc8493c31007dcfa2959efc38c22d5f7cbf7d766423a4c491ae2254ad19475fad70ca8c637c14aa3a9c69208aa527fa082b1952bb1f2823e5eedf8e887941ef5e071a2d0e18293a17d04f6bd0aff34c792e38f037755c68cacdc53e20a21b1ce",
+        "2f517558614c0d36911dea3bbe48e8b4b792919b2899f7ff9551502327843f6b35c26dada2c1e19114c0f54b1f9dd03f0bc542e55119b3e477ca44417fbf6013679427c81906ecfd1dcaf719e63745574ae284f38a22f0e2754bffefecccf037d273d5c454089d8b58ec9564b85f115352738146e2efcefeb4cbd7a2c57dc78610bc2d69a1501452030049be53719d5af75bb21a9bc5c8e9d55f596d4df4699590cda81786b09d0493ef14c0660a0eb41db50e571214be3505c3113a7c0d7155c5da6d82e245c6696707e761c6eb4e53e9b51a9549755e3f721421b866283483f485c7dcb95c702cf721556393fd40658c5d937cca4a8332c54b657e120575c86111e03603e6f4a8b81649d5fe576244"
+      ],
+      "manifest": {
+        "chunk_size": 256,
+        "chunks": [
+          {
+            "cid": "b3:c86374ff27a144c81ead95210c30ea6d962cdeec74798e04a6242a85bec4b387",
+            "len": 272
+          },
+          {
+            "cid": "b3:4bb26b5fc0b1170c5a84d9628692374a0ab64d1f6807975bdd281e0ec1b287f3",
+            "len": 272
+          }
+        ],
+        "enc": {
+          "alg": "xchacha20poly1305-chunked-v1",
+          "nonce_prefix": "d3a81c13e32c2c5f217e5047bf367b25",
+          "object_id": "c5a49dceacc2510ccd49ffa50e8d049f",
+          "wrapped_keys": [
+            {
+              "ct": "Qo3fPpKzzMLAbmOcKeKg4AytcT+uBeh6gs5Cg0HU5IyAIMdGph5m6Fg7Q/NG7Lsr",
+              "nonce": "eq6CYfra7zuVqg/8tSORXpctmFi6Zv9w",
+              "recipient": "kek:cd17cb52ad5eb92c"
+            }
+          ]
+        },
+        "size": 512,
+        "version": 1
+      },
+      "manifest_cid": "b3:74bd91bbe2e5ad758bca492b90d59f8d4849b40277c5f4d5673bbb64f616c2ae",
+      "manifest_json": "{\"version\":1,\"size\":512,\"chunk_size\":256,\"chunks\":[{\"cid\":\"b3:c86374ff27a144c81ead95210c30ea6d962cdeec74798e04a6242a85bec4b387\",\"len\":272},{\"cid\":\"b3:4bb26b5fc0b1170c5a84d9628692374a0ab64d1f6807975bdd281e0ec1b287f3\",\"len\":272}],\"enc\":{\"alg\":\"xchacha20poly1305-chunked-v1\",\"object_id\":\"c5a49dceacc2510ccd49ffa50e8d049f\",\"nonce_prefix\":\"d3a81c13e32c2c5f217e5047bf367b25\",\"wrapped_keys\":[{\"recipient\":\"kek:cd17cb52ad5eb92c\",\"nonce\":\"eq6CYfra7zuVqg/8tSORXpctmFi6Zv9w\",\"ct\":\"Qo3fPpKzzMLAbmOcKeKg4AytcT+uBeh6gs5Cg0HU5IyAIMdGph5m6Fg7Q/NG7Lsr\"}]}}",
+      "name": "exact_multiple_owner",
+      "not_readable_by": [
+        "friend",
+        "stranger"
+      ],
+      "plaintext_hex": "0104070a0d101316191c1f2225282b2e3134373a3d404346494c4f5255585b5e6164676a6d707376797c7f8285888b8e9194979a9da0a3a6a9acafb2b5b8bbbec1c4c7cacdd0d3d6d9dcdfe2e5e8ebeef1f4f7fafd000306090c0f1215181b1e2124272a2d303336393c3f4245484b4e5154575a5d606366696c6f7275787b7e8184878a8d909396999c9fa2a5a8abaeb1b4b7babdc0c3c6c9cccfd2d5d8dbdee1e4e7eaedf0f3f6f9fcff0205080b0e1114171a1d202326292c2f3235383b3e4144474a4d505356595c5f6265686b6e7174777a7d808386898c8f9295989b9ea1a4a7aaadb0b3b6b9bcbfc2c5c8cbced1d4d7dadde0e3e6e9eceff2f5f8fbfe0104070a0d101316191c1f2225282b2e3134373a3d404346494c4f5255585b5e6164676a6d707376797c7f8285888b8e9194979a9da0a3a6a9acafb2b5b8bbbec1c4c7cacdd0d3d6d9dcdfe2e5e8ebeef1f4f7fafd000306090c0f1215181b1e2124272a2d303336393c3f4245484b4e5154575a5d606366696c6f7275787b7e8184878a8d909396999c9fa2a5a8abaeb1b4b7babdc0c3c6c9cccfd2d5d8dbdee1e4e7eaedf0f3f6f9fcff0205080b0e1114171a1d202326292c2f3235383b3e4144474a4d505356595c5f6265686b6e7174777a7d808386898c8f9295989b9ea1a4a7aaadb0b3b6b9bcbfc2c5c8cbced1d4d7dadde0e3e6e9eceff2f5f8fbfe",
+      "readable_by": [
+        "owner"
+      ]
+    },
+    {
+      "chunk_size": 1024,
+      "chunks_hex": [
+        "6c00fd6e805254c7cd5592deebc6edc0"
+      ],
+      "manifest": {
+        "chunk_size": 1024,
+        "chunks": [
+          {
+            "cid": "b3:b55c417c916cba6be8708f1bad1042c3936bfd83fe0d29c3682836a1bb7c0ef0",
+            "len": 16
+          }
+        ],
+        "enc": {
+          "alg": "xchacha20poly1305-chunked-v1",
+          "nonce_prefix": "76fff8e5222c13b2543f4a47d5347521",
+          "object_id": "d1bd8b72ac19f472bb870dc0ba373952",
+          "wrapped_keys": [
+            {
+              "ct": "raFSAMSL+qQwSNkPj1oafb7A1KHQSZQn4981oNS5824razd4ZuxCY33Q+8RRX3tJ",
+              "nonce": "OX7/nD0QQ7ECeGDBQZWgAWVKU4CHBIBb",
+              "recipient": "kek:cd17cb52ad5eb92c"
+            }
+          ]
+        },
+        "size": 0,
+        "version": 1
+      },
+      "manifest_cid": "b3:2da784b918007720b6cd66dcf3e2454d6329d67c82ca9c0b1a3c1ba17fbcb2d9",
+      "manifest_json": "{\"version\":1,\"size\":0,\"chunk_size\":1024,\"chunks\":[{\"cid\":\"b3:b55c417c916cba6be8708f1bad1042c3936bfd83fe0d29c3682836a1bb7c0ef0\",\"len\":16}],\"enc\":{\"alg\":\"xchacha20poly1305-chunked-v1\",\"object_id\":\"d1bd8b72ac19f472bb870dc0ba373952\",\"nonce_prefix\":\"76fff8e5222c13b2543f4a47d5347521\",\"wrapped_keys\":[{\"recipient\":\"kek:cd17cb52ad5eb92c\",\"nonce\":\"OX7/nD0QQ7ECeGDBQZWgAWVKU4CHBIBb\",\"ct\":\"raFSAMSL+qQwSNkPj1oafb7A1KHQSZQn4981oNS5824razd4ZuxCY33Q+8RRX3tJ\"}]}}",
+      "name": "empty_owner",
+      "not_readable_by": [
+        "friend",
+        "stranger"
+      ],
+      "plaintext_hex": "",
+      "readable_by": [
+        "owner"
+      ]
+    },
+    {
+      "chunk_size": 100,
+      "chunks_hex": [
+        "126371258541158a68c7789c4ad68873ad546b7f99225f1f81cf0318f9e32109ec83f35ba52c344b0fb14902095bd9a1bfd9153290b1859201364e88e34067abdd8c479e67ae418e6fde331b8cd402d897653618f781caf2a026247e22d8f939ae5d8c96062bb28dc5e0c6e6f0c7857cb973ef2b",
+        "418c7ebdc45b031e34e8c87c1c9f57ce118fe32626a2e97086f6a4656239a6ba9a42a86aaa33c88f6e5b309c88a07490a3188241edb7db1a1984389607a6526f8a6c8853df9788c391dd13deb6f136d7072f4c8d1fc6c562f67da88911ee4a89fba192cba9a65b78adc652fa4c0fd438d366c5bd",
+        "a7be010cc306bfeb8d96d901537dae3f6545e7bd9f13606453fd2ec746e0b27a890b906fd8020ee197a7996bc051e622bf5a3db4813c013fdb26a75f28c8f96b212f4332bd008c5992ae742110e975de523b9917af7cfc02c48644e472bae95adda8c07ae2180b7c9f6c48b1918a1c7fda96031d"
+      ],
+      "manifest": {
+        "chunk_size": 100,
+        "chunks": [
+          {
+            "cid": "b3:8090fe244dd44deffaa7cd7a075578385e492c5dabec53963e4d03ed31a2265d",
+            "len": 116
+          },
+          {
+            "cid": "b3:e5e3a82e2e3c49f03faf3ddb9c7007aba38d4cd0b4229e76391964ba16f0ee23",
+            "len": 116
+          },
+          {
+            "cid": "b3:44260d955daa0ca1539db1b39b2958d9946994765b1e1259288d73e2e619d97a",
+            "len": 116
+          }
+        ],
+        "content_type": "application/octet-stream",
+        "enc": {
+          "alg": "xchacha20poly1305-chunked-v1",
+          "nonce_prefix": "9e1814f2007502de346054a6cbe49bee",
+          "object_id": "b1073e90cc69e4bd93d509ca3b732bd6",
+          "wrapped_keys": [
+            {
+              "ct": "BwZQjFCQplyRlK6V98wuSLufLxNq9y7/id2FX6HHHjaxt6rPlbKFCF68XtrlbZCj",
+              "nonce": "feR3RHIS3by/lT6uvzfLik7GRu9e/a9j",
+              "recipient": "kek:cd17cb52ad5eb92c"
+            },
+            {
+              "ct": "omglfRpvTghVTp/0fY5qFipWgT8pc2QCJjqkYQ+I02AeqwB4wdJYoItUjIlsuPfg",
+              "epk": "B731U94X255erpAcYx98agC1qVrNxdfQ5PXda8Ch8Mpp",
+              "nonce": "NnkM7xiuwW8BETQpECKo3e05IC3rwLPf",
+              "recipient": "x25519:HztmdMrCxowGBpGboRAppcdePuu8hVHzcwPhuiUNwA9h"
+            }
+          ]
+        },
+        "size": 300,
+        "version": 1
+      },
+      "manifest_cid": "b3:54769c9233dfb832c6c9ae8136514b01e7f08b8330c2195a6ae61d2d0629eb85",
+      "manifest_json": "{\"version\":1,\"size\":300,\"chunk_size\":100,\"chunks\":[{\"cid\":\"b3:8090fe244dd44deffaa7cd7a075578385e492c5dabec53963e4d03ed31a2265d\",\"len\":116},{\"cid\":\"b3:e5e3a82e2e3c49f03faf3ddb9c7007aba38d4cd0b4229e76391964ba16f0ee23\",\"len\":116},{\"cid\":\"b3:44260d955daa0ca1539db1b39b2958d9946994765b1e1259288d73e2e619d97a\",\"len\":116}],\"enc\":{\"alg\":\"xchacha20poly1305-chunked-v1\",\"object_id\":\"b1073e90cc69e4bd93d509ca3b732bd6\",\"nonce_prefix\":\"9e1814f2007502de346054a6cbe49bee\",\"wrapped_keys\":[{\"recipient\":\"kek:cd17cb52ad5eb92c\",\"nonce\":\"feR3RHIS3by/lT6uvzfLik7GRu9e/a9j\",\"ct\":\"BwZQjFCQplyRlK6V98wuSLufLxNq9y7/id2FX6HHHjaxt6rPlbKFCF68XtrlbZCj\"},{\"recipient\":\"x25519:HztmdMrCxowGBpGboRAppcdePuu8hVHzcwPhuiUNwA9h\",\"epk\":\"B731U94X255erpAcYx98agC1qVrNxdfQ5PXda8Ch8Mpp\",\"nonce\":\"NnkM7xiuwW8BETQpECKo3e05IC3rwLPf\",\"ct\":\"omglfRpvTghVTp/0fY5qFipWgT8pc2QCJjqkYQ+I02AeqwB4wdJYoItUjIlsuPfg\"}]},\"content_type\":\"application/octet-stream\"}",
+      "name": "owner_and_x25519",
+      "not_readable_by": [
+        "stranger"
+      ],
+      "plaintext_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b",
+      "readable_by": [
+        "owner",
+        "friend"
+      ]
+    },
+    {
+      "chunk_size": 7,
+      "chunks_hex": [
+        "b1f74d8409ec339e5a189a82d7cee3dd6493257ee9e50a",
+        "095c2f2c18a12ab5559033612099cb05f623520b3cc56d",
+        "e81105c32ef68f1d936a1436309e83d787bc0bed"
+      ],
+      "manifest": {
+        "chunk_size": 7,
+        "chunks": [
+          {
+            "cid": "b3:ee0fd97b140cc4f2f6dcada96eefde31483c3b05167ec132fc4c3213d621b602",
+            "len": 23
+          },
+          {
+            "cid": "b3:8271c94501fe5466ec95fc68cbb6bfb81a4e0d5b3bab45cd3de14351b0d1d2a0",
+            "len": 23
+          },
+          {
+            "cid": "b3:5123c7556a4c02bc11769e8bbda79ce98aeb639eac4f2cfbe60ab2dec74a3e8b",
+            "len": 20
+          }
+        ],
+        "enc": {
+          "alg": "xchacha20poly1305-chunked-v1",
+          "nonce_prefix": "7a0d552656ae1f9fd27e8d19e93030df",
+          "object_id": "42e976a4dd82bebef3b4e9321b883f4c",
+          "wrapped_keys": [
+            {
+              "ct": "8r4ZkoWstxvJfV1ou2/uiBvLWfG3LOjkODkdbglBNOZe9Z9aC+8d6OXNZG8jDD9N",
+              "epk": "9DwM7L5rA2PThHcRBSeNq7ywPk5gyBQkZgkgTcKBpWKe",
+              "nonce": "836xfB3MHwWlD+2bH3H2y17BUJ7VgWe7",
+              "recipient": "x25519:HztmdMrCxowGBpGboRAppcdePuu8hVHzcwPhuiUNwA9h"
+            }
+          ]
+        },
+        "size": 18,
+        "version": 1
+      },
+      "manifest_cid": "b3:9885bc3b13b48703312a56ceac5a9f300e73a00ff489c261acd99559cbf5a2a9",
+      "manifest_json": "{\"version\":1,\"size\":18,\"chunk_size\":7,\"chunks\":[{\"cid\":\"b3:ee0fd97b140cc4f2f6dcada96eefde31483c3b05167ec132fc4c3213d621b602\",\"len\":23},{\"cid\":\"b3:8271c94501fe5466ec95fc68cbb6bfb81a4e0d5b3bab45cd3de14351b0d1d2a0\",\"len\":23},{\"cid\":\"b3:5123c7556a4c02bc11769e8bbda79ce98aeb639eac4f2cfbe60ab2dec74a3e8b\",\"len\":20}],\"enc\":{\"alg\":\"xchacha20poly1305-chunked-v1\",\"object_id\":\"42e976a4dd82bebef3b4e9321b883f4c\",\"nonce_prefix\":\"7a0d552656ae1f9fd27e8d19e93030df\",\"wrapped_keys\":[{\"recipient\":\"x25519:HztmdMrCxowGBpGboRAppcdePuu8hVHzcwPhuiUNwA9h\",\"epk\":\"9DwM7L5rA2PThHcRBSeNq7ywPk5gyBQkZgkgTcKBpWKe\",\"nonce\":\"836xfB3MHwWlD+2bH3H2y17BUJ7VgWe7\",\"ct\":\"8r4ZkoWstxvJfV1ou2/uiBvLWfG3LOjkODkdbglBNOZe9Z9aC+8d6OXNZG8jDD9N\"}]}}",
+      "name": "x25519_only",
+      "not_readable_by": [
+        "owner",
+        "stranger"
+      ],
+      "plaintext_hex": "666f7220796f75722065796573206f6e6c79",
+      "readable_by": [
+        "friend"
+      ]
+    },
+    {
+      "chunk_size": 8,
+      "chunks_hex": [
+        "4142434445464748",
+        "494a4b4c4d4e4f50",
+        "51525354"
+      ],
+      "manifest": {
+        "chunk_size": 8,
+        "chunks": [
+          {
+            "cid": "b3:59a216db95aff0f8833f96f341fcb1f6594378096127c2b0fa9f3a849361d979",
+            "len": 8
+          },
+          {
+            "cid": "b3:0405b20392b3c40add06e9bd489ea48bcc819b8f890e75d16a3c641f7519ff88",
+            "len": 8
+          },
+          {
+            "cid": "b3:3fe27fdfa8f289ef4a05491b3b3ff6f6af1d462c4147655e40e766c649b3d352",
+            "len": 4
+          }
+        ],
+        "size": 20,
+        "version": 1
+      },
+      "manifest_cid": "b3:3e054aa968cf79400cacc01869dfa3ebc1d8f9989f5200470d35cb9a47a45fc3",
+      "manifest_json": "{\"version\":1,\"size\":20,\"chunk_size\":8,\"chunks\":[{\"cid\":\"b3:59a216db95aff0f8833f96f341fcb1f6594378096127c2b0fa9f3a849361d979\",\"len\":8},{\"cid\":\"b3:0405b20392b3c40add06e9bd489ea48bcc819b8f890e75d16a3c641f7519ff88\",\"len\":8},{\"cid\":\"b3:3fe27fdfa8f289ef4a05491b3b3ff6f6af1d462c4147655e40e766c649b3d352\",\"len\":4}]}",
+      "name": "public",
+      "not_readable_by": [],
+      "plaintext_hex": "4142434445464748494a4b4c4d4e4f5051525354",
+      "readable_by": [
+        "owner",
+        "friend",
+        "stranger"
+      ]
+    },
+    {
+      "chunk_size": 8,
+      "chunks_hex": [
+        ""
+      ],
+      "manifest": {
+        "chunk_size": 8,
+        "chunks": [
+          {
+            "cid": "b3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+            "len": 0
+          }
+        ],
+        "size": 0,
+        "version": 1
+      },
+      "manifest_cid": "b3:92f8c46b36188ae1bb4e3da96315f1f88f1d287628d73c03de507e79d37c666b",
+      "manifest_json": "{\"version\":1,\"size\":0,\"chunk_size\":8,\"chunks\":[{\"cid\":\"b3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262\",\"len\":0}]}",
+      "name": "public_empty",
+      "not_readable_by": [],
+      "plaintext_hex": "",
+      "readable_by": [
+        "owner",
+        "friend",
+        "stranger"
+      ]
+    }
+  ],
+  "records": [
+    {
+      "json": "{\"namespace\":\"alice.near\",\"path\":\"memory/today.txt\",\"manifest_cid\":\"b3:cca714a318cfd67ca32f1004cd12af7d060f716ad5bccb9550ef5da1d5aea4dc\",\"size\":6,\"stored_size\":120,\"seq\":1,\"writer\":\"alice.near\",\"writer_pk\":\"ed25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj\",\"ts_ms\":1763456789999,\"sig\":\"uGy7ammXdacjqDPVyD2s8f5bTv9F9Hxb95g17ir3vqSoU2di2b1TX6ucouCu2AuFi3UYNYCSFzC24v3nDsfaxEB\"}",
+      "record": {
+        "manifest_cid": "b3:cca714a318cfd67ca32f1004cd12af7d060f716ad5bccb9550ef5da1d5aea4dc",
+        "namespace": "alice.near",
+        "path": "memory/today.txt",
+        "seq": 1,
+        "sig": "uGy7ammXdacjqDPVyD2s8f5bTv9F9Hxb95g17ir3vqSoU2di2b1TX6ucouCu2AuFi3UYNYCSFzC24v3nDsfaxEB",
+        "size": 6,
+        "stored_size": 120,
+        "ts_ms": 1763456789999,
+        "writer": "alice.near",
+        "writer_pk": "ed25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj"
+      },
+      "signing_string": "nstorage-record-v1\nalice.near\nmemory/today.txt\nb3:cca714a318cfd67ca32f1004cd12af7d060f716ad5bccb9550ef5da1d5aea4dc\n6\n120\n1\nalice.near\ned25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj\n1763456789999"
+    },
+    {
+      "json": "{\"namespace\":\"app.near\",\"path\":\"users/bob.near/ü x\",\"manifest_cid\":\"b3:2308c00db209e417a3369b2531ce4255b918e9bb4ec792b2045a88f65b0fab3a\",\"size\":0,\"stored_size\":300,\"seq\":7,\"writer\":\"alice.near\",\"writer_pk\":\"ed25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj\",\"ts_ms\":1763456789999,\"sig\":\"4iwmNmVhHWYG5KmGtNATjKRjpgZw2ovZGnELaipL5whuCKwMkBGToHHsBb7U5LK8FTa3BdSUwLqn2G9r2xoRijn5\"}",
+      "record": {
+        "manifest_cid": "b3:2308c00db209e417a3369b2531ce4255b918e9bb4ec792b2045a88f65b0fab3a",
+        "namespace": "app.near",
+        "path": "users/bob.near/ü x",
+        "seq": 7,
+        "sig": "4iwmNmVhHWYG5KmGtNATjKRjpgZw2ovZGnELaipL5whuCKwMkBGToHHsBb7U5LK8FTa3BdSUwLqn2G9r2xoRijn5",
+        "size": 0,
+        "stored_size": 300,
+        "ts_ms": 1763456789999,
+        "writer": "alice.near",
+        "writer_pk": "ed25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj"
+      },
+      "signing_string": "nstorage-record-v1\napp.near\nusers/bob.near/ü x\nb3:2308c00db209e417a3369b2531ce4255b918e9bb4ec792b2045a88f65b0fab3a\n0\n300\n7\nalice.near\ned25519:9C6hybhQ6Aycep9jaUnP6uL9ZYvDjUp1aSkFWPUFJtpj\n1763456789999"
+    }
+  ],
+  "roots": {
+    "friend": {
+      "kek": "a0a47bb023340571afaaa9df50c1bc531edd2808bcb0cc6facc32e56cedfed3a",
+      "kek_id": "80be69e084a48379",
+      "root_key": "6465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80818283",
+      "x25519_public": "x25519:HztmdMrCxowGBpGboRAppcdePuu8hVHzcwPhuiUNwA9h",
+      "x25519_secret": "7d0b5fc676d87ccfc1c6289234b41b3a229693564528db10a943061f477d0407"
+    },
+    "owner": {
+      "kek": "668def02828a787923648b18c863d1bcf12a4b4f52e53485d4175e592ff87ea0",
+      "kek_id": "cd17cb52ad5eb92c",
+      "root_key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "x25519_public": "x25519:HXKs4vW3VqssNdrf3HYroZgLZsTmFjoBeZ6TQMFGTpnj",
+      "x25519_secret": "e400067a5bc4658f8657315c13ade7a79358229bd04c85fbccfba9e996772025"
+    },
+    "stranger": {
+      "kek": "6e205478cc73316f82044acd713992e089ef7fb834587dba392a5fc4196cbd10",
+      "kek_id": "71bb87bbdf956d56",
+      "root_key": "c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7",
+      "x25519_public": "x25519:T8oh8pHvjJbiaSGY6QWotcSGdf86iFpRwjbA5nFST6m",
+      "x25519_secret": "939cd0a721023a5dada01d91fa3ba030254eaa763db2823e47151ce08cedc02f"
+    }
+  },
+  "uri": {
+    "encode_path": [
+      {
+        "encoded": "memory/today.txt",
+        "path": "memory/today.txt"
+      },
+      {
+        "encoded": "x%20y/%C3%BC%2B%3F%23%26%3D%25.txt",
+        "path": "x y/ü+?#&=%.txt"
+      },
+      {
+        "encoded": "a~b-c_d.e/f",
+        "path": "a~b-c_d.e/f"
+      },
+      {
+        "encoded": "emoji%F0%9F%99%82/%E6%97%A5%E6%9C%AC",
+        "path": "emoji🙂/日本"
+      }
+    ],
+    "invalid": [
+      "s3://a.near/x",
+      "near://A.near/x",
+      "near://a..near/x",
+      "near://.a.near/x",
+      "near://a.near./x",
+      "near://a/x",
+      "near://alice.near/../x",
+      "near://alice.near/./x",
+      "near://alice.near/a//b",
+      "near://alice.near/a\nb",
+      "near://alice.near/a\\b",
+      "near://alice.near/ab",
+      "near://alice.near/ab"
+    ],
+    "object_invalid_paths": [
+      "dir/",
+      "",
+      "a//b"
+    ],
+    "valid": [
+      {
+        "display": "near://alice.near/objects/etc/mystuff",
+        "namespace": "alice.near",
+        "path": "objects/etc/mystuff",
+        "uri": "near://alice.near/objects/etc/mystuff"
+      },
+      {
+        "display": "near://alice.near/",
+        "namespace": "alice.near",
+        "path": "",
+        "uri": "near://alice.near"
+      },
+      {
+        "display": "near://alice.near/",
+        "namespace": "alice.near",
+        "path": "",
+        "uri": "near://alice.near/"
+      },
+      {
+        "display": "near://alice.near/dir/",
+        "namespace": "alice.near",
+        "path": "dir/",
+        "uri": "near://alice.near/dir/"
+      },
+      {
+        "display": "near://a-b_c.near/x y/ü/emoji🙂.txt",
+        "namespace": "a-b_c.near",
+        "path": "x y/ü/emoji🙂.txt",
+        "uri": "near://a-b_c.near/x y/ü/emoji🙂.txt"
+      },
+      {
+        "display": "near://0x.near/a/b.c/...d",
+        "namespace": "0x.near",
+        "path": "a/b.c/...d",
+        "uri": "near://0x.near/a/b.c/...d"
+      }
+    ]
+  }
+}
