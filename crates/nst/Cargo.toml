@@ -13,6 +13,7 @@ clap.workspace = true
 nstorage-core.workspace = true
 nstorage-client.workspace = true
 nstorage-ckd.workspace = true
+nstorage-near.workspace = true
 hex.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true

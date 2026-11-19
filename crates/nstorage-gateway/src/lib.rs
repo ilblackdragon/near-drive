@@ -4,6 +4,7 @@ pub mod cache;
 pub mod keys;
 pub mod locate;
 pub mod placement;
+pub mod policies;
 pub mod s3;
 pub mod store;
 pub mod usage;
@@ -47,9 +48,13 @@ pub struct Config {
     /// account -> allowed public keys (dev / tests).
     #[serde(default)]
     pub dev_keys: HashMap<String, Vec<String>>,
-    /// namespace -> ordered rules. Stand-in for the `storage.near` contract.
+    /// namespace -> ordered rules. Overrides `storage.near` for these
+    /// namespaces; the only policy source when `rpc_url` is None.
     #[serde(default)]
     pub policies: HashMap<String, Vec<Rule>>,
+    /// Read namespace rules from `storage_contract` via `rpc_url` (cached 30 s).
+    #[serde(default = "default_true")]
+    pub contract_policies: bool,
     /// Blob backends, storage classes, index store, chunk cache (see README).
     #[serde(default)]
     pub storage: StorageConfig,
@@ -64,9 +69,14 @@ impl Default for Config {
             storage_contract: default_contract(),
             dev_keys: HashMap::new(),
             policies: HashMap::new(),
+            contract_policies: true,
             storage: StorageConfig::default(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_contract() -> String {
@@ -78,6 +88,7 @@ pub struct AppState {
     pub blobs: Placement,
     pub index: Arc<dyn IndexStore>,
     pub keys: keys::KeyResolver,
+    pub policies: policies::PolicySource,
     pub usage: usage::UsageSink,
     replay: Mutex<HashMap<String, Instant>>,
 }
@@ -89,14 +100,24 @@ impl AppState {
             blobs: Placement::from_config(&cfg.storage, &cfg.data_dir)?,
             index: cfg.storage.index.build(&cfg.data_dir)?,
             keys: keys::KeyResolver::new(cfg.rpc_url.clone(), cfg.storage_contract.clone(), cfg.dev_keys.clone()),
+            policies: policies::PolicySource::new(
+                &cfg.policies,
+                match (&cfg.rpc_url, cfg.contract_policies) {
+                    (Some(rpc), true) => Some(nstorage_near::StorageContract::new(rpc.clone(), cfg.storage_contract.clone())),
+                    _ => None,
+                },
+            ),
             usage: usage::UsageSink::open(cfg.data_dir.join("usage.jsonl")).await?,
             replay: Mutex::new(HashMap::new()),
             cfg,
         }))
     }
 
-    fn rules(&self, ns: &str) -> &[Rule] {
-        self.cfg.policies.get(ns).map(Vec::as_slice).unwrap_or(&[])
+    async fn rules(&self, ns: &str) -> Result<Arc<Vec<Rule>>, ApiError> {
+        self.policies.rules(ns).await.map_err(|e| {
+            tracing::error!("{e:#}");
+            err(StatusCode::SERVICE_UNAVAILABLE, "namespace policy unavailable")
+        })
     }
 }
 
@@ -189,7 +210,7 @@ async fn put_chunk(
 ) -> Result<StatusCode, ApiError> {
     check_ns(&ns)?;
     let signer = authenticate(&st, &method, &uri, &headers, &body).await?;
-    if !policy::can_write_somewhere(&ns, st.rules(&ns), &signer.account) {
+    if !policy::can_write_somewhere(&ns, &st.rules(&ns).await?, &signer.account) {
         return Err(err(StatusCode::FORBIDDEN, "no write access to namespace"));
     }
     if !nstorage_core::is_valid_cid(&cid) || nstorage_core::cid(&body) != cid {
@@ -221,7 +242,7 @@ async fn put_object(
 ) -> Result<Response, ApiError> {
     check_obj(&ns, &path)?;
     let signer = authenticate(&st, &method, &uri, &headers, &body).await?;
-    let access = policy::resolve(&ns, st.rules(&ns), &path, &signer.account);
+    let access = policy::resolve(&ns, &st.rules(&ns).await?, &path, &signer.account);
     if !access.write {
         return Err(err(StatusCode::FORBIDDEN, "no write access"));
     }
@@ -295,7 +316,7 @@ async fn get_object(
 ) -> Result<Response, ApiError> {
     check_obj(&ns, &path)?;
     let signer = authenticate(&st, &method, &uri, &headers, &[]).await?;
-    let access = policy::resolve(&ns, st.rules(&ns), &path, &signer.account);
+    let access = policy::resolve(&ns, &st.rules(&ns).await?, &path, &signer.account);
     if !access.read {
         return Err(err(StatusCode::FORBIDDEN, "no read access"));
     }
@@ -341,7 +362,7 @@ async fn delete_object(
 ) -> Result<StatusCode, ApiError> {
     check_obj(&ns, &path)?;
     let signer = authenticate(&st, &method, &uri, &headers, &[]).await?;
-    let access = policy::resolve(&ns, st.rules(&ns), &path, &signer.account);
+    let access = policy::resolve(&ns, &st.rules(&ns).await?, &path, &signer.account);
     if !access.write {
         return Err(err(StatusCode::FORBIDDEN, "no write access"));
     }
@@ -371,13 +392,13 @@ async fn list_objects(
 ) -> Result<Response, ApiError> {
     check_ns(&ns)?;
     let signer = authenticate(&st, &method, &uri, &headers, &[]).await?;
-    let rules = st.rules(&ns);
+    let rules = st.rules(&ns).await?;
     let entries: Vec<_> = st
         .index
         .list(&ns, &q.prefix)
         .await?
         .into_iter()
-        .filter(|r| policy::resolve(&ns, rules, &r.path, &signer.account).read)
+        .filter(|r| policy::resolve(&ns, &rules, &r.path, &signer.account).read)
         .map(|r| json!({"path": r.path, "size": r.size, "seq": r.seq, "writer": r.writer, "ts_ms": r.ts_ms, "manifest_cid": r.manifest_cid}))
         .collect();
     Ok(Json(entries).into_response())

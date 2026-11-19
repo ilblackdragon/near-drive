@@ -11,7 +11,9 @@ See [DESIGN.md](DESIGN.md) for the architecture and roadmap.
 | `nstorage-client` | Rust SDK: chunk + encrypt + sign, verifies everything it reads; streaming `put_file`/`get_to_file`/`get_range` for large objects |
 | `nstorage-gateway` | stateless HTTP gateway; NEAR access-key auth (RPC `view_access_key` or dev keys); blob backends fs / S3 / R2 / MinIO / HTTP blob bridge with storage classes and replication; fs or S3 (multi-gateway CAS) index; chunk cache; `?mode=locate` direct URLs; JSONL usage metering |
 | `nstorage-s3` | S3-compatible local sidecar: SigV4/SigV2 verification, aws-chunked + checksum trailers, S3 ops → native API |
-| `nst` | CLI: `keygen`, `dev-key`, `put`, `get` (streaming, `--range`, `--class`), `ls`, `rm`, `s3-proxy` |
+| `nst` | CLI: `keygen`, `dev-key`, `put`, `get` (streaming, `--range`, `--class`), `ls`, `rm`, `share`, `s3-proxy`, `keygen --ckd`; chain: `grant`, `rules`, `publish-key`, `gateways` |
+| `nstorage-near` | NEAR JSON-RPC views + signed function calls (small hand-rolled borsh tx builder) for `storage.near` |
+| `contracts/storage` | the `storage.near` contract: namespace rules, X25519 keys, gateway registry, credential epochs, anchors, stablecoin / NEAR Intents escrow ([docs/payments.md](docs/payments.md)) |
 
 ## Quickstart (dev)
 
@@ -33,13 +35,52 @@ target/debug/nst get near://alice.near/memory/today.txt
 With real NEAR accounts, set `"rpc_url": "https://rpc.mainnet.near.org"` in the gateway config. Then use
 `~/.near-credentials/mainnet/<account>.json`, which needs a full-access key or a function-call key for `storage_contract`.
 
-Gateway config `policies` stands in for the `storage.near` contract until it exists. For example, an app pays for its users' data:
+With `rpc_url` set, the gateway reads namespace rules from the `storage_contract` (`get_rules`, cached 30 s; set
+`"contract_policies": false` to disable). Config `policies` entries override the contract for their namespaces, and are
+the only policy source without `rpc_url`. For example, an app pays for its users' data:
 
 ```json
 "policies": {"app.near": [
   {"prefix": "users/{account}/", "read": ["{account}"], "write": ["{account}", "app.near"], "payer": "app.near"}
 ]}
 ```
+
+The same rule onchain, plus sharing by account name (`--rpc-url` defaults per `--network`; `--contract` defaults to
+`storage.near`; `NSTORAGE_GATEWAY=auto` picks the fastest healthy gateway from the onchain registry):
+
+```sh
+nst --account app.near grant 'near://app.near/users/{account}/' --read '{account}' --write '{account},app.near' --payer app.near
+nst rules app.near
+nst --account bob.near publish-key            # set_enc_key with bob's x25519 key
+nst --account alice.near share near://alice.near/doc/x bob.near   # looks up bob's key onchain
+nst gateways
+```
+
+Onchain writes attach a NEAR deposit for storage staking (excess refunded), so they need a full-access key.
+
+## storage.near contract
+
+`contracts/` is a separate cargo workspace (wasm). Build and test:
+
+```sh
+contracts/build.sh                                   # cargo near build → contracts/target/near/*/
+cd contracts && cargo test -p nstorage-contract      # unit tests + local sandbox (near-workspaces) tests
+```
+
+Methods (JSON args; `U128` = decimal string):
+
+| area | methods |
+|---|---|
+| policy | `set_rules(rules)` (payable; caller's namespace; ≤32 rules, one `{account}` per prefix), `get_rules(namespace)` |
+| keys | `set_enc_key(key)` / `remove_enc_key()` (payable), `get_enc_key(account_id)` |
+| revocation | `bump_cred_epoch() -> u64` (payable), `get_cred_epoch(account_id) -> u64` |
+| anchors | `anchor(namespace, root, seq)` (owner or active gateway; seq strictly increasing), `get_anchor(namespace)` |
+| registry | `register_gateway(info)` (stake ≥ `gateway_min_stake` + storage), `update_gateway(info)`, `deregister_gateway()`, `withdraw_gateway_stake()` (after delay), `get_gateway(operator)`, `list_gateways(from_index, limit)`, `gateways_count()` |
+| escrow | `ft_on_transfer`, `mt_on_transfer`, `set_spend_cap(per_day)`, `settle(entries)`, `request_withdraw_balance(asset, amount)`, `cancel_withdraw_balance()`, `withdraw_balance()`, `withdraw_earnings()`, `get_payer`, `get_earnings`, `is_settled`, `get_assets`, `get_settlers` |
+| owner | `new(owner_id, assets?, config?)`, `set_config(patch)`, `set_asset(asset)`, `add_settler(account_id, any_gateway)`, `remove_settler`, `set_owner`, `get_config`, `get_owner` |
+
+`info = {url, regions, backends, price_hint, attestation?}`. See [docs/payments.md](docs/payments.md) for funding
+(USDC `ft_transfer_call`, NEAR Intents `mt_transfer_call` / signed `transfer` intent) and settlement.
 
 ## Storage backends, classes and index
 
@@ -156,6 +197,11 @@ The proxy encrypts client-side with the account's root key and signs requests wi
 - `tests/streaming.rs`: streaming vs one-shot interop, ranges, storage classes, a blob bridge with direct URLs and fallback;
 - `tests/large.rs`: a large object with bounded memory;
 - `crates/nstorage-s3/tests/s3_e2e.rs`: gateway + S3 proxy driven by the AWS Rust SDK (and raw signed requests for chunk signatures, trailers, skew and presigned URLs).
+- `tests/contract_policy.rs`: gateway policy from `storage.near` through a mock RPC (cache, override, failure → 503).
+
+Contract tests (`cd contracts && cargo test`, after `contracts/build.sh`; the sandbox node binary is downloaded on first
+run) include `tests/sandbox.rs` (contract flows with mock FT/MT tokens, plus the `nstorage-near` tx builder) and
+`tests/gateway_chain.rs` (a real gateway resolving keys and rules from the sandbox chain, sharing by account, discovery).
 
 To run the S3 tests against a local MinIO (bind it to localhost only):
 

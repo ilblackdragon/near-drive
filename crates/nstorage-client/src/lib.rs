@@ -17,7 +17,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use nstorage_core;
 
+mod chain;
 mod large;
+pub use chain::discover_gateway;
 pub use large::{Located, LocatedChunk};
 
 pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -86,6 +88,8 @@ pub struct Client {
     /// identical concurrent requests never produce the same signature (the
     /// gateway's replay cache would reject the second one).
     last_ts: AtomicU64,
+    /// `storage.near` access for sharing-by-account and policy grants.
+    chain: Option<nstorage_near::StorageContract>,
 }
 
 fn now_ms() -> u64 {
@@ -116,6 +120,7 @@ impl Client {
             chunk_size: DEFAULT_CHUNK_SIZE,
             parallelism: DEFAULT_PARALLELISM,
             last_ts: AtomicU64::new(0),
+            chain: None,
         }
     }
 
