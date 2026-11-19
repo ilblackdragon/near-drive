@@ -11,3 +11,9 @@ serde_json.workspace = true
 reqwest.workspace = true
 nstorage-core.workspace = true
 ed25519-dalek.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

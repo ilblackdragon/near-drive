@@ -5,7 +5,7 @@ use nstorage_client::{
     nstorage_core::{crypto::RootKey, keys, NearUri},
     Client, PutOptions,
 };
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -24,6 +24,12 @@ struct Cli {
     /// Directory for nstorage root keys (default ~/.nstorage).
     #[arg(long, env = "NSTORAGE_HOME", global = true)]
     home: Option<PathBuf>,
+    /// Concurrent chunk transfers for put/get.
+    #[arg(long, env = "NSTORAGE_PARALLEL", default_value_t = nstorage_client::DEFAULT_PARALLELISM, global = true)]
+    parallel: usize,
+    /// Chunk size in MiB for uploads (1..=64).
+    #[arg(long, env = "NSTORAGE_CHUNK_MIB", default_value_t = 4, global = true)]
+    chunk_mib: usize,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -49,13 +55,22 @@ enum Cmd {
         /// Also encrypt to this recipient (`x25519:<base58>`); repeatable.
         #[arg(long = "share")]
         share: Vec<String>,
+        /// Storage class (`hot`, `bulk`, ...); default: the gateway's default.
+        #[arg(long)]
+        class: Option<String>,
     },
     /// Give a recipient (`x25519:<base58>`) the key to an existing object.
     Share { uri: String, recipient: String },
     /// Print this account's public key for receiving shared objects.
     Whoami,
     /// Download to a file (default stdout).
-    Get { uri: String, dst: Option<PathBuf> },
+    Get {
+        uri: String,
+        dst: Option<PathBuf>,
+        /// Only bytes START-END (inclusive, like HTTP Range), e.g. `0-1023` or `1048576-`.
+        #[arg(long)]
+        range: Option<String>,
+    },
     /// List objects under a prefix.
     Ls { uri: String },
     /// Delete an object.
@@ -118,7 +133,13 @@ fn client(cli: &Cli) -> Result<Client> {
         bail!("credentials are for {cred_account}, not {account}");
     }
     let root = load_root(&root_key_path(cli, &account)?)?;
-    Ok(Client::new(&cli.gateway, account, sk, root))
+    if !(1..=64).contains(&cli.chunk_mib) {
+        bail!("--chunk-mib must be in 1..=64");
+    }
+    let mut c = Client::new(&cli.gateway, account, sk, root);
+    c.parallelism = cli.parallel.max(1);
+    c.chunk_size = cli.chunk_mib * 1024 * 1024;
+    Ok(c)
 }
 
 #[tokio::main]
@@ -142,24 +163,28 @@ async fn main() -> Result<()> {
             write_private(out, &serde_json::to_string_pretty(&json)?)?;
             println!("{}", keys::format_public_key(&sk.verifying_key()));
         }
-        Cmd::Put { src, uri, public, content_type, share } => {
+        Cmd::Put { src, uri, public, content_type, share, class } => {
             let c = client(&cli)?;
             let uri = NearUri::parse(uri)?;
-            let mut data = vec![];
-            if src == "-" {
-                std::io::stdin().read_to_end(&mut data)?;
-            } else {
-                data = std::fs::read(src).with_context(|| format!("reading {src}"))?;
-            }
-            let rec = c.put(&uri, &data, &PutOptions { public: *public, content_type: content_type.clone(), share_with: share.clone() }).await?;
+            let opts = PutOptions { public: *public, content_type: content_type.clone(), share_with: share.clone(), class: class.clone() };
+            // streaming: bounded memory, parallel chunk uploads
+            let rec = if src == "-" { c.put_reader(tokio::io::stdin(), &uri, &opts).await? } else { c.put_file(src, &uri, &opts).await? };
             eprintln!("{uri} seq={} size={} stored={}", rec.seq, rec.size, rec.stored_size);
         }
-        Cmd::Get { uri, dst } => {
+        Cmd::Get { uri, dst, range } => {
             let c = client(&cli)?;
-            let (_, data) = c.get(&NearUri::parse(uri)?).await?;
-            match dst {
-                Some(p) => std::fs::write(p, &data)?,
-                None => std::io::stdout().write_all(&data)?,
+            let uri = NearUri::parse(uri)?;
+            if let Some(r) = range {
+                let data = c.get_range(&uri, parse_range(r)?).await?;
+                match dst {
+                    Some(p) => std::fs::write(p, &data)?,
+                    None => std::io::stdout().write_all(&data)?,
+                }
+            } else {
+                match dst {
+                    Some(p) => c.get_to_file(&uri, p).await.map(|_| ())?,
+                    None => c.get_to_writer(&uri, tokio::io::stdout()).await.map(|_| ())?,
+                }
             }
         }
         Cmd::Ls { uri } => {
@@ -182,6 +207,17 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `A-B` (inclusive) or `A-` -> half-open range.
+fn parse_range(s: &str) -> Result<std::ops::Range<u64>> {
+    let (a, b) = s.split_once('-').context("range must look like START-END or START-")?;
+    let start: u64 = a.trim().parse().context("bad range start")?;
+    let end = if b.trim().is_empty() { u64::MAX } else { b.trim().parse::<u64>().context("bad range end")?.saturating_add(1) };
+    if end <= start {
+        bail!("empty range");
+    }
+    Ok(start..end)
 }
 
 fn ed25519_dalek_key() -> ed25519_dalek::SigningKey {

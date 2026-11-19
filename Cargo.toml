@@ -29,6 +29,10 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
+async-trait = "0.1"
+bytes = "1"
+futures-util = "0.3"
+object_store = { version = "0.13", default-features = false, features = ["aws"] }
 nstorage-core = { path = "crates/nstorage-core" }
 nstorage-client = { path = "crates/nstorage-client" }
 nstorage-gateway = { path = "crates/nstorage-gateway" }
