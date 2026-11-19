@@ -94,7 +94,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
                     return
                 }
             }
-            let final = try await result ?? api.item(currentID)
+            let final: DriveItem
+            if let result { final = result } else { final = try await api.item(currentID) }
             completionHandler(FileProviderItem(final), [], false, nil)
         }, onError: { completionHandler(nil, [], false, $0) })
     }
