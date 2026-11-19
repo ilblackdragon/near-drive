@@ -1,0 +1,136 @@
+{
+  "comment": "Produced by sdk/python/scripts/emit_objects.py; roots from vectors.json",
+  "objects": [
+    {
+      "name": "single_chunk_owner",
+      "plaintext_hex": "68656c6c6f2066726f6d20707974686f6e",
+      "chunk_size": 4194304,
+      "chunks_hex": [
+        "507e0261bbf10d560357770ba99212c621786611ebe280fa73d564da749538e866"
+      ],
+      "manifest_json": "{\"version\":1,\"size\":17,\"chunk_size\":4194304,\"chunks\":[{\"cid\":\"b3:8bec03689669f091024ff854506f3ce67753b90f5b08b5968923272b8b8c64a8\",\"len\":33}],\"enc\":{\"alg\":\"xchacha20poly1305-chunked-v1\",\"object_id\":\"3779fc49582cf0d59b3bc925a25ccd6d\",\"nonce_prefix\":\"1521c5af41a4d616113090b1285a1ec5\",\"wrapped_keys\":[{\"recipient\":\"kek:cd17cb52ad5eb92c\",\"nonce\":\"9ovhuRwY3Kh6u6YuT2P94AUVZ7cSOeQx\",\"ct\":\"HvTXWu+iLXN4goX48DhJADwCWTmiPzO8HWnn7iu96QxaztrUnkjPCkAY4Rnx3zN4\"}]},\"content_type\":\"text/plain; q=\\\"ü🙂\\\" \\\\ \\n\\t\\u0001\"}",
+      "manifest_cid": "b3:85f2d6bf5cacaabab8beaadf2c8861e61698c4220283691df25ef2baba26445c",
+      "readable_by": [
+        "owner"
+      ],
+      "not_readable_by": [
+        "friend",
+        "stranger"
+      ]
+    },
+    {
+      "name": "multi_chunk_owner",
+      "plaintext_hex": "05121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b3845525f6c798693a0adbac7d4e1eefb0815222f3c495663707d8a97a4b1becbd8e5f2ff0c192633404d5a6774818e9ba8b5c2cfdce9f603101d2a3744515e6b7885929facb9c6d3e0edfa0714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9aa7b4c1cedbe8f5020f1c293643505d6a7784919eabb8c5d2dfecf90613202d3a4754616e7b8895a2afbcc9d6e3f0fd0a1724313e4b5865727f8c99a6b3c0cddae7f4010e1b2835424f5c697683909daab7c4d1deebf805121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b3845525f6c798693a0adbac7d4e1eefb0815222f3c495663707d8a97a4b1becbd8e5f2ff0c192633404d5a6774818e9ba8b5c2cfdce9f603101d2a3744515e6b7885929facb9c6d3e0edfa0714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9aa7b4c1cedbe8f5020f1c293643505d6a7784919eabb8c5d2dfecf90613202d3a4754616e7b8895a2afbcc9d6e3f0fd0a1724313e4b5865727f8c99a6b3c0cddae7f4010e1b2835424f5c697683909daab7c4d1deebf805121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b3845525f6c798693a0adbac7d4e1eefb0815222f3c495663707d8a97a4b1becbd8e5f2ff0c192633404d5a6774818e9ba8b5c2cfdce9f603101d2a3744515e6b7885929facb9c6d3e0edfa0714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9aa7b4c1cedbe8f5020f1c293643505d6a7784919eabb8c5d2dfecf90613202d3a4754616e7b8895a2afbcc9d6e3f0fd0a1724313e4b5865727f8c99a6b3c0cddae7f4010e1b2835424f5c697683909daab7c4d1deebf805121f2c394653606d7a8794a1aebbc8d5e2effc091623303d4a5764717e8b98a5b2bfccd9e6f3000d1a2734414e5b6875828f9ca9b6c3d0ddeaf704111e2b3845525f6c798693a0adbac7d4e1eefb0815222f3c495663707d8a97a4b1becbd8e5f2ff0c192633404d5a6774818e9ba8b5c2cfdce9f603101d2a3744515e6b7885929facb9c6d3e0edfa0714212e3b4855626f7c8996a3b0bdcad7e4f1fe0b1825323f4c596673808d9aa7b4c1cedbe8f5020f1c293643505d6a7784919eabb8c5d2dfecf90613202d3a4754616e7b8895a2afbcc9d6e3f0fd0a1724313e4b5865727f8c99a6b3c0",
+      "chunk_size": 256,
+      "chunks_hex": [
+        "68b8c336ee10c573cf322abb23e3fb805f1aa93660de00f176419c01d2b3353658454f9e0e8fce4ff26512d214967e9825bf6ddced0dc01834f53222b332046eeb90c41922f06007de63d2b6f3007f3809d88b0705c526b7fd09e9e6b1156a7fa9ab8e8b80754142b5b277d9d964192dff2eabcc1b07f8aea0cc389a4188cd9f57b332b4e3c7afa489cd98db2266fcb5d1b8a44b2658ca58006aa9e79a9c9ce1e63472e53b98d6e88200e5baf866ee4bd14ef6209a583a2b9ba56eed258744c8005d4daad65841c8c21b6a568a03d1c5d151cb773ef64d8f21951775010210c3617982f4cddf2901392d0ab21892f5e32b5a095043f68f49c5c2a6aa54c14b9bd5b66079db4afa80c46f46941abb4f29",
+        "f945bc13329e7177cc6082392eb80e3e9900306006eb8f710ecd9979bf154e80485577e84eac2c1b90341bffbc9ea6b3501f170ad7ce8f2b0db9c8beae3fa5feb1939055e122cd0e2c33d144ebd9ddc6f9e45c90b94ec4e29f53757aade60f635161dce146218bcf16ffa76f129af881621252dcabbf9be137efb1d896f4a19cab6a489b08c52af4834a54370ef84f45da8fb2e0bf5fa1a62524a29d9f784097f95876c5d0b8b0f9dc9f088b0626e05146038c5dfb90bdddcd705ae90417c07831e87d18f604a398ee4bfd42aa90cc846108d605be5fa5ea1f74823e06b814ad51569bbbfccb22443b7144195877bf346333b75090870bf2c37b71a42059e1830773692e84ef320afdd7aed6e0f545a9",
+        "1ca54094affdf4653cd63fd73ba0c78c191174d58c6167a9c1a5d1d6575019f1f5dab0fa2fd3e4b4847e75d16ed25e01bca2bfdcbf2d2db61bbb0316bce34d8491d9dc85d1d8f4b08bb037a412af616bf381fd09a715cf232aeae856afff6c9b67de0a88660d196bd1a9afdf4be42e2ec2593b15f5d4005d9da5a6a3fdef9aaca64111a5f0016fb516cbcc40b30298cb489c7f9dc52b3dce2938d7ec7ed5cb8c3c9df0f18f46a4c89459b251cbaf0f3b53938c9ce963bd27917d938724bf156b54d90657102246378285718ea8bffdd753d72b79f655594016a666f7b75ebc6ecaaed9d5f8457f21ecaaaea8e6d556467f2d9cc1b935c0491c56b9345aa4c20899b83edfd1d4a5f29821f3e8d118f2be",
+        "b2d35371f7a3e18c1be71b0036be5a745035fa1af7d392b999fae5ca2f781fef6e457bb6fefd321bcb4fc3ef03770890545fe00c669e556117e6646fa5ec75c5629b2cd947fb2447a832ca2b66c232dfa3a0fe2e1da6816007696a49a3b75b186d980a4e6de44b38da29273d7b74c3fd798749360a110b4caea60ac123d1764577a4d716c0ef3e2db4e809d10b33db715c0f758d81bcef1b871a251ef3c7491d169c04b10dc2e85e7a46365d5827003f768f66604d744b7f68dce055ce3d65f861cc8817926ce75fe77f138a0f6568cc05b6cd824dc762716cb995f9f2ec3bfd8c902fe5d2a6b5078cab74f94eb2d3dbf2929a85cf2708cf"
+      ],
+      "manifest_json": "{\"version\":1,\"size\":1000,\"chunk_size\":256,\"chunks\":[{\"cid\":\"b3:467a3f3c0748260ec20fc300ec85c30ae47fc60a6f1afaf41b5eecd4511425a0\",\"len\":272},{\"cid\":\"b3:669eaeefe9f1302754b7743a4644e9840977bb52bbb0124d7e418bddd4016348\",\"len\":272},{\"cid\":\"b3:dbfa0261080e7859ab03016b3705a8def478e17812b37a33f99b32ffc0a8f751\",\"len\":272},{\"cid\":\"b3:50ccbf20e87068cf5c62fbe9d08cd66f36c4be4e23d9beadeab0f2bf366ba4f6\",\"len\":248}],\"enc\":{\"alg\":\"xchacha20poly1305-chunked-v1\",\"object_id\":\"f721e01b62a92a09d3ae2810dc895c2f\",\"nonce_prefix\":\"9a99319d547fdad9803530e4b6ae65e7\",\"wrapped_keys\":[{\"recipient\":\"kek:cd17cb52ad5eb92c\",\"nonce\":\"UhJL//f6y3yBL/ePu4zBAEkn0YY7e+/v\",\"ct\":\"/xtRglgk6jxkLupd4Bfpcd2SxcXJbX9OJYYVYE7J3KxRAoM+CYGKuzDSQPhDM1pk\"}]}}",
+      "manifest_cid": "b3:b07173e22df0ac2658ccfcb5dcf124f772999be7d628a834219e928c18910d34",
+      "readable_by": [
+        "owner"
+      ],
+      "not_readable_by": [
+        "friend",
+        "stranger"
+      ]
+    },
+    {
+      "name": "empty_owner",
+      "plaintext_hex": "",
+      "chunk_size": 1024,
+      "chunks_hex": [
+        "9634a319066ba55cf9900f56e4790f14"
+      ],
+      "manifest_json": "{\"version\":1,\"size\":0,\"chunk_size\":1024,\"chunks\":[{\"cid\":\"b3:bcc666f1c1d163ac7a9f2af619eeb7872b8d9d4e5dea296ccb3d79a18b97a1dc\",\"len\":16}],\"enc\":{\"alg\":\"xchacha20poly1305-chunked-v1\",\"object_id\":\"c44a81ffb385d7114128a82bbdad659e\",\"nonce_prefix\":\"f34cdd9287a0bdbb289c75734bc48da4\",\"wrapped_keys\":[{\"recipient\":\"kek:cd17cb52ad5eb92c\",\"nonce\":\"cg8X2xwcSf+m1aHgAvBvTGpoRZqJoReT\",\"ct\":\"d6baCUqAk4QdkHCjdwz44TH3fW3vRZCPsN3D+csKv8rmTp7nJHLsF1afO0emQLnH\"}]}}",
+      "manifest_cid": "b3:9f7e921e6ed8857f0817fde65dc47a0f9da7b15c9df8642bcaad487b103d1659",
+      "readable_by": [
+        "owner"
+      ],
+      "not_readable_by": [
+        "friend",
+        "stranger"
+      ]
+    },
+    {
+      "name": "owner_and_x25519",
+      "plaintext_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b",
+      "chunk_size": 100,
+      "chunks_hex": [
+        "bfd038ddb4d01c077643e08030f825b70ca40f087ac24d16d8539ab0ed3c9fa805a500447086b1c340c54be6d8dca8a25622d21e0b4300f8dac85bb90dfd7fba0961ec64d1798d419285208b814457d4f52868d25886597af28eb822d22e42b295cd7c4c6aac6f4eb74448081a1ef94f5a956738",
+        "133fc76bc63932f8c1d5e79db03221d3aba81de8ca5a73c8607091aafb14161b87377abc656a13eee4f44bc10758d1dae531c504e4ab222defe8de5624fad851e4130d581ef43f56ca24472901fafed473c5d2b62e9bc67cd58532adaac3def30e68fd198e1640a6000d580ea560a7f8da6333b5",
+        "4f9856b9fb73a15d25ec4b38e3f84eb24e19e01ac599bf5fd8437c87f4d7f3dc8c2e29b85dd0486c503f5227d0428be84308ff9245091dced63676b83ceb9ea917b76cc4e88e3b525844196cca231344a07095c3e088ac96f7847dce229e5d216d7d6bc7e6c63b9a6445608187d932a47b0a9137"
+      ],
+      "manifest_json": "{\"version\":1,\"size\":300,\"chunk_size\":100,\"chunks\":[{\"cid\":\"b3:48071fdf3e2af06eed93eaaa9c52b223f113e1e260f858cb5c650eb10df0869a\",\"len\":116},{\"cid\":\"b3:361f2a40db2eaf7e0d310d48548971e53c7471ceefe98e5e34c94209988eb2be\",\"len\":116},{\"cid\":\"b3:d8b51d3b25dd81a9aaa3734fe54bdefc7d0af6d6c5543cc56a91414a476dac15\",\"len\":116}],\"enc\":{\"alg\":\"xchacha20poly1305-chunked-v1\",\"object_id\":\"4b4b2fb68d4519caa76911427ed76f0c\",\"nonce_prefix\":\"5bd21955369c3bb8e020083de4f904c5\",\"wrapped_keys\":[{\"recipient\":\"kek:cd17cb52ad5eb92c\",\"nonce\":\"PcNIziBpDqPVauYrWA5T4WZIv6ECmWTI\",\"ct\":\"hbXHNThQ4u4cOVmuaMen+8q09KEV1dZiEx7l/zLTODmP6GAPoaCyjFPYRSdUo6/q\"},{\"recipient\":\"x25519:HztmdMrCxowGBpGboRAppcdePuu8hVHzcwPhuiUNwA9h\",\"epk\":\"95MSWn4EmwUqrmXHb2ZqjQpWS6vvi23ctYjHwRP2sQmt\",\"nonce\":\"+sFR6BV2imy/2aYfkUyBHnWhsRzyo5Bm\",\"ct\":\"/qeNWieLlJC/glYqkfEd4x/ArsKnDs4wWcX4rjUzoIstrRC1+aJgqNdkSsFT50Lc\"}]},\"content_type\":\"application/octet-stream\"}",
+      "manifest_cid": "b3:434356578cc14d586e51d38596813adf0d1e36fca2e4473ab456b484dc0d3bf3",
+      "readable_by": [
+        "owner",
+        "friend"
+      ],
+      "not_readable_by": [
+        "stranger"
+      ]
+    },
+    {
+      "name": "x25519_only",
+      "plaintext_hex": "6170702077726f7465207468697320666f7220667269656e64",
+      "chunk_size": 7,
+      "chunks_hex": [
+        "c0c6da860a3f4c6eb5f8e5f1b95becc4c083daa2e45919",
+        "b4dbc7c934cc24cd8af13b4eb9f3f33d79ff9f69807e0c",
+        "6145aea6aae0afea3a5aa7188135c226ee6269d1d92400",
+        "a1cf7205b63b45df72c85a31be6f35810cb855cf"
+      ],
+      "manifest_json": "{\"version\":1,\"size\":25,\"chunk_size\":7,\"chunks\":[{\"cid\":\"b3:4b90c86cd26d52fd4c54907ac94531be9685ec6e490c1e8c54945f9cb3e2e4e9\",\"len\":23},{\"cid\":\"b3:5fdc9983c4307ba2b0989681ae120324601a1800792da12e586a68e57604b575\",\"len\":23},{\"cid\":\"b3:82bab104cf7e13b7e5fdf190162c1612f409945b407dda6a8032acd1fb1cdbd8\",\"len\":23},{\"cid\":\"b3:e1e5e1e193fab1925e00eadadf09a77f14c3363f32cc6d8b0373cc78806f61de\",\"len\":20}],\"enc\":{\"alg\":\"xchacha20poly1305-chunked-v1\",\"object_id\":\"3e2e99c2a28f11b00158409259d89925\",\"nonce_prefix\":\"19b6df317544888075aeb7e3c648d0b6\",\"wrapped_keys\":[{\"recipient\":\"x25519:HztmdMrCxowGBpGboRAppcdePuu8hVHzcwPhuiUNwA9h\",\"epk\":\"Gh6AHrNbevq2g13BAWoWfK98jWcwMhUppGgnrath157D\",\"nonce\":\"joN80LYKs4I6SmiR5jcfDyfZwi/lLjCZ\",\"ct\":\"/V9/QsNUPVaOjC/wh71Cam/cBqHB9gv3fyjJBNBJ2soRlOWW1CVsDoCR9rZGfKl1\"}]}}",
+      "manifest_cid": "b3:b0fd47b590e12f8b16d778e25b75c95ec21e1eb0907834e7b6b092d39d9642af",
+      "readable_by": [
+        "friend"
+      ],
+      "not_readable_by": [
+        "owner",
+        "stranger"
+      ]
+    },
+    {
+      "name": "shared_after",
+      "plaintext_hex": "0104070a0d101316191c1f2225282b2e3134373a3d404346494c4f5255585b5e6164676a6d707376797c7f8285888b8e9194",
+      "chunk_size": 16,
+      "chunks_hex": [
+        "6513e3b92808c5ab31fa57066e15459e9b79b9b22d5c6108391b2f63ec1511d1",
+        "462f9afbb8e832ae56baa1905d8f0de2e24b60546730c8a1b85112f09b6f46fa",
+        "fb04eae17acdc1998f49d837cba58311dcff461115fb1910ca88bd2016f9bcab",
+        "be5447801b6b113f27e8e1438fc628c9b65d"
+      ],
+      "manifest_json": "{\"version\":1,\"size\":50,\"chunk_size\":16,\"chunks\":[{\"cid\":\"b3:f04591836ae467f4ce22b7f498267056aecb4464051eab54fd43ca96df11d05f\",\"len\":32},{\"cid\":\"b3:fec982095db56080c34f082c17ab9af2c2a9e2f1b06e5bc0af48e49254c24e94\",\"len\":32},{\"cid\":\"b3:65576a70d824d1bed7abcfe714c8144fa3212a4a0e21fcc7e8a113b12818b03e\",\"len\":32},{\"cid\":\"b3:7efc200f5c7ab52d43740a8a72d3d9e0e0ffc0f599b4fcb1e37c5f454446f7a8\",\"len\":18}],\"enc\":{\"alg\":\"xchacha20poly1305-chunked-v1\",\"object_id\":\"6d3eaabddd4956a2eccf4f137f15774a\",\"nonce_prefix\":\"1790b2a722f64eac8909b83ccc68260f\",\"wrapped_keys\":[{\"recipient\":\"kek:cd17cb52ad5eb92c\",\"nonce\":\"VL2iGm70JTtNezIDf89o+llqzUSs4PfJ\",\"ct\":\"UmgrYKPnl/dg1cYi715wPiFXrlVMlnOzZTR/fl0cvQ0oIvlivGLpgbYVfSA7N0rk\"},{\"recipient\":\"x25519:T8oh8pHvjJbiaSGY6QWotcSGdf86iFpRwjbA5nFST6m\",\"epk\":\"DNQRpmudqW4hGYGJ8FVyYAvDxPco5TTDFq5nWPxboA1i\",\"nonce\":\"yJq2tODEiJE6KRXKmCqQvYZR6G7YfAWp\",\"ct\":\"uLq/Clm+HlEJ5yqlQ1xbmE60U1CTeMYMIx2AV69fQ27WKNRuN1NYV1bfxQ3uuXiv\"}]}}",
+      "manifest_cid": "b3:270b68e81767bb57eb148df65b5d06f72253f01d054485a37eb81a6de41c5f25",
+      "readable_by": [
+        "owner",
+        "stranger"
+      ],
+      "not_readable_by": [
+        "friend"
+      ]
+    },
+    {
+      "name": "public",
+      "plaintext_hex": "4142434445464748494a4b4c4d4e4f5051525354",
+      "chunk_size": 8,
+      "chunks_hex": [
+        "4142434445464748",
+        "494a4b4c4d4e4f50",
+        "51525354"
+      ],
+      "manifest_json": "{\"version\":1,\"size\":20,\"chunk_size\":8,\"chunks\":[{\"cid\":\"b3:59a216db95aff0f8833f96f341fcb1f6594378096127c2b0fa9f3a849361d979\",\"len\":8},{\"cid\":\"b3:0405b20392b3c40add06e9bd489ea48bcc819b8f890e75d16a3c641f7519ff88\",\"len\":8},{\"cid\":\"b3:3fe27fdfa8f289ef4a05491b3b3ff6f6af1d462c4147655e40e766c649b3d352\",\"len\":4}]}",
+      "manifest_cid": "b3:3e054aa968cf79400cacc01869dfa3ebc1d8f9989f5200470d35cb9a47a45fc3",
+      "readable_by": [
+        "owner",
+        "friend",
+        "stranger"
+      ],
+      "not_readable_by": []
+    }
+  ]
+}
