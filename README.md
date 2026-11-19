@@ -10,7 +10,8 @@ See [DESIGN.md](DESIGN.md) for the architecture and roadmap.
 | `nstorage-core` | URIs, chunked XChaCha20-Poly1305 envelope encryption, manifests, signed pointer records, request signing, namespace policy |
 | `nstorage-client` | Rust SDK: chunk + encrypt + sign, verifies everything it reads; streaming `put_file`/`get_to_file`/`get_range` for large objects |
 | `nstorage-gateway` | stateless HTTP gateway; NEAR access-key auth (RPC `view_access_key` or dev keys); blob backends fs / S3 / R2 / MinIO / HTTP blob bridge with storage classes and replication; fs or S3 (multi-gateway CAS) index; chunk cache; `?mode=locate` direct URLs; JSONL usage metering |
-| `nst` | CLI: `keygen`, `dev-key`, `put`, `get` (streaming, `--range`, `--class`), `ls`, `rm` |
+| `nstorage-s3` | S3-compatible local sidecar: SigV4/SigV2 verification, aws-chunked + checksum trailers, S3 ops → native API |
+| `nst` | CLI: `keygen`, `dev-key`, `put`, `get` (streaming, `--range`, `--class`), `ls`, `rm`, `s3-proxy` |
 
 ## Quickstart (dev)
 
@@ -115,13 +116,46 @@ nst get near://alice.near/models/m.safetensors ./m.safetensors
 nst get --range 0-1048575 near://alice.near/models/m.safetensors > header.bin
 ```
 
+## S3 sidecar (`nst s3-proxy`)
+
+Existing S3 code (boto3, aws-cli, aws-sdk-*) can talk to nstorage by changing only `endpoint_url` and the keys:
+
+```sh
+nst s3-proxy                       # 127.0.0.1:9000; loopback only
+#  first start prints the generated keys (stored 0600 in ~/.nstorage/s3-proxy.json)
+#  or: --access-key/--secret-key (env NSTORAGE_S3_ACCESS_KEY / NSTORAGE_S3_SECRET_KEY)
+#  --public-prefix weights/public/   store keys under that prefix unencrypted
+#  --bucket other.near               also list this namespace in ListBuckets
+```
+
+```python
+s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:9000",
+                  aws_access_key_id=AK, aws_secret_access_key=SK, region_name="us-east-1")
+s3.upload_file("ckpt.bin", "alice.near", "ckpts/step-100.bin")
+```
+
+The proxy encrypts client-side with the account's root key and signs requests with its NEAR key.
+- **Addressing.** Bucket = NEAR namespace and key = object path. Path-style URLs (`http://127.0.0.1:9000/alice.near/key`) work, and so does virtual-host style when the host is `alice.near.localhost`.
+- **Auth.** Accepted: SigV4 header and presigned auth, including signed `aws-chunked` with every chunk signature verified, `UNSIGNED-PAYLOAD` and `STREAMING-UNSIGNED-PAYLOAD-TRAILER`. `x-amz-checksum-{crc32,crc32c,crc64nvme,sha1,sha256}` and `Content-MD5` are checked. SigV2 is also accepted, because botocore < 1.36 presigns with it. Requests fail on a bad signature, a wrong key or more than 15 minutes of clock skew.
+- **Operations.**
+  - Buckets: ListBuckets, Head/Create/DeleteBucket (own namespace only, as no-ops) and GetBucketLocation.
+  - Objects: Put/Get/Head/Delete Object, with Range and the If-* conditions, plus DeleteObjects and CopyObject.
+  - Listing: ListObjects v1/v2 with prefix, delimiter, pagination and `encoding-type=url`.
+  - Multipart: Create/UploadPart/UploadPartCopy/Complete/Abort/ListParts/ListMultipartUploads. Parts are staged in `~/.nstorage/s3-staging` and uploaded with `put_file` on completion.
+  - Not supported (`NotImplemented`): ACLs, policies, tagging, versioning, lifecycle, CORS, SSE-C headers and SigV4a.
+- **Metadata.** Content-Type is kept in the manifest. `x-amz-meta-*` goes into an encrypted sidecar object `<key>.nst-s3meta`, which listings hide; keys ending in that suffix are reserved. ETag is the first 32 hex characters of the manifest cid, quoted (multipart objects have no `-N` suffix). Last-Modified comes from the record timestamp.
+- **Keys.** They must be valid nstorage paths: no empty, `.` or `..` segments and no trailing `/`. Other keys get `InvalidArgument`.
+
+`tests/boto3_smoke.sh` starts a dev gateway and the proxy and runs `tests/boto3_smoke.py`. Set `PYTHON=` to choose the boto3 install and `AWS_CLI=` to also test `aws s3 cp`.
+
 ## Tests
 
 `cargo test` runs the following:
 - unit tests;
 - a gateway+client e2e covering encryption at rest, overwrite/CAS, listing, namespace isolation, app-pays prefixes, and forged or stale record rejection;
 - `tests/streaming.rs`: streaming vs one-shot interop, ranges, storage classes, a blob bridge with direct URLs and fallback;
-- `tests/large.rs`: a large object with bounded memory.
+- `tests/large.rs`: a large object with bounded memory;
+- `crates/nstorage-s3/tests/s3_e2e.rs`: gateway + S3 proxy driven by the AWS Rust SDK (and raw signed requests for chunk signatures, trailers, skew and presigned URLs).
 
 To run the S3 tests against a local MinIO (bind it to localhost only):
 

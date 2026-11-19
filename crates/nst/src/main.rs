@@ -89,18 +89,44 @@ enum Cmd {
     Ls { uri: String },
     /// Delete an object.
     Rm { uri: String },
+    /// Run a local S3-compatible endpoint (loopback only) backed by nstorage.
+    /// boto3 / aws-cli: set endpoint_url=http://127.0.0.1:9000 and the printed keys.
+    S3Proxy {
+        #[arg(long, default_value = "127.0.0.1:9000")]
+        listen: std::net::SocketAddr,
+        /// S3 access key (default: generated once and stored in <home>/s3-proxy.json).
+        #[arg(long, env = "NSTORAGE_S3_ACCESS_KEY", requires = "secret_key")]
+        access_key: Option<String>,
+        #[arg(long, env = "NSTORAGE_S3_SECRET_KEY", requires = "access_key", hide_env_values = true)]
+        secret_key: Option<String>,
+        /// Extra namespace to show in ListBuckets; repeatable.
+        #[arg(long = "bucket")]
+        buckets: Vec<String>,
+        /// Store keys under this prefix unencrypted (public data); repeatable.
+        #[arg(long = "public-prefix")]
+        public_prefixes: Vec<String>,
+        /// Largest single request body (PUT / part) accepted, in MiB.
+        #[arg(long, default_value_t = 5120)]
+        max_body_mib: usize,
+        /// Region reported by GetBucketLocation.
+        #[arg(long, default_value = "us-east-1")]
+        region: String,
+    },
 }
 
 fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).context("HOME not set")
 }
 
+fn nstorage_home(cli: &Cli) -> Result<PathBuf> {
+    match &cli.home {
+        Some(h) => Ok(h.clone()),
+        None => Ok(home_dir()?.join(".nstorage")),
+    }
+}
+
 fn root_key_path(cli: &Cli, account: &str) -> Result<PathBuf> {
-    let base = match &cli.home {
-        Some(h) => h.clone(),
-        None => home_dir()?.join(".nstorage"),
-    };
-    Ok(base.join("keys").join(format!("{account}.root")))
+    Ok(nstorage_home(cli)?.join("keys").join(format!("{account}.root")))
 }
 
 fn load_root(path: &PathBuf) -> Result<Option<RootKey>> {
@@ -238,6 +264,43 @@ async fn main() -> Result<()> {
         }
         Cmd::Rm { uri } => {
             client(&cli)?.delete(&NearUri::parse(uri)?).await?;
+        }
+        Cmd::S3Proxy { listen, access_key, secret_key, buckets, public_prefixes, max_body_mib, region } => {
+            use nstorage_s3::{backend::ClientBackend, credentials, sigv4::Credentials, Proxy, ProxyConfig};
+            nstorage_s3::check_loopback(listen)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn,nstorage_s3=info".into()))
+                .with_writer(std::io::stderr)
+                .init();
+            let c = client(&cli)?;
+            let home = nstorage_home(&cli)?;
+            let creds = match (access_key, secret_key) {
+                (Some(a), Some(s)) => Credentials { access_key: a.clone(), secret_key: s.clone() },
+                _ => {
+                    let path = home.join("s3-proxy.json");
+                    let (creds, created) = credentials::load_or_create(&path)?;
+                    if created {
+                        eprintln!("generated S3 credentials (saved to {}):", path.display());
+                        eprintln!("  aws_access_key_id     = {}", creds.access_key);
+                        eprintln!("  aws_secret_access_key = {}", creds.secret_key);
+                    } else {
+                        eprintln!("using S3 credentials from {} (access key {})", path.display(), creds.access_key);
+                    }
+                    creds
+                }
+            };
+            if c.x25519_public().is_none() && public_prefixes.is_empty() {
+                eprintln!("warning: no root key loaded (run `nst keygen`); private writes will fail");
+            }
+            let account = c.account().to_string();
+            let mut cfg = ProxyConfig::new(creds, home.join("s3-staging"));
+            cfg.extra_buckets = buckets.clone();
+            cfg.public_prefixes = public_prefixes.clone();
+            cfg.max_body_bytes = max_body_mib * 1024 * 1024;
+            cfg.region = region.clone();
+            let proxy = Proxy::new(cfg, ClientBackend::new(c));
+            eprintln!("nstorage S3 proxy for {account} on http://{listen} (bucket = namespace, e.g. http://{listen}/{account}/key)");
+            nstorage_s3::run(*listen, proxy).await?;
         }
     }
     Ok(())
