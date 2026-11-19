@@ -1,0 +1,30 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build CLI
+        run: cargo build -p near-drive-cli
+      - name: test (all crates)
+        if: runner.os == 'Linux'
+        run: cargo test --workspace
+      - name: test (client, sync, gateway; macOS / Windows)
+        if: runner.os != 'Linux'
+        # The folder-sync, resilience and e2e suites run a real gateway in-process.
+        run: >
+          cargo test -p near-drive-core -p near-drive-client -p near-drive-sync -p near-drive-cli
+          && cargo test -p near-drive-gateway --lib --test e2e --test streaming --test resilience

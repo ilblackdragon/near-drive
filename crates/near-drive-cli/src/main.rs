@@ -9,6 +9,7 @@
 mod daemon;
 mod interactive;
 mod nearcli;
+mod syncs;
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -187,18 +188,53 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Start the local S3-compatible endpoint in the background (loopback only).
-    /// boto3 / aws-cli: endpoint_url=http://127.0.0.1:9000 and the printed keys.
+    /// Start the background service: the local S3-compatible endpoint
+    /// (loopback only; boto3 / aws-cli: endpoint_url=http://127.0.0.1:9000 and
+    /// the printed keys) and every synced folder (`near drive sync add`).
     Up {
         #[command(flatten)]
         proxy: ProxyArgs,
+        /// Only sync folders; no S3 endpoint.
+        #[arg(long)]
+        no_s3: bool,
     },
-    /// Stop the background S3 endpoint started by `up`.
+    /// Stop the background service started by `up`.
     Down,
-    /// Run the local S3-compatible endpoint in the foreground (what `up` runs).
+    /// Keep local folders in sync with NEAR Drive (like Dropbox).
+    Sync {
+        #[command(subcommand)]
+        action: Option<SyncCmd>,
+    },
+    /// Run the local S3-compatible endpoint in the foreground (for containers / systemd).
     S3Proxy {
         #[command(flatten)]
         proxy: ProxyArgs,
+    },
+    /// What `up` runs in the background (S3 endpoint + synced folders), in the foreground.
+    #[command(hide = true)]
+    Daemon {
+        #[command(flatten)]
+        proxy: ProxyArgs,
+        #[arg(long)]
+        no_s3: bool,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum SyncCmd {
+    /// Sync a local folder (created if missing) with a NEAR Drive folder
+    /// (default `Drive/` in your namespace). `near drive up` keeps it in sync.
+    Add { dir: Option<PathBuf>, remote: Option<String> },
+    /// Stop syncing a folder (its files stay).
+    Remove { dir: Option<PathBuf> },
+    /// Synced folders, last sync, conflicts and errors.
+    Status,
+    /// Sync a folder now, in the foreground (`--watch`: keep going).
+    Run {
+        dir: Option<PathBuf>,
+        remote: Option<String>,
+        #[arg(long)]
+        watch: bool,
     },
 }
 
@@ -216,7 +252,9 @@ fn menu() -> Vec<interactive::Choice<Cmd>> {
         choice(Cmd::Keygen { ckd: false, random: false, ckd_contract: None, ckd_domain: None }, "keygen      - Create your encryption key"),
         choice(Cmd::PublishKey, "publish-key - Let others share files with you"),
         choice(Cmd::Gateways, "gateways    - List registered gateways"),
-        choice(Cmd::Up { proxy: ProxyArgs::default() }, "up          - Start the local S3 endpoint (background)"),
+        choice(Cmd::Sync { action: Some(SyncCmd::Add { dir: None, remote: None }) }, "sync add    - Keep a local folder in sync (like Dropbox)"),
+        choice(Cmd::Sync { action: Some(SyncCmd::Status) }, "sync status - Synced folders and their state"),
+        choice(Cmd::Up { proxy: ProxyArgs::default(), no_s3: false }, "up          - Start syncing + the local S3 endpoint (background)"),
         choice(Cmd::Down, "down        - Stop the local S3 endpoint"),
         choice(Cmd::Logout, "logout      - Remove the NEAR Drive session key"),
     ]
@@ -258,14 +296,15 @@ fn load_root(path: &PathBuf) -> Result<Option<RootKey>> {
 }
 
 fn write_private(path: &PathBuf, contents: &str) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    // Unix: owner-only. Windows: files under the user profile are private to the user by default ACLs.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let mut f = o
         .open(path)
         .with_context(|| format!("creating {} (refusing to overwrite an existing key)", path.display()))?;
     f.write_all(contents.as_bytes())?;
@@ -603,7 +642,7 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             ctx.echo(&words);
             // Interrupted file uploads resume from a journal in <home>/uploads.
             let resume_dir = if src == "-" || no_resume { None } else { Some(ctx.drive_home()?.join("uploads")) };
-            let opts = PutOptions { public, content_type, share_with: share, class, resume_dir };
+            let opts = PutOptions { public, content_type, share_with: share, class, resume_dir, ..Default::default() };
             // streaming: bounded memory, parallel chunk uploads
             let rec = if src == "-" { c.put_reader(tokio::io::stdin(), &uri, &opts).await? } else { c.put_file(&src, &uri, &opts).await? };
             eprintln!("{uri} seq={} size={} stored={}", rec.seq, rec.size, rec.stored_size);
@@ -767,35 +806,90 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             println!("{}", keys::format_public_key(&sk.verifying_key()));
         }
         Cmd::S3Proxy { proxy } => {
-            let ProxyArgs { listen, buckets, public_prefixes, max_body_mib, region, .. } = proxy.clone();
-            use near_drive_s3::{backend::ClientBackend, Proxy, ProxyConfig};
-            near_drive_s3::check_loopback(&listen)?;
-            tracing_subscriber::fmt()
-                .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn,near_drive_s3=info".into()))
-                .with_writer(std::io::stderr)
-                .init();
-            let c = ctx.client().await?;
+            syncs::init_tracing();
             ctx.echo(&["s3-proxy".into()]);
-            let creds = s3_credentials(ctx, &proxy)?;
-            if c.x25519_public().is_none() && public_prefixes.is_empty() {
-                eprintln!("warning: no root key loaded (run `near drive keygen`); private writes will fail");
-            }
-            let account = c.account().to_string();
-            let mut cfg = ProxyConfig::new(creds, ctx.drive_home()?.join("s3-staging"));
-            cfg.extra_buckets = buckets;
-            cfg.public_prefixes = public_prefixes;
-            cfg.max_body_bytes = max_body_mib * 1024 * 1024;
-            cfg.region = region;
-            let proxy = Proxy::new(cfg, ClientBackend::new(c));
-            eprintln!("NEAR Drive S3 proxy for {account} on http://{listen} (bucket = namespace, e.g. http://{listen}/{account}/key)");
-            near_drive_s3::run(listen, proxy).await?;
+            run_s3(ctx, proxy).await?;
         }
-        Cmd::Up { proxy } => daemon::up(ctx, proxy).await?,
+        Cmd::Daemon { proxy, no_s3 } => {
+            syncs::init_tracing();
+            let c = std::sync::Arc::new(ctx.client().await?);
+            let (home, account, network) = (ctx.drive_home()?, c.account().to_string(), ctx.network.clone());
+            let sync = syncs::supervise(c, home, account, network);
+            if no_s3 {
+                sync.await?;
+            } else {
+                tokio::try_join!(run_s3(ctx, proxy), sync)?;
+            }
+        }
+        Cmd::Sync { action } => {
+            let action = match action {
+                Some(a) => a,
+                None => ctx.p.select(
+                    "Sync:",
+                    "SUBCOMMAND",
+                    vec![
+                        choice(SyncCmd::Add { dir: None, remote: None }, "add    - Sync a local folder"),
+                        choice(SyncCmd::Status, "status - Synced folders and their state"),
+                        choice(SyncCmd::Run { dir: None, remote: None, watch: false }, "run    - Sync a folder now"),
+                        choice(SyncCmd::Remove { dir: None }, "remove - Stop syncing a folder"),
+                    ],
+                )?,
+            };
+            match action {
+                SyncCmd::Add { dir, remote } => {
+                    let account = ctx.account()?;
+                    let default_dir = home_dir().map(|h| h.join("NearDrive").display().to_string()).unwrap_or_else(|_| "NearDrive".into());
+                    let asked = dir.is_none();
+                    let dir = PathBuf::from(ctx.p.text(dir.map(|d| d.display().to_string()), "Local folder:", "DIR", Some(&default_dir), Some("created if it doesn't exist"))?);
+                    let remote = match remote {
+                        Some(r) => Some(r),
+                        None if asked => Some(ctx.p.text(None, "NEAR Drive folder:", "REMOTE", Some(&format!("near://{account}/Drive/")), None)?),
+                        None => None,
+                    };
+                    let mut words = vec!["sync".to_string(), "add".into(), dir.display().to_string()];
+                    words.extend(remote.clone());
+                    ctx.echo(&words);
+                    syncs::add(ctx, dir, remote).await?;
+                }
+                SyncCmd::Remove { dir } => {
+                    let dir = PathBuf::from(ctx.p.text(dir.map(|d| d.display().to_string()), "Folder to stop syncing:", "DIR", None, None)?);
+                    syncs::remove(ctx, dir)?;
+                }
+                SyncCmd::Status => syncs::status(ctx)?,
+                SyncCmd::Run { dir, remote, watch } => {
+                    let dir = PathBuf::from(ctx.p.text(dir.map(|d| d.display().to_string()), "Local folder:", "DIR", None, None)?);
+                    syncs::run(ctx, dir, remote, watch).await?;
+                }
+            }
+        }
+        Cmd::Up { proxy, no_s3 } => daemon::up(ctx, proxy, no_s3).await?,
         Cmd::Down => {
             ctx.echo(&["down".into()]);
             daemon::down(&ctx.drive_home()?)?;
         }
     }
+    Ok(())
+}
+
+/// The S3 endpoint (foreground `s3-proxy`, or part of the background service).
+async fn run_s3(ctx: &mut Ctx, proxy: ProxyArgs) -> Result<()> {
+    let ProxyArgs { listen, buckets, public_prefixes, max_body_mib, region, .. } = proxy.clone();
+    use near_drive_s3::{backend::ClientBackend, Proxy, ProxyConfig};
+    near_drive_s3::check_loopback(&listen)?;
+    let c = ctx.client().await?;
+    let creds = s3_credentials(ctx, &proxy)?;
+    if c.x25519_public().is_none() && public_prefixes.is_empty() {
+        eprintln!("warning: no root key loaded (run `near drive keygen`); private writes will fail");
+    }
+    let account = c.account().to_string();
+    let mut cfg = ProxyConfig::new(creds, ctx.drive_home()?.join("s3-staging"));
+    cfg.extra_buckets = buckets;
+    cfg.public_prefixes = public_prefixes;
+    cfg.max_body_bytes = max_body_mib * 1024 * 1024;
+    cfg.region = region;
+    let proxy = Proxy::new(cfg, ClientBackend::new(c));
+    eprintln!("NEAR Drive S3 proxy for {account} on http://{listen} (bucket = namespace, e.g. http://{listen}/{account}/key)");
+    near_drive_s3::run(listen, proxy).await?;
     Ok(())
 }
 

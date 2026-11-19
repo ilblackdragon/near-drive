@@ -29,7 +29,8 @@ near drive login                                  # pick an account; adds a NEAR
 near drive keygen --ckd                           # encryption key derived from the account (MPC CKD)
 near drive put ./notes.txt docs/                  # -> near://<you>/docs/notes.txt (bare paths = your namespace)
 near drive get docs/notes.txt ./notes.txt          # other namespaces: near://bob.near/...
-near drive up                                     # local S3 endpoint in the background; prints AWS_* exports
+near drive sync add ~/NearDrive                   # Dropbox-style folder <-> near://<you>/Drive/
+near drive up                                     # background: synced folders + local S3 endpoint (AWS_* exports)
 near drive down
 near drive                                        # no arguments: menu
 ```
@@ -266,12 +267,50 @@ Add a `billing` section to the gateway config to bill each prefix's `payer` in N
 - **Settlement.** `billing::settle::Settlement` is the plug-in point for the NEAR escrow settler (`settle([{payer, amount, gateway, period_id}])`). It ships with `cloud_credits` (default) and `log` (dev: logs lines, gate off) backends.
 - **Limits.** One meter reads one gateway's log, so a payer's bytes must be written and deleted through the same gateway for storage to integrate correctly. A NEAR account is billed to its personal NEAR AI Cloud organization and must have signed in to NEAR AI Cloud once; until then, writes get 402 `unknown_account`.
 
+## Synced folders (`near drive sync`)
+
+A local folder kept in two-way sync with a NEAR Drive folder, like Dropbox, on Linux, macOS and Windows (no kernel
+drivers: it is a real folder, so it works offline and with every app).
+
+```sh
+near drive sync add ~/NearDrive               # <-> near://<you>/Drive/ (or: sync add ~/Work Work/)
+near drive up                                 # keep registered folders in sync in the background (+ S3; --no-s3)
+near drive sync status                        # last sync, conflicts, errors per folder
+near drive sync run ~/NearDrive [--watch]     # sync now in the foreground instead
+near drive sync remove ~/NearDrive            # stop (files stay)
+```
+
+- **Encrypted** like any other write: the gateway and backends only see ciphertext. Every device of the account
+  with the same root key (`keygen --ckd` derives it anywhere) sees the same files.
+- **Change detection:** local changes come from file-system events (inotify / FSEvents / ReadDirectoryChangesW),
+  debounced, plus a rescan each pass; remote changes are picked up by polling (30 s). A file is uploaded once it has
+  been unchanged for 2 s (not mid-save); a touch without a content change transfers nothing.
+- **Never overwrites what it hasn't seen:** uploads and deletes are conditional on the version this device last
+  synced (`PutOptions::expect_seq`, `Client::delete_if`). When both sides changed, the remote version keeps the name
+  and the local one becomes `name (conflicted copy from <device> <date>).ext`, which is uploaded too. Identical
+  content on both sides (a copied folder) is not a conflict.
+- **Deletes are recoverable locally:** a file deleted elsewhere is moved to `<folder>/.near-drive/trash/`. A file
+  deleted locally is deleted remotely (only if unchanged there); a file edited on one side and deleted on the other is
+  kept.
+- **Robust transfers:** chunked, parallel, retried and resumable (see [Large objects](#large-objects)); downloads land
+  in a hidden temp file and are renamed into place atomically. Offline edits wait and go up when the gateway is
+  reachable again.
+- **Cross-platform names:** paths are stored with `/` and Unicode NFC (macOS writes decomposed names). Remote names
+  a platform can't hold (Windows: `<>:"|?*`, `CON`, trailing dots; case-only differences on macOS / Windows) are
+  skipped and reported, never deleted. OS litter (`.DS_Store`, `Thumbs.db`, `~$*`, `*.tmp`, partial downloads) is
+  not synced.
+- **State** lives in `<folder>/.near-drive/` (never synced); registered folders in `~/.near-drive/sync.json`. The
+  background service re-reads it, so `sync add` / `remove` take effect within seconds.
+
+Not built yet: files on demand (placeholders that download when opened: Windows Cloud Files API, macOS File
+Provider, FUSE on Linux), selective sync, push notifications instead of polling, and a tray/menu-bar app.
+
 ## S3 sidecar (`near drive up` / `down`)
 
 Existing S3 code (boto3, aws-cli, aws-sdk-*) can talk to NEAR Drive by changing only `endpoint_url` and the keys:
 
 ```sh
-near drive up                             # background, 127.0.0.1:9000, loopback only; prints AWS_* exports
+near drive up                             # background, 127.0.0.1:9000, loopback only; prints AWS_* exports (also runs synced folders)
 #  keys generated once, stored 0600 in ~/.near-drive/s3-proxy.json; pid/log in ~/.near-drive/s3-proxy.{pid,log}
 near drive down                           # stop it
 near drive s3-proxy                       # same, in the foreground (containers, systemd); takes the same flags
@@ -306,6 +345,7 @@ The proxy encrypts client-side with the account's root key and signs requests wi
 - unit tests;
 - a gateway+client e2e covering encryption at rest, overwrite/CAS, listing, namespace isolation, app-pays prefixes, and forged or stale record rejection;
 - `tests/streaming.rs`: streaming vs one-shot interop, ranges, storage classes, a blob bridge with direct URLs and fallback;
+- `crates/near-drive-sync/tests/sync.rs`: two devices syncing through a gateway: first sync, edits both ways, deletes to trash, conflicts (conflicted copies), touch without transfer, identical-content merge, conditional writes, offline, settle, the watch loop;
 - `tests/resilience.rs`: a fault-injecting proxy (503s, truncated bodies, lost write responses, dead links); resumed uploads and downloads send/fetch only what is missing; a changed file restarts with a fresh key; small reads take one request;
 - `tests/large.rs`: a large object with bounded memory;
 - `crates/near-drive-s3/tests/s3_e2e.rs`: gateway + S3 proxy driven by the AWS Rust SDK (and raw signed requests for chunk signatures, trailers, skew and presigned URLs).

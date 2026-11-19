@@ -9,7 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-std"] }
+tokio = { workspace = true, features = ["io-std", "signal"] }
 clap.workspace = true
 near-drive-core.workspace = true
 near-drive-client.workspace = true
@@ -19,14 +19,18 @@ hex.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
 near-drive-s3.workspace = true
+near-drive-sync.workspace = true
 tracing-subscriber.workspace = true
+tracing.workspace = true
 inquire = "0.9"
 dirs = "5"
-libc = "0.2"
 toml = "0.8"
 bs58.workspace = true
 # Same backends as near-cli-rs, so `near` and `near-drive` share the OS keychain.
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [[bin]]
 name = "near-drive"

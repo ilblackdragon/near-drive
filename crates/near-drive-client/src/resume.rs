@@ -111,14 +111,13 @@ pub(crate) fn load(path: &Path, key: &JournalKey) -> Option<Resumed> {
 
 /// Check every journaled chunk's plaintext hash against the file now.
 pub(crate) fn file_unchanged(src: &Path, chunk_size: u64, r: &Resumed) -> Result<bool> {
-    use std::os::unix::fs::FileExt;
     let f = std::fs::File::open(src)?;
     let len = f.metadata()?.len();
     let mut buf = vec![0u8; chunk_size as usize];
     for (&i, ph) in &r.dispatched {
         let n = near_drive_core::crypto::stream::chunk_plain_len(len, chunk_size, i) as usize;
         let b = &mut buf[..n];
-        f.read_exact_at(b, i * chunk_size)?;
+        near_drive_core::fsx::read_exact_at(&f, b, i * chunk_size)?;
         if blake3::hash(b).to_hex().as_str() != ph {
             return Ok(false);
         }

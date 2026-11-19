@@ -457,9 +457,16 @@ async fn get_object(
     }
 }
 
+#[derive(Deserialize)]
+struct DeleteQuery {
+    /// Delete only if the current version is this seq (409 otherwise).
+    seq: Option<u64>,
+}
+
 async fn delete_object(
     State(st): State<Arc<AppState>>,
     Path((ns, path)): Path<(String, String)>,
+    Query(q): Query<DeleteQuery>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -471,6 +478,9 @@ async fn delete_object(
         return Err(err(StatusCode::FORBIDDEN, "no write access"));
     }
     let rec = st.index.get(&ns, &path).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "not found"))?;
+    if q.seq.is_some_and(|s| s != rec.seq) {
+        return Err(err(StatusCode::CONFLICT, format!("seq conflict: current seq is {}", rec.seq)));
+    }
     match st.index.delete(&ns, &path, rec.seq).await {
         Ok(()) => {}
         Err(CasError::Conflict { .. }) => return Err(err(StatusCode::CONFLICT, "object changed concurrently")),

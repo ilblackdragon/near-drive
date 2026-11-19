@@ -177,6 +177,31 @@ try:
     assert "not running" in nd("down").stderr
     ok("up: background S3 endpoint (boto3 reads docs/notes.txt); down stops it")
 
+    # Sync: register a folder, the background service keeps it in sync; a second folder pulls it.
+    laptop, desktop = os.path.join(t, "Laptop"), os.path.join(t, "Desktop")
+    r = nd("sync", "add", laptop, "Shared")
+    assert r.returncode == 0 and "near://alice.local/Shared/" in r.stdout, r
+    r = nd("up", "--no-s3", timeout=30)
+    assert r.returncode == 0 and laptop in r.stdout, r
+    os.makedirs(os.path.join(laptop, "plans"))
+    with open(os.path.join(laptop, "plans", "q1.md"), "w") as f:
+        f.write("# Q1\n")
+    for _ in range(60):
+        time.sleep(0.5)
+        if "Shared/plans/q1.md" in nd("ls", "Shared/").stdout:
+            break
+    else:
+        raise AssertionError("background sync did not upload; log:\n" + open(os.path.join(t, "home", "daemon.log")).read())
+    r = nd("sync", "run", desktop, "Shared")
+    assert r.returncode == 0 and "down   plans/q1.md" in r.stderr, r
+    with open(os.path.join(desktop, "plans", "q1.md")) as f:
+        assert f.read() == "# Q1\n"
+    r = nd("sync", "status")
+    assert "running" in r.stdout and "last sync" in r.stdout, r.stdout
+    assert "stopped" in nd("down").stderr
+    assert "stopped syncing" in nd("sync", "remove", laptop).stdout
+    ok("sync: `sync add` + `up --no-s3` syncs in the background; `sync run` pulls into a second folder")
+
     # Non-interactive: a missing argument is an error, not a prompt.
     r = subprocess.run([f"{BIN}/near-drive", "--network", "local", "--account", ACCOUNT, "get"], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
     assert r.returncode != 0 and "missing" in r.stderr, r.stderr

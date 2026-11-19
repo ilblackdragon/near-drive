@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod crypto;
+pub mod fsx;
 pub mod keys;
 pub mod manifest;
 pub mod policy;

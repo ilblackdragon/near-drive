@@ -87,7 +87,26 @@ pub struct PutOptions {
     /// [`Client::put_file`] keeps a journal here so an interrupted upload of the
     /// same file to the same URI resumes instead of starting over. None = off.
     pub resume_dir: Option<std::path::PathBuf>,
+    /// Write only if the object is currently at this seq (0 = must not exist);
+    /// otherwise fail with [`Conflict`] instead of overwriting a newer version.
+    pub expect_seq: Option<u64>,
 }
+
+/// A conditional write or delete found a different current version.
+#[derive(Debug, Clone)]
+pub struct Conflict {
+    pub uri: String,
+    /// Current seq (0 = the object does not exist).
+    pub current: u64,
+}
+
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} changed concurrently (current seq {})", self.uri, self.current)
+    }
+}
+
+impl std::error::Error for Conflict {}
 
 pub struct Client {
     http: reqwest::Client,
@@ -267,7 +286,7 @@ impl Client {
             enc,
             content_type: opts.content_type.clone(),
         };
-        self.commit_manifest(uri, &manifest, opts.class.as_deref()).await
+        self.commit_manifest(uri, &manifest, opts.class.as_deref(), opts.expect_seq).await
     }
 
     /// Publish `manifest` (chunks already uploaded) as the new version of `uri`.
@@ -277,12 +296,17 @@ impl Client {
     /// may have landed; a following 409 is then checked against the current
     /// head, and if that head is this manifest by this key, the write succeeded.
     /// A conflict with someone else's write is retried once with the new seq.
-    async fn commit_manifest(&self, uri: &NearUri, manifest: &Manifest, class: Option<&str>) -> Result<PointerRecord> {
+    async fn commit_manifest(&self, uri: &NearUri, manifest: &Manifest, class: Option<&str>, expect_seq: Option<u64>) -> Result<PointerRecord> {
         let mbytes = manifest.to_bytes();
         let stored = manifest.stored_size() + mbytes.len() as u64;
-        // Independent: upload the manifest chunk while reading the current seq.
-        let (mref, head) = tokio::join!(self.put_chunk(&uri.namespace, mbytes, class), self.head(uri));
-        let (mref, mut prev) = (mref?, head?.map(|h| h.record.seq).unwrap_or(0));
+        let (mref, mut prev) = match expect_seq {
+            Some(s) => (self.put_chunk(&uri.namespace, mbytes, class).await?, s),
+            None => {
+                // Independent: upload the manifest chunk while reading the current seq.
+                let (mref, head) = tokio::join!(self.put_chunk(&uri.namespace, mbytes, class), self.head(uri));
+                (mref?, head?.map(|h| h.record.seq).unwrap_or(0))
+            }
+        };
         let my_pk = near_drive_core::keys::format_public_key(&self.sk.verifying_key());
         let mut maybe_landed = false;
         let mut conflicts = 0;
@@ -299,6 +323,9 @@ impl Client {
                         if maybe_landed && h.record.manifest_cid == mref.cid && h.record.writer_pk == my_pk && h.record.seq == prev + 1 {
                             return Ok(h.record.clone());
                         }
+                    }
+                    if expect_seq.is_some() {
+                        return Err(Conflict { uri: uri.to_string(), current: cur.map(|h| h.record.seq).unwrap_or(0) }.into());
                     }
                     conflicts += 1;
                     if conflicts >= 2 {
@@ -339,7 +366,7 @@ impl Client {
         let enc = crypto::add_recipient(root, enc, &crypto::Recipient::X25519(crypto::parse_x25519(recipient)?))?;
         let manifest = Manifest { enc: Some(enc), ..head.manifest };
         // Chunks are reused, so the object keeps its class.
-        self.commit_manifest(uri, &manifest, head.class.as_deref()).await
+        self.commit_manifest(uri, &manifest, head.class.as_deref(), None).await
     }
 
     pub async fn get(&self, uri: &NearUri) -> Result<(ObjectHead, Vec<u8>)> {
@@ -380,12 +407,27 @@ impl Client {
     /// Delete `uri`. Retried; a 404 after a failed attempt means that attempt
     /// already deleted it.
     pub async fn delete(&self, uri: &NearUri) -> Result<()> {
+        self.delete_inner(uri, None).await
+    }
+
+    /// Delete `uri` only if its current version is `seq`; otherwise [`Conflict`].
+    pub async fn delete_if(&self, uri: &NearUri, seq: u64) -> Result<()> {
+        self.delete_inner(uri, Some(seq)).await
+    }
+
+    async fn delete_inner(&self, uri: &NearUri, seq: Option<u64>) -> Result<()> {
         let path = Self::obj_path(uri);
+        let q = seq.map(|s| format!("seq={s}")).unwrap_or_default();
         with_retries(&self.net, "delete", |attempt| {
-            let path = path.clone();
+            let (path, q) = (path.clone(), q.clone());
             async move {
-                match self.send(Method::DELETE, &path, "", Bytes::new()).await {
+                match self.send(Method::DELETE, &path, &q, Bytes::new()).await {
                     Ok(r) if r.status() == StatusCode::NOT_FOUND && attempt > 0 => Attempt::Done(()),
+                    Ok(r) if r.status() == StatusCode::CONFLICT && seq.is_some() => {
+                        let body = r.text().await.unwrap_or_default();
+                        let current = body.rsplit("current seq is ").next().and_then(|t| t.trim_matches(|c: char| !c.is_ascii_digit()).parse().ok()).unwrap_or(0);
+                        Attempt::Fatal(Conflict { uri: uri.to_string(), current }.into())
+                    }
                     r => match ok_or_attempt(r).await {
                         Attempt::Done(_) => Attempt::Done(()),
                         Attempt::Retry(e, w) => Attempt::Retry(e, w),

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/near-drive-core", "crates/near-drive-client", "crates/near-drive-gateway", "crates/near-drive-s3", "crates/near-drive-ckd", "crates/near-drive-chain", "crates/near-drive-cli"]
+members = ["crates/near-drive-core", "crates/near-drive-client", "crates/near-drive-gateway", "crates/near-drive-s3", "crates/near-drive-ckd", "crates/near-drive-chain", "crates/near-drive-cli", "crates/near-drive-sync"]
 # NEAR contracts target wasm and have their own workspace (contracts/Cargo.toml).
 exclude = ["contracts"]
 
@@ -42,3 +42,4 @@ near-drive-gateway = { path = "crates/near-drive-gateway" }
 near-drive-ckd = { path = "crates/near-drive-ckd" }
 near-drive-s3 = { path = "crates/near-drive-s3" }
 near-drive-chain = { path = "crates/near-drive-chain" }
+near-drive-sync = { path = "crates/near-drive-sync" }

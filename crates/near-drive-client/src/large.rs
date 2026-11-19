@@ -107,14 +107,13 @@ struct PartMeta {
 /// For each chunk: are the bytes at its offset in `f` exactly that chunk?
 /// (Re-encrypt / hash them and compare with the manifest's cid.)
 fn chunks_on_disk(f: &std::fs::File, m: &Manifest, opener: &Opener) -> Result<Vec<bool>> {
-    use std::os::unix::fs::FileExt;
     let n = m.chunks.len();
     let mut buf = vec![0u8; m.chunk_size as usize];
     (0..n)
         .map(|i| {
             let len = chunk_plain_len(m.size, m.chunk_size, i as u64) as usize;
             let b = &mut buf[..len];
-            f.read_exact_at(b, i as u64 * m.chunk_size)?;
+            near_drive_core::fsx::read_exact_at(f, b, i as u64 * m.chunk_size)?;
             let cid = match opener {
                 Opener::Plain => near_drive_core::cid(b),
                 Opener::Enc(o) => near_drive_core::cid(&o.reseal(i as u64, i + 1 == n, b)?),
@@ -349,7 +348,7 @@ impl Client {
             },
             content_type: opts.content_type.clone(),
         };
-        self.commit_manifest(uri, &manifest, class).await
+        self.commit_manifest(uri, &manifest, class, opts.expect_seq).await
     }
 
     fn opener(&self, m: &Manifest) -> Result<Opener> {
@@ -390,8 +389,7 @@ impl Client {
     /// object checks every chunk already on disk (by re-deriving its cid from
     /// the bytes) and fetches only the missing or damaged ones.
     pub async fn get_to_file(&self, uri: &NearUri, path: impl AsRef<Path>) -> Result<ObjectHead> {
-        use std::os::unix::fs::FileExt;
-        let path = path.as_ref().to_path_buf();
+            let path = path.as_ref().to_path_buf();
         let loc = self.locate_or_404(uri).await?;
         let opener = self.opener(&loc.manifest)?;
         let suffixed = |s: &str| {
@@ -427,7 +425,7 @@ impl Client {
                 let (file, loc, opener) = (file.clone(), &loc, &opener);
                 async move {
                     let pt = self.plain_chunk(uri, loc, opener, i).await?;
-                    tokio::task::spawn_blocking(move || file.write_all_at(&pt, i as u64 * cs)).await??;
+                    tokio::task::spawn_blocking(move || near_drive_core::fsx::write_all_at(&file, &pt, i as u64 * cs)).await??;
                     Ok(())
                 }
             })
