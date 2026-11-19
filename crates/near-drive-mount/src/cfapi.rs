@@ -212,20 +212,42 @@ impl Provider {
         Ok(())
     }
 
-    /// Apply remote changes to placeholders in folders that exist locally.
+    /// Make sure every folder on the way to `rel` exists (as a placeholder).
+    fn ensure_dirs(&self, rel: &str) -> Result<()> {
+        let mut dir = self.root.clone();
+        let parts: Vec<&str> = rel.split('/').collect();
+        for d in &parts[..parts.len().saturating_sub(1)] {
+            let next = dir.join(d);
+            if !next.exists() {
+                if let Err(e) = Self::dir_info(d).create(&dir) {
+                    tracing::debug!("placeholder folder {}: {e}", next.display());
+                    std::fs::create_dir_all(&next)?;
+                }
+            }
+            dir = next;
+        }
+        Ok(())
+    }
+
+    /// Bring placeholders in line with the remote: new files and folders get
+    /// placeholders (cheap: no data), changed in-sync files are updated and
+    /// dehydrated, deleted in-sync files are removed.
     fn refresh(&self) -> Result<()> {
         let all = self.list_all()?;
         // New and changed remote files.
         for (rel, f) in &all {
             let path = self.local(rel);
             let parent = path.parent().unwrap_or(&self.root).to_path_buf();
-            if !parent.exists() {
-                continue; // folder not populated yet: it lists itself when opened
+            if let Err(e) = self.ensure_dirs(rel) {
+                tracing::warn!("{rel}: {e:#}");
+                continue;
             }
             match std::fs::File::open(&path) {
                 Err(_) => {
                     let name = rel.rsplit('/').next().unwrap_or(rel);
-                    let _ = Self::file_info(name, f).create(&parent);
+                    if let Err(e) = Self::file_info(name, f).create(&parent) {
+                        tracing::warn!("placeholder {rel}: {e}");
+                    }
                 }
                 Ok(file) => {
                     let ph: Placeholder = file.into();
@@ -285,6 +307,7 @@ fn cerr(e: anyhow::Error) -> CloudErrorKind {
 
 impl SyncFilter for Provider {
     fn fetch_placeholders(&self, request: Request, ticket: ticket::FetchPlaceholders, _info: info::FetchPlaceholders) -> CResult<()> {
+        tracing::debug!("fetch_placeholders {}", request.path().display());
         let dir = rel_of(&self.root, &request.path()).ok_or(CloudErrorKind::NotUnderSyncRoot)?;
         let all = self.list_all().map_err(cerr)?;
         let mut items = self.children(&dir, &all);
@@ -294,6 +317,7 @@ impl SyncFilter for Provider {
     }
 
     fn fetch_data(&self, request: Request, ticket: ticket::FetchData, info: info::FetchData) -> CResult<()> {
+        tracing::debug!("fetch_data {} {:?}", request.path().display(), info.required_file_range());
         let rel = rel_of(&self.root, &request.path()).ok_or(CloudErrorKind::NotUnderSyncRoot)?;
         let size = request.file_size();
         let want = info.required_file_range();
@@ -416,6 +440,11 @@ pub fn mount(client: Arc<Client>, remote: NearUri, folder: &Path, _opts: MountOp
 
     // Background: uploads of local changes (after they settle) and remote refreshes.
     let worker = Arc::new(Provider { client: client.clone(), remote: remote.clone(), root, rt: rt.clone(), pending });
+    // Show the whole tree right away (placeholders only, no file data).
+    {
+        let w = worker.clone();
+        tokio::task::block_in_place(|| w.refresh()).context("listing the remote folder")?;
+    }
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
     let changed = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let changed2 = changed.clone();

@@ -47,6 +47,7 @@ async fn cloud_files_placeholders() {
         eprintln!("skipping: no Cloud Files API here");
         return;
     }
+    let _ = tracing_subscriber::fmt().with_env_filter("near_drive_mount=debug").with_test_writer().try_init();
     let tmp = tempfile::tempdir().unwrap();
     let sk = SigningKey::generate(&mut rand::rngs::OsRng);
     let dev = HashMap::from([("alice.near".to_string(), vec![keys::format_public_key(&sk.verifying_key())])]);

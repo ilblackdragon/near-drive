@@ -36,3 +36,4 @@ near-drive-gateway.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
 axum.workspace = true
+tracing-subscriber.workspace = true
