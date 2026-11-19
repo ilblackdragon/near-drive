@@ -321,7 +321,7 @@ async fn get_object(
                         (StatusCode::PARTIAL_CONTENT, [("content-type", "application/octet-stream".to_string()), ("content-range", cr)], bytes).into_response()
                     }
                     Ok(None) => bridge::ranged_response(&headers, st.blobs.get(&cid).await?.ok_or_else(missing)?),
-                    Err(()) => return Err(err(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable")),
+                    Err(bridge::Unsatisfiable) => return Err(err(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable")),
                 },
                 _ => bridge::ranged_response(&headers, st.blobs.get(&cid).await?.ok_or_else(missing)?),
             };

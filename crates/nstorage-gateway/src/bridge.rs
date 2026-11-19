@@ -119,10 +119,14 @@ impl BlobStore for BridgeBlobStore {
     }
 }
 
+/// A `Range` header that cannot be satisfied (HTTP 416).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unsatisfiable;
+
 /// Parse a single-range `Range` header (`bytes=a-b`, `bytes=a-`, `bytes=-n`)
-/// against an object of `len` bytes into a half-open range. `Err(())` means
-/// unsatisfiable (416); `Ok(None)` means no usable Range header (serve all).
-pub fn parse_range(h: Option<&str>, len: u64) -> Result<Option<Range<u64>>, ()> {
+/// against an object of `len` bytes into a half-open range. `Ok(None)` means
+/// no usable Range header (serve everything).
+pub fn parse_range(h: Option<&str>, len: u64) -> Result<Option<Range<u64>>, Unsatisfiable> {
     let Some(spec) = h.and_then(|h| h.trim().strip_prefix("bytes=")) else { return Ok(None) };
     if spec.contains(',') {
         return Ok(None); // multi-range: serve the whole thing
@@ -130,16 +134,16 @@ pub fn parse_range(h: Option<&str>, len: u64) -> Result<Option<Range<u64>>, ()> 
     let Some((a, b)) = spec.split_once('-') else { return Ok(None) };
     let (a, b) = (a.trim(), b.trim());
     let r = if a.is_empty() {
-        let n: u64 = b.parse().map_err(|_| ())?;
+        let n: u64 = b.parse().map_err(|_| Unsatisfiable)?;
         if n == 0 {
-            return Err(());
+            return Err(Unsatisfiable);
         }
         len.saturating_sub(n)..len
     } else {
-        let s: u64 = a.parse().map_err(|_| ())?;
-        let e = if b.is_empty() { len } else { b.parse::<u64>().map_err(|_| ())?.saturating_add(1).min(len) };
+        let s: u64 = a.parse().map_err(|_| Unsatisfiable)?;
+        let e = if b.is_empty() { len } else { b.parse::<u64>().map_err(|_| Unsatisfiable)?.saturating_add(1).min(len) };
         if s >= len || e <= s {
-            return Err(());
+            return Err(Unsatisfiable);
         }
         s..e
     };
@@ -160,7 +164,7 @@ pub fn ranged_response(headers: &HeaderMap, bytes: Bytes) -> Response {
             bytes.slice(r.start as usize..r.end as usize),
         )
             .into_response(),
-        Err(()) => (StatusCode::RANGE_NOT_SATISFIABLE, [(header::CONTENT_RANGE, format!("bytes */{len}"))]).into_response(),
+        Err(Unsatisfiable) => (StatusCode::RANGE_NOT_SATISFIABLE, [(header::CONTENT_RANGE, format!("bytes */{len}"))]).into_response(),
     }
 }
 
@@ -259,8 +263,8 @@ mod tests {
         assert_eq!(parse_range(Some("bytes=2-"), 10), Ok(Some(2..10)));
         assert_eq!(parse_range(Some("bytes=2-100"), 10), Ok(Some(2..10)));
         assert_eq!(parse_range(Some("bytes=-3"), 10), Ok(Some(7..10)));
-        assert_eq!(parse_range(Some("bytes=10-"), 10), Err(()));
-        assert_eq!(parse_range(Some("bytes=5-4"), 10), Err(()));
+        assert_eq!(parse_range(Some("bytes=10-"), 10), Err(Unsatisfiable));
+        assert_eq!(parse_range(Some("bytes=5-4"), 10), Err(Unsatisfiable));
         assert_eq!(parse_range(Some("bytes=0-1,4-5"), 10), Ok(None));
     }
 
