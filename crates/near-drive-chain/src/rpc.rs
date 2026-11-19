@@ -21,6 +21,15 @@ pub fn default_rpc_url(network: &str) -> Option<&'static str> {
     }
 }
 
+/// Permission of an access key, as far as NEAR Drive cares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyPermission {
+    FullAccess,
+    FunctionCall { receiver_id: String },
+    /// Gas keys and future kinds.
+    Other,
+}
+
 /// The target account has no contract deployed (or does not exist).
 #[derive(Debug)]
 pub struct NoContract(pub String);
@@ -163,6 +172,34 @@ impl NearRpc {
         let hash = r.get("block_hash").and_then(Value::as_str).ok_or_else(|| anyhow!("access key: no block_hash"))?;
         let hash: [u8; 32] = bs58::decode(hash).into_vec()?.try_into().map_err(|_| anyhow!("bad block hash"))?;
         Ok((nonce, hash))
+    }
+
+    /// All access keys of `account`: `(public_key, permission)`, where a
+    /// function-call key carries its `receiver_id`.
+    pub async fn access_key_list(&self, account: &str) -> Result<Vec<(String, KeyPermission)>> {
+        let r = self
+            .request(
+                "query",
+                json!({"request_type": "view_access_key_list", "finality": "final", "account_id": account}),
+                Duration::from_secs(10),
+            )
+            .await?;
+        let keys = r.get("keys").and_then(Value::as_array).ok_or_else(|| anyhow!("access key list: no keys in {r}"))?;
+        Ok(keys
+            .iter()
+            .filter_map(|k| {
+                let pk = k.get("public_key")?.as_str()?.to_string();
+                let perm = k.get("access_key")?.get("permission")?;
+                let perm = if perm.as_str() == Some("FullAccess") {
+                    KeyPermission::FullAccess
+                } else if let Some(fc) = perm.get("FunctionCall") {
+                    KeyPermission::FunctionCall { receiver_id: fc.get("receiver_id")?.as_str()?.to_string() }
+                } else {
+                    KeyPermission::Other
+                };
+                Some((pk, perm))
+            })
+            .collect())
     }
 
     /// Sign and send a transaction with the given actions; waits until all

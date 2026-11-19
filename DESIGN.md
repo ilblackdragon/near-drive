@@ -105,7 +105,7 @@ The signature is ed25519 (base58) over
 Clients keep timestamps strictly increasing so two identical requests never share a signature (the gateway keeps a replay cache keyed by signature).
 The gateway accepts the key if it is one of:
 - a **full-access key** of the account (`view_access_key`); or
-- a **function-call key scoped to `drive.near`**. This is the recommended "storage session key". Wallets can add it without touching funds, and revoking it is a normal NEAR key deletion; or
+- a **function-call key scoped to `drive.near`**. This is the recommended "storage session key". Wallets can add it without touching funds, and revoking it is a normal NEAR key deletion (`near drive login` / `logout` do both through near-cli, which also stores the key); or
 - (dev mode) a key listed in the gateway config.
 
 A timestamp window of ±5 min plus a short replay cache per gateway is enough. Requests are idempotent PUT/GET/DELETE, and content-addressed chunk uploads are harmless to replay.
@@ -232,6 +232,7 @@ client.share(uri, account) ; client.grant(prefix, rule)   # onchain policy tx
 | **1** | S3/R2 stores with conditional writes; storage classes and replication; blob-bridge protocol (`docs/blob-bridge.md`); streaming large objects + `?mode=locate` + chunk cache; `near drive s3-proxy`; cloud-credits billing (metering, reporting, 402 gate) + cloud-api endpoints; TS and Python SDKs; sharing (X25519 recipients); CORS | Done. Verified against MinIO, boto3 1.34 and 1.44, aws-cli, and a local cloud-api build. Not verified against real AWS S3/R2 or a deployed cloud-api. The cloud-api change needs a schema change in `nearai/cloud-platform` first (see its `docs/storage-billing.md`) |
 | **2** | `drive.near` contract (rules, enc keys, gateway registry, cred epochs, anchors); gateway reads rules from chain; `near drive grant/rules/publish-key/gateways`, gateway discovery; CKD root keys (`near drive keygen --ckd`); FOC bridge (Synapse) | Done in code. Contract verified in a local sandbox only. CKD verified against the official vectors and live read-only queries, not a real request. FOC bridge type-checked and mock-tested; no funded upload completed |
 | **3** | NEAR Intents / stablecoin escrow (`ft_on_transfer`, `mt_on_transfer`, capped `settle`, delayed withdrawals; `docs/payments.md`); Shelby bridge (S3 mode + experimental SDK mode) | Done in code; sandbox and mock tests only |
+| **CLI** | One `near-drive` binary, also `near drive` as a near-cli-rs extension; NEAR keys and transactions delegated to near-cli (`login` adds a function-call session key via `near account add-key`; `grant`/`publish-key`/`keygen --ckd`/`logout` are near-cli transactions); interactive prompts in a terminal | Done. Verified on a local sandbox with near-cli-rs 0.29 (`tests/near_cli_e2e.sh`, including near-cli's interactive signer menu) and in a pty (`tests/interactive_smoke.py`). OS-keychain lookup is the same entry format near-cli writes but was only exercised through the legacy-file fallback (headless Linux) |
 | Not built | hosted TEE S3 endpoint; storage reservations, disputes, stake slashing; chunk garbage collection; placement log; hidden-path mode; keychain-wrapped root key cache; NEAR-escrow settler wired into billing (interface exists); prepaid storage so session keys can set rules | |
 
 ## 10. Open questions

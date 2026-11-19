@@ -11,9 +11,50 @@ See [DESIGN.md](DESIGN.md) for the architecture and roadmap.
 | `near-drive-client` | Rust SDK: chunk + encrypt + sign, verifies everything it reads; streaming `put_file`/`get_to_file`/`get_range` for large objects |
 | `near-drive-gateway` | stateless HTTP gateway; NEAR access-key auth (RPC `view_access_key` or dev keys); blob backends fs / S3 / R2 / MinIO / HTTP blob bridge with storage classes and replication; fs or S3 (multi-gateway CAS) index; chunk cache; `?mode=locate` direct URLs; JSONL usage metering |
 | `near-drive-s3` | S3-compatible local sidecar: SigV4/SigV2 verification, aws-chunked + checksum trailers, S3 ops → native API |
-| `near-drive` | CLI: `keygen`, `dev-key`, `put`, `get` (streaming, `--range`, `--class`), `ls`, `rm`, `share`, `s3-proxy`, `keygen --ckd`; chain: `grant`, `rules`, `publish-key`, `gateways` |
+| `near-drive-cli` | the `near-drive` binary, also `near drive` (near-cli-rs extension): `login`/`logout`, `keygen [--ckd]`, `put`, `get` (streaming, `--range`, `--class`), `ls`, `rm`, `share`, `grant`, `rules`, `publish-key`, `whoami`, `gateways`, `s3-proxy`; interactive when run in a terminal. NEAR keys come from near-cli ([below](#cli-near-drive--near-drive)) |
 | `near-drive-chain` | NEAR JSON-RPC views + signed function calls (small hand-rolled borsh tx builder) for `drive.near` |
 | `contracts/drive` | the `drive.near` contract: namespace rules, X25519 keys, gateway registry, credential epochs, anchors, stablecoin / NEAR Intents escrow ([docs/payments.md](docs/payments.md)) |
+
+## CLI: `near drive` / `near-drive`
+
+One binary, two ways to run it:
+
+- `near drive <command>` once `near-drive` is on `PATH`. near-cli-rs runs `near-<name>` for subcommands it
+  does not know (like `cargo`). (`near storage` is taken: near-cli keeps it as a legacy alias of `view-state`.)
+- `near-drive <command>` standalone.
+
+```sh
+cargo install --path crates/near-drive-cli        # installs near-drive
+near drive login                                  # pick an account; adds a NEAR Drive session key via near-cli
+near drive keygen --ckd                           # encryption key derived from the account (MPC CKD)
+near drive put ./notes.txt near://alice.near/notes.txt
+near drive                                        # no arguments: menu
+```
+
+**NEAR keys are near-cli's.** NEAR Drive never stores or creates NEAR keys itself:
+
+- Requests to the gateway are signed with a key from near-cli's keychain: the OS keychain entries `near` writes
+  (`near-<network>-<account>` / `<account>:<public key>`) or the legacy files under `~/.near-credentials/<network>/`.
+  The CLI lists the account's keys onchain and picks a function-call key for the drive contract first, then a
+  full-access key. `near drive whoami` shows which one and where it came from.
+- `near drive login` runs `near account add-key <account> grant-function-call-access --contract-account-id drive.near
+  ... autogenerate-new-keypair save-to-keychain`: near-cli generates the session key, stores it, and signs the
+  `AddKey` with whatever signer you choose (keychain, Ledger, seed phrase, ...). `near drive logout` deletes it.
+- Transactions (`grant`, `publish-key`, `keygen --ckd`, `login`, `logout`) are run by `near contract call-function
+  as-transaction ...`, so near-cli asks for the signer. Without a terminal it uses `sign-with-keychain send`; override
+  with `--near-sign "sign-with-ledger send"` (or `NEAR_DRIVE_NEAR_SIGN`).
+- `--network` is a near-cli connection name (`mainnet`, `testnet`, or your own from `near config add-connection`);
+  the RPC URL and the CKD MPC contract come from that connection.
+- `--credentials <file>` bypasses near-cli for everything (dev gateways, CI): requests and transactions are signed
+  with that key file.
+
+The encryption root key is not a NEAR key and stays in `~/.near-drive/keys/<account>.root` (the TS and Python SDKs
+read it there). With `keygen --ckd` it can be re-derived from the account on any device.
+
+**Interactive mode.** In a terminal, anything missing is asked for with the same prompt library near-cli uses:
+`near drive` alone opens a menu; `near drive get` lists your files to pick from; `put` suggests a destination;
+`grant` asks who can read, write and pay; `keygen` asks CKD or random. Afterwards it prints the equivalent
+non-interactive command. Without a terminal (or with `--no-interactive`) missing arguments are errors.
 
 ## Quickstart (dev)
 
@@ -32,8 +73,9 @@ target/debug/near-drive ls near://alice.near/
 target/debug/near-drive get near://alice.near/memory/today.txt
 ```
 
-With real NEAR accounts, set `"rpc_url": "https://rpc.mainnet.near.org"` in the gateway config. Then use
-`~/.near-credentials/mainnet/<account>.json`, which needs a full-access key or a function-call key for `storage_contract`.
+With real NEAR accounts, set `"rpc_url": "https://rpc.mainnet.near.org"` in the gateway config and drop
+`NEAR_DRIVE_CREDENTIALS`: the CLI then uses near-cli's keys (`near drive login`). The gateway accepts a full-access key
+or a function-call key for `storage_contract`.
 
 With `rpc_url` set, the gateway reads namespace rules from the `storage_contract` (`get_rules`, cached 30 s; set
 `"contract_policies": false` to disable). Config `policies` entries override the contract for their namespaces, and are
@@ -45,8 +87,8 @@ the only policy source without `rpc_url`. For example, an app pays for its users
 ]}
 ```
 
-The same rule onchain, plus sharing by account name (`--rpc-url` defaults per `--network`; `--contract` defaults to
-`drive.near`; `NEAR_DRIVE_GATEWAY=auto` picks the fastest healthy gateway from the onchain registry):
+The same rule onchain, plus sharing by account name (`--rpc-url` defaults to the near-cli connection's; `--contract`
+defaults to `drive.near`; `NEAR_DRIVE_GATEWAY=auto` picks the fastest healthy gateway from the onchain registry):
 
 ```sh
 near drive --account app.near grant 'near://app.near/users/{account}/' --read '{account}' --write '{account},app.near' --payer app.near
@@ -56,7 +98,8 @@ near drive --account alice.near share near://alice.near/doc/x bob.near   # looks
 near drive gateways
 ```
 
-Onchain writes attach a NEAR deposit for storage staking (excess refunded), so they need a full-access key.
+Onchain writes attach a NEAR deposit for storage staking (excess refunded), so near-cli must sign them with a
+full-access key (or Ledger); the session key cannot.
 
 ## drive.near contract
 
@@ -226,6 +269,14 @@ The proxy encrypts client-side with the account's root key and signs requests wi
 Contract tests (`cd contracts && cargo test`, after `contracts/build.sh`; the sandbox node binary is downloaded on first
 run) include `tests/sandbox.rs` (contract flows with mock FT/MT tokens, plus the `near-drive-chain` tx builder) and
 `tests/gateway_chain.rs` (a real gateway resolving keys and rules from the sandbox chain, sharing by account, discovery).
+
+CLI scripts (after `cargo build`):
+- `tests/near_cli_e2e.sh`: sandbox node + contract + gateway; the CLI with near-cli-rs: key from near-cli's
+  keychain, `login` (session key added by near-cli), put/get/ls signed by it, `grant` and `publish-key` sent by
+  near-cli (also interactively, through near-cli's signer menu), `near drive ...` as an extension, `logout`.
+  Needs `near` and `contracts/build.sh`.
+- `tests/interactive_smoke.py` (pexpect): menu, account/network pickers, put, get from a listing, rm with
+  confirmation, and no prompts without a terminal.
 
 To run the S3 tests against a local MinIO (bind it to localhost only):
 

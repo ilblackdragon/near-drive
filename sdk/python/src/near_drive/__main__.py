@@ -15,7 +15,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--gateway", default=os.environ.get("NEAR_DRIVE_GATEWAY", "http://127.0.0.1:8787"))
     p.add_argument("--account", default=os.environ.get("NEAR_DRIVE_ACCOUNT"))
     p.add_argument("--credentials", default=os.environ.get("NEAR_DRIVE_CREDENTIALS"))
-    p.add_argument("--network", default=os.environ.get("NEAR_NETWORK", "mainnet"))
+    p.add_argument("--network", default=os.environ.get("NEAR_DRIVE_NETWORK", os.environ.get("NEAR_NETWORK", "mainnet")))
     p.add_argument("--home", default=os.environ.get("NEAR_DRIVE_HOME"))
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("keygen")

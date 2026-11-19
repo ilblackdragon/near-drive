@@ -1,27 +1,47 @@
-//! `near-drive` — command-line client for NEAR Drive.
+//! `near-drive`: the NEAR Drive CLI.
+//!
+//! Runs standalone (`near-drive ls ...`) or as a near-cli-rs extension
+//! (`near drive ls ...`: `near` runs `near-drive` for subcommands it does not
+//! know). NEAR keys are never managed here: request-signing keys are read from
+//! near-cli's keychain, and transactions are signed and sent by `near`
+//! (see `nearcli.rs`). Run with no subcommand, or with missing arguments, in a
+//! terminal to be asked for them.
+mod interactive;
+mod nearcli;
+
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use ed25519_dalek::SigningKey;
+use interactive::{basename, choice, split_list, Prompter};
 use near_drive_client::{
     near_drive_core::{crypto::RootKey, keys, policy::Rule, NearUri},
     Client, PutOptions,
 };
-use std::io::Write;
+use nearcli::{FunctionCall, KeyKind, NearCli, NearCliConfig};
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
+const DEFAULT_GATEWAY: &str = "http://127.0.0.1:8787";
+const DEFAULT_CONTRACT: &str = "drive.near";
+const CALL_TGAS: u64 = 50;
+
 #[derive(Parser)]
-#[command(name = "nst", about = "NEAR storage client")]
+#[command(name = "near-drive", about = "NEAR Drive: end-to-end encrypted storage addressed by NEAR accounts (also runs as `near drive`)")]
 struct Cli {
-    #[arg(long, env = "NEAR_DRIVE_GATEWAY", default_value = "http://127.0.0.1:8787", global = true)]
+    #[arg(long, env = "NEAR_DRIVE_GATEWAY", default_value = DEFAULT_GATEWAY, global = true)]
     gateway: String,
-    /// NEAR account to act as.
+    /// NEAR account to act as (asked for in interactive mode).
     #[arg(long, env = "NEAR_DRIVE_ACCOUNT", global = true)]
     account: Option<String>,
-    /// NEAR credentials JSON (default ~/.near-credentials/<network>/<account>.json).
+    /// near-cli network connection (`mainnet`, `testnet`, or any name from
+    /// `near config show-connections`). Default: mainnet.
+    #[arg(long, env = "NEAR_DRIVE_NETWORK", global = true)]
+    network: Option<String>,
+    /// Use this key file (NEAR credentials JSON) for everything instead of
+    /// near-cli: request signing and transactions. For dev gateways and CI.
     #[arg(long, env = "NEAR_DRIVE_CREDENTIALS", global = true)]
     credentials: Option<PathBuf>,
-    #[arg(long, env = "NEAR_NETWORK", default_value = "mainnet", global = true)]
-    network: String,
-    /// Directory for NEAR Drive root keys (default ~/.near-drive).
+    /// Directory for encryption root keys (default ~/.near-drive).
     #[arg(long, env = "NEAR_DRIVE_HOME", global = true)]
     home: Option<PathBuf>,
     /// Concurrent chunk transfers for put/get.
@@ -30,44 +50,44 @@ struct Cli {
     /// Chunk size in MiB for uploads (1..=64).
     #[arg(long, env = "NEAR_DRIVE_CHUNK_MIB", default_value_t = 4, global = true)]
     chunk_mib: usize,
-    /// NEAR RPC for drive.near (default: per --network). Set
-    /// NEAR_DRIVE_GATEWAY=auto to pick a gateway from the onchain registry.
+    /// NEAR RPC (default: the near-cli connection's). With
+    /// `--gateway auto` a gateway is picked from the onchain registry.
     #[arg(long, env = "NEAR_RPC_URL", global = true)]
     rpc_url: Option<String>,
-    /// The storage contract account.
-    #[arg(long, env = "NEAR_DRIVE_CONTRACT", default_value = "drive.near", global = true)]
+    /// The NEAR Drive contract account.
+    #[arg(long, env = "NEAR_DRIVE_CONTRACT", default_value = DEFAULT_CONTRACT, global = true)]
     contract: String,
+    /// near-cli-rs binary.
+    #[arg(long, env = "NEAR_DRIVE_NEAR_BIN", default_value = "near", global = true)]
+    near_bin: String,
+    /// near-cli words that pick the transaction signer, e.g.
+    /// "sign-with-keychain send" or "sign-with-ledger send". Default: near-cli
+    /// asks (interactive), or "sign-with-keychain send".
+    #[arg(long, env = "NEAR_DRIVE_NEAR_SIGN", global = true)]
+    near_sign: Option<String>,
+    /// Never prompt; fail on missing arguments.
+    #[arg(long, env = "NEAR_DRIVE_NO_INTERACTIVE", global = true)]
+    no_interactive: bool,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Cmd {
-    /// Create the account's encryption root key: random local key, or with
-    /// `--ckd` derive it via NEAR MPC Confidential Key Derivation (sends one
-    /// `request_app_private_key` tx on `--network`; same key on every device).
-    Keygen {
+    /// List files under a prefix (default: your whole namespace).
+    Ls { uri: Option<String> },
+    /// Download a file (to stdout when no destination is given).
+    Get {
+        uri: Option<String>,
+        dst: Option<PathBuf>,
+        /// Only bytes START-END (inclusive, like HTTP Range), e.g. `0-1023` or `1048576-`.
         #[arg(long)]
-        ckd: bool,
-        /// MPC contract (default: v1.signer / v1.signer-prod.testnet by --network).
-        #[arg(long, requires = "ckd")]
-        ckd_contract: Option<String>,
-        /// NEAR RPC URL (default: rpc.<network>.near.org).
-        #[arg(long, requires = "ckd")]
-        ckd_rpc: Option<String>,
-        /// CKD domain id (default 2).
-        #[arg(long, requires = "ckd")]
-        ckd_domain: Option<u64>,
-    },
-    /// Generate an ed25519 key in NEAR credentials format (for dev gateways).
-    DevKey {
-        #[arg(long)]
-        out: PathBuf,
+        range: Option<String>,
     },
     /// Upload a file (or `-` for stdin).
     Put {
-        src: String,
-        uri: String,
+        src: Option<String>,
+        uri: Option<String>,
         /// Store unencrypted (public data).
         #[arg(long)]
         public: bool,
@@ -80,14 +100,16 @@ enum Cmd {
         #[arg(long)]
         class: Option<String>,
     },
-    /// Give a recipient the key to an existing object: an `x25519:<base58>`
-    /// key, or an account name whose key is looked up in drive.near.
-    Share { uri: String, recipient: String },
-    /// Add or replace (by prefix) a rule in your namespace policy (onchain tx).
+    /// Delete a file.
+    Rm { uri: Option<String> },
+    /// Give someone the key to a file: an account name (its key is looked up
+    /// in the contract) or an `x25519:<base58>` key.
+    Share { uri: Option<String>, recipient: Option<String> },
+    /// Add or replace (by prefix) an access rule in your namespace (transaction via near-cli).
     /// Example: `near drive grant 'near://app.near/users/{account}/' --read '{account}' --write '{account},app.near' --payer app.near`
     Grant {
         /// `near://<your account>/<prefix>`
-        uri: String,
+        uri: Option<String>,
         #[arg(long, value_delimiter = ',')]
         read: Vec<String>,
         #[arg(long, value_delimiter = ',')]
@@ -95,26 +117,44 @@ enum Cmd {
         #[arg(long)]
         payer: Option<String>,
     },
-    /// Print a namespace's policy rules from drive.near.
-    Rules { namespace: String },
-    /// Publish your X25519 key in drive.near so others can share to you.
-    PublishKey,
-    /// List gateways registered in drive.near.
-    Gateways,
-    /// Print this account's public key for receiving shared objects.
-    Whoami,
-    /// Download to a file (default stdout).
-    Get {
-        uri: String,
-        dst: Option<PathBuf>,
-        /// Only bytes START-END (inclusive, like HTTP Range), e.g. `0-1023` or `1048576-`.
-        #[arg(long)]
-        range: Option<String>,
+    /// Print a namespace's access rules.
+    Rules { namespace: Option<String> },
+    /// Add a NEAR Drive session key to your account with near-cli: a
+    /// function-call key limited to the drive contract, kept in near-cli's keychain.
+    Login {
+        /// Gas allowance of the key (it only signs storage requests, not transactions).
+        #[arg(long, default_value = "0.25 NEAR")]
+        allowance: String,
     },
-    /// List objects under a prefix.
-    Ls { uri: String },
-    /// Delete an object.
-    Rm { uri: String },
+    /// Delete the NEAR Drive session key from your account (transaction via near-cli).
+    Logout,
+    /// Create your encryption root key.
+    Keygen {
+        /// Derive it from your NEAR account with MPC Confidential Key
+        /// Derivation (one transaction; the same key on every device).
+        #[arg(long, conflicts_with = "random")]
+        ckd: bool,
+        /// A random key stored only on this machine (back it up).
+        #[arg(long)]
+        random: bool,
+        /// MPC contract (default: the near-cli connection's `mpc_contract_account_id`).
+        #[arg(long)]
+        ckd_contract: Option<String>,
+        /// CKD domain id (default 2).
+        #[arg(long)]
+        ckd_domain: Option<u64>,
+    },
+    /// Publish your X25519 key in the contract so others can share to you (transaction via near-cli).
+    PublishKey,
+    /// Show the account, the key used to sign requests and your sharing key.
+    Whoami,
+    /// List gateways registered in the contract.
+    Gateways,
+    /// Generate an ed25519 key in NEAR credentials format (for dev gateways).
+    DevKey {
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Run a local S3-compatible endpoint (loopback only) backed by NEAR Drive.
     /// boto3 / aws-cli: set endpoint_url=http://127.0.0.1:9000 and the printed keys.
     S3Proxy {
@@ -140,19 +180,35 @@ enum Cmd {
     },
 }
 
+fn menu() -> Vec<interactive::Choice<Cmd>> {
+    vec![
+        choice(Cmd::Ls { uri: None }, "ls          - List your files"),
+        choice(Cmd::Get { uri: None, dst: None, range: None }, "get         - Download a file"),
+        choice(Cmd::Put { src: None, uri: None, public: false, content_type: None, share: vec![], class: None }, "put         - Upload a file"),
+        choice(Cmd::Rm { uri: None }, "rm          - Delete a file"),
+        choice(Cmd::Share { uri: None, recipient: None }, "share       - Give another account access to a file"),
+        choice(Cmd::Grant { uri: None, read: vec![], write: vec![], payer: None }, "grant       - Set who can read/write a folder (onchain rule)"),
+        choice(Cmd::Rules { namespace: None }, "rules       - Show a namespace's access rules"),
+        choice(Cmd::Whoami, "whoami      - Show account, signing key and sharing key"),
+        choice(Cmd::Login { allowance: "0.25 NEAR".into() }, "login       - Add a NEAR Drive session key (via near-cli)"),
+        choice(Cmd::Keygen { ckd: false, random: false, ckd_contract: None, ckd_domain: None }, "keygen      - Create your encryption key"),
+        choice(Cmd::PublishKey, "publish-key - Let others share files with you"),
+        choice(Cmd::Gateways, "gateways    - List registered gateways"),
+        choice(Cmd::Logout, "logout      - Remove the NEAR Drive session key"),
+    ]
+}
+
+struct Ctx {
+    cli: Cli,
+    cfg: NearCliConfig,
+    network: String,
+    network_prompted: bool,
+    account: Option<String>,
+    p: Prompter,
+}
+
 fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).context("HOME not set")
-}
-
-fn near_drive_home(cli: &Cli) -> Result<PathBuf> {
-    match &cli.home {
-        Some(h) => Ok(h.clone()),
-        None => Ok(home_dir()?.join(".near-drive")),
-    }
-}
-
-fn root_key_path(cli: &Cli, account: &str) -> Result<PathBuf> {
-    Ok(near_drive_home(cli)?.join("keys").join(format!("{account}.root")))
 }
 
 fn load_root(path: &PathBuf) -> Result<Option<RootKey>> {
@@ -184,176 +240,505 @@ fn write_private(path: &PathBuf, contents: &str) -> Result<()> {
     Ok(())
 }
 
-fn account(cli: &Cli) -> Result<String> {
-    cli.account.clone().context("--account (or NEAR_DRIVE_ACCOUNT) is required")
+fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
 }
 
-fn rpc_url(cli: &Cli) -> Result<String> {
-    match &cli.rpc_url {
-        Some(u) => Ok(u.clone()),
-        None => near_drive_chain::default_rpc_url(&cli.network)
-            .map(str::to_string)
-            .with_context(|| format!("no default RPC for network {:?}; pass --rpc-url", cli.network)),
+impl Ctx {
+    fn drive_home(&self) -> Result<PathBuf> {
+        match &self.cli.home {
+            Some(h) => Ok(h.clone()),
+            None => Ok(home_dir()?.join(".near-drive")),
+        }
+    }
+
+    fn root_key_path(&self, account: &str) -> Result<PathBuf> {
+        Ok(self.drive_home()?.join("keys").join(format!("{account}.root")))
+    }
+
+    fn conn(&self) -> Result<&nearcli::Connection> {
+        self.cfg.connection(&self.network)
+    }
+
+    fn rpc_url(&self) -> Result<String> {
+        match &self.cli.rpc_url {
+            Some(u) => Ok(u.clone()),
+            None => Ok(self.conn()?.rpc_url.clone()),
+        }
+    }
+
+    fn contract(&self) -> Result<near_drive_chain::StorageContract> {
+        Ok(near_drive_chain::StorageContract::new(self.rpc_url()?, &self.cli.contract))
+    }
+
+    fn near(&self) -> NearCli {
+        NearCli {
+            bin: self.cli.near_bin.clone(),
+            sign: self.cli.near_sign.as_deref().map(nearcli::split_words).unwrap_or_default(),
+            interactive: self.p.enabled,
+        }
+    }
+
+    fn account(&mut self) -> Result<String> {
+        if let Some(a) = &self.account {
+            return Ok(a.clone());
+        }
+        let mut known = self.cfg.legacy_accounts(&self.conn().map(|c| c.network_name.clone()).unwrap_or_default());
+        for a in self.cfg.used_accounts() {
+            if !known.contains(&a) {
+                known.push(a);
+            }
+        }
+        let a = self.p.account(self.cli.account.clone(), known)?;
+        near_drive_client::near_drive_core::uri::validate_account_id(&a).with_context(|| format!("invalid account {a:?}"))?;
+        self.account = Some(a.clone());
+        Ok(a)
+    }
+
+    /// The key that signs gateway requests: `--credentials`, else whatever
+    /// near-cli has for the account (session key preferred).
+    async fn request_key(&mut self) -> Result<(String, SigningKey, Option<nearcli::FoundKey>)> {
+        let account = self.account()?;
+        if let Some(path) = &self.cli.credentials {
+            let (cred_account, sk) = keys::NearCredentials::load(path)?;
+            if cred_account != account {
+                bail!("credentials are for {cred_account}, not {account}");
+            }
+            return Ok((account, sk, None));
+        }
+        let conn = self.conn()?.clone();
+        let found = nearcli::find_request_key(&self.cfg, &conn, &account, &self.cli.contract).await?;
+        Ok((account, found.key.clone(), Some(found)))
+    }
+
+    async fn client(&mut self) -> Result<Client> {
+        let (account, sk, _) = self.request_key().await?;
+        let root = load_root(&self.root_key_path(&account)?)?;
+        if !(1..=64).contains(&self.cli.chunk_mib) {
+            bail!("--chunk-mib must be in 1..=64");
+        }
+        let rpc = self.rpc_url().ok();
+        let gateway = match (self.cli.gateway.as_str(), &rpc) {
+            ("auto", Some(rpc)) => near_drive_client::discover_gateway(rpc, &self.cli.contract).await?,
+            ("auto", None) => bail!("--gateway auto needs --rpc-url"),
+            (g, _) => g.to_string(),
+        };
+        let mut c = Client::new(gateway, account, sk, root);
+        if let Some(rpc) = &rpc {
+            c = c.with_chain(rpc, &self.cli.contract);
+        }
+        c.parallelism = self.cli.parallel.max(1);
+        c.chunk_size = self.cli.chunk_mib * 1024 * 1024;
+        Ok(c)
+    }
+
+    /// After prompting, show the command that does the same without prompts.
+    fn echo(&self, words: &[String]) {
+        if !self.p.used {
+            return;
+        }
+        let mut argv: Vec<String> = Vec::new();
+        if self.cli.network.is_some() || self.network_prompted {
+            argv.extend(["--network".into(), self.network.clone()]);
+        }
+        if let Some(a) = &self.account {
+            argv.extend(["--account".into(), a.clone()]);
+        }
+        if self.cli.gateway != DEFAULT_GATEWAY {
+            argv.extend(["--gateway".into(), self.cli.gateway.clone()]);
+        }
+        if self.cli.contract != DEFAULT_CONTRACT {
+            argv.extend(["--contract".into(), self.cli.contract.clone()]);
+        }
+        argv.extend(words.iter().cloned());
+        let prog = if on_path(&self.cli.near_bin) { "near drive" } else { "near-drive" };
+        eprintln!("\nTo repeat without prompts:\n  {prog} {}\n", nearcli::shell_join(&argv));
+    }
+
+    /// An object URI: given, or typed with a `near://<account>/` start and
+    /// picked from a listing when the answer ends with `/`.
+    async fn object_uri(&mut self, value: Option<String>, msg: &str, c: &Client) -> Result<NearUri> {
+        if let Some(v) = value {
+            return Ok(NearUri::parse(&v)?);
+        }
+        let start = format!("near://{}/", c.account());
+        let mut s = self.p.uri(None, msg, &start, Some("end with / to pick from a listing"))?;
+        while s.ends_with('/') {
+            let prefix = NearUri::parse(&s)?;
+            let entries = c.list(&prefix).await?;
+            if entries.is_empty() {
+                bail!("nothing under {s}");
+            }
+            let opts = entries
+                .iter()
+                .map(|e| choice(format!("near://{}/{}", prefix.namespace, e.path), format!("{:<48} {:>12}", e.path, human(e.size))))
+                .collect();
+            s = self.p.select("Pick a file:", "URI", opts)?;
+        }
+        Ok(NearUri::parse(&s)?)
+    }
+
+    async fn keygen(&mut self, ckd: bool, ckd_contract: Option<String>, ckd_domain: Option<u64>) -> Result<()> {
+        let account = self.account()?;
+        let path = self.root_key_path(&account)?;
+        if path.exists() {
+            bail!("{} already exists; refusing to overwrite", path.display());
+        }
+        if !ckd {
+            write_private(&path, &hex::encode(RootKey::generate().as_bytes()))?;
+            eprintln!("root key written to {} — back it up; losing it loses your encrypted data", path.display());
+            return Ok(());
+        }
+        use near_drive_ckd::{near as ckdnear, CkdRequestArgs, CkdResponse, EphemeralKey, DERIVATION_PATH};
+        let conn = self.conn()?.clone();
+        let rpc = self.rpc_url()?;
+        let contract = ckd_contract
+            .or(conn.mpc_contract_account_id.clone())
+            .with_context(|| format!("near-cli connection {:?} has no mpc_contract_account_id; pass --ckd-contract", self.network))?;
+        let domain = ckd_domain.unwrap_or(2);
+        let mpc_pk = ckdnear::Rpc::new(&rpc).mpc_public_key(&contract, domain).await?;
+        let eph = EphemeralKey::generate();
+        let root = if let Some(cred) = &self.cli.credentials {
+            // Explicit key file: sign here, without near-cli.
+            let (cred_account, key) = keys::NearCredentials::load(cred)?;
+            if cred_account != account {
+                bail!("credentials are for {cred_account}, not {account}");
+            }
+            let net = near_drive_ckd::CkdNetwork { network: conn.network_name.clone(), rpc_url: rpc, contract: contract.clone(), domain_id: domain };
+            ckdnear::request_root_key(&net, &ckdnear::Signer { account_id: account.clone(), key }, DERIVATION_PATH).await?
+        } else {
+            let args: serde_json::Value = serde_json::from_slice(&CkdRequestArgs::new(&eph, DERIVATION_PATH, domain).to_call_args())?;
+            eprintln!("requesting your CKD root key from {contract} (domain {domain}); costs gas + 1 yoctoNEAR and needs a full-access key");
+            let out = self.near().call_capture(&FunctionCall {
+                signer: &account,
+                network: &self.network,
+                contract: &contract,
+                method: ckdnear::METHOD,
+                args: &args,
+                gas_tgas: ckdnear::DEFAULT_GAS / 1_000_000_000_000,
+                deposit_yocto: ckdnear::DEPOSIT_YOCTO,
+            })?;
+            let resp: CkdResponse = serde_json::from_slice(out.trim_ascii()).with_context(|| format!("parsing CKD response from near: {:?}", String::from_utf8_lossy(&out)))?;
+            near_drive_ckd::root_key_from_response(&resp, &eph, &account, DERIVATION_PATH, &mpc_pk)?
+        };
+        write_private(&path, &hex::encode(root.as_bytes()))?;
+        eprintln!("CKD root key cached at {}; `near drive keygen --ckd` recovers it on any device", path.display());
+        Ok(())
+    }
+
+    /// A contract call: near-cli signs, unless `--credentials` was given.
+    async fn transact(&mut self, method: &str, args: serde_json::Value, deposit: u128) -> Result<()> {
+        let account = self.account()?;
+        if let Some(path) = &self.cli.credentials {
+            let signer = near_drive_chain::Signer::from_credentials_file(path)?;
+            if signer.account_id != account {
+                bail!("credentials are for {}, not {account}", signer.account_id);
+            }
+            self.contract()?.rpc.call(&signer, &self.cli.contract, method, &args, CALL_TGAS * near_drive_chain::TGAS, deposit).await?;
+            return Ok(());
+        }
+        self.near().call(&FunctionCall {
+            signer: &account,
+            network: &self.network,
+            contract: &self.cli.contract,
+            method,
+            args: &args,
+            gas_tgas: CALL_TGAS,
+            deposit_yocto: deposit,
+        })
     }
 }
 
-fn contract(cli: &Cli) -> Result<near_drive_chain::StorageContract> {
-    Ok(near_drive_chain::StorageContract::new(rpc_url(cli)?, &cli.contract))
-}
-
-fn credentials_path(cli: &Cli, account: &str) -> Result<PathBuf> {
-    Ok(match &cli.credentials {
-        Some(p) => p.clone(),
-        None => home_dir()?.join(".near-credentials").join(&cli.network).join(format!("{account}.json")),
-    })
-}
-
-async fn client(cli: &Cli) -> Result<Client> {
-    let account = account(cli)?;
-    let (cred_account, sk) = keys::NearCredentials::load(&credentials_path(cli, &account)?)?;
-    if cred_account != account {
-        bail!("credentials are for {cred_account}, not {account}");
+fn human(n: u64) -> String {
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
     }
-    let root = load_root(&root_key_path(cli, &account)?)?;
-    if !(1..=64).contains(&cli.chunk_mib) {
-        bail!("--chunk-mib must be in 1..=64");
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", U[i])
     }
-    let rpc = rpc_url(cli).ok();
-    let gateway = match (cli.gateway.as_str(), &rpc) {
-        ("auto", Some(rpc)) => near_drive_client::discover_gateway(rpc, &cli.contract).await?,
-        ("auto", None) => bail!("--gateway auto needs --rpc-url"),
-        (g, _) => g.to_string(),
-    };
-    let mut c = Client::new(gateway, account, sk, root);
-    if let Some(rpc) = &rpc {
-        c = c.with_chain(rpc, &cli.contract);
-    }
-    c.parallelism = cli.parallel.max(1);
-    c.chunk_size = cli.chunk_mib * 1024 * 1024;
-    Ok(c)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match &cli.cmd {
-        Cmd::Keygen { ckd: true, ckd_contract, ckd_rpc, ckd_domain } => {
-            let account = account(&cli)?;
-            let path = root_key_path(&cli, &account)?;
-            if path.exists() {
-                bail!("{} already exists; refusing to overwrite", path.display());
+    let mut cli = Cli::parse();
+    let interactive = !cli.no_interactive && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let cfg = NearCliConfig::load()?;
+    let mut p = Prompter::new(interactive);
+    let cmd = match cli.cmd.take() {
+        Some(c) => c,
+        None if interactive => p.select("What do you want to do?", "COMMAND", menu())?,
+        None => {
+            Cli::command().print_help()?;
+            std::process::exit(2);
+        }
+    };
+    let (network, network_prompted) = match &cli.network {
+        Some(n) => (n.clone(), false),
+        None if p.used && cfg.connections.len() > 1 => {
+            let mut names: Vec<String> = cfg.connections.keys().cloned().collect();
+            names.sort_by_key(|n| (n != "mainnet", n != "testnet", n.clone()));
+            let n = p.select("Which network (near-cli connection)?", "--network", names.into_iter().map(|n| choice(n.clone(), n)).collect())?;
+            (n, true)
+        }
+        None => ("mainnet".to_string(), false),
+    };
+    let mut ctx = Ctx { account: None, cli, cfg, network, network_prompted, p };
+    run(&mut ctx, cmd).await
+}
+
+async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Ls { uri } => {
+            let c = ctx.client().await?;
+            let uri = match uri {
+                Some(u) => NearUri::parse(&u)?,
+                None => NearUri::parse(&format!("near://{}/", c.account()))?,
+            };
+            ctx.echo(&["ls".into(), uri.to_string()]);
+            for e in c.list(&uri).await? {
+                println!("{:>12}  seq={:<4} {:<24} {}", e.size, e.seq, e.writer, e.path);
             }
-            let net = near_drive_ckd::CkdNetwork::resolve(&cli.network, ckd_contract.clone(), ckd_rpc.clone(), *ckd_domain)?;
-            let (cred_account, key) = keys::NearCredentials::load(&credentials_path(&cli, &account)?)?;
-            if cred_account != account {
-                bail!("credentials are for {cred_account}, not {account}");
-            }
-            eprintln!("requesting CKD root key from {} (domain {}) on {} as {account} (1 yoctoNEAR + gas)…", net.contract, net.domain_id, net.network);
-            let signer = near_drive_ckd::near::Signer { account_id: account.clone(), key };
-            let root = near_drive_ckd::near::request_root_key(&net, &signer, near_drive_ckd::DERIVATION_PATH).await?;
-            write_private(&path, &hex::encode(root.as_bytes()))?;
-            eprintln!("CKD root key cached at {}; rerun `near drive keygen --ckd` on any device to recover it", path.display());
-        }
-        Cmd::Keygen { ckd: false, .. } => {
-            let account = account(&cli)?;
-            let path = root_key_path(&cli, &account)?;
-            write_private(&path, &hex::encode(RootKey::generate().as_bytes()))?;
-            eprintln!("root key written to {} — back it up; losing it loses your encrypted data", path.display());
-        }
-        Cmd::DevKey { out } => {
-            let account = account(&cli)?;
-            let sk = ed25519_dalek_key();
-            let json = serde_json::json!({
-                "account_id": account,
-                "public_key": keys::format_public_key(&sk.verifying_key()),
-                "private_key": keys::format_secret_key(&sk),
-            });
-            write_private(out, &serde_json::to_string_pretty(&json)?)?;
-            println!("{}", keys::format_public_key(&sk.verifying_key()));
-        }
-        Cmd::Put { src, uri, public, content_type, share, class } => {
-            let c = client(&cli).await?;
-            let uri = NearUri::parse(uri)?;
-            let opts = PutOptions { public: *public, content_type: content_type.clone(), share_with: share.clone(), class: class.clone() };
-            // streaming: bounded memory, parallel chunk uploads
-            let rec = if src == "-" { c.put_reader(tokio::io::stdin(), &uri, &opts).await? } else { c.put_file(src, &uri, &opts).await? };
-            eprintln!("{uri} seq={} size={} stored={}", rec.seq, rec.size, rec.stored_size);
         }
         Cmd::Get { uri, dst, range } => {
-            let c = client(&cli).await?;
-            let uri = NearUri::parse(uri)?;
+            let c = ctx.client().await?;
+            let uri = ctx.object_uri(uri, "File to download:", &c).await?;
+            let dst = match dst {
+                Some(d) => Some(d),
+                // Don't dump file bytes into a terminal: ask where to save.
+                None if ctx.p.enabled && std::io::stdout().is_terminal() => {
+                    Some(PathBuf::from(ctx.p.text(None, "Save to:", "DST", Some(&basename(&uri.path)?), None)?))
+                }
+                None => None,
+            };
+            let mut words = vec!["get".to_string(), uri.to_string()];
+            words.extend(dst.as_ref().map(|d| d.display().to_string()));
+            if let Some(r) = &range {
+                words.extend(["--range".into(), r.clone()]);
+            }
+            ctx.echo(&words);
             if let Some(r) = range {
-                let data = c.get_range(&uri, parse_range(r)?).await?;
+                let data = c.get_range(&uri, parse_range(&r)?).await?;
                 match dst {
                     Some(p) => std::fs::write(p, &data)?,
                     None => std::io::stdout().write_all(&data)?,
                 }
             } else {
-                match dst {
-                    Some(p) => c.get_to_file(&uri, p).await.map(|_| ())?,
+                match &dst {
+                    Some(p) => {
+                        c.get_to_file(&uri, p).await?;
+                        if ctx.p.used {
+                            eprintln!("saved {}", p.display());
+                        }
+                    }
                     None => c.get_to_writer(&uri, tokio::io::stdout()).await.map(|_| ())?,
                 }
             }
         }
-        Cmd::Ls { uri } => {
-            let c = client(&cli).await?;
-            for e in c.list(&NearUri::parse(uri)?).await? {
-                println!("{:>12}  seq={:<4} {:<24} {}", e.size, e.seq, e.writer, e.path);
+        Cmd::Put { src, uri, public, content_type, share, class } => {
+            let c = ctx.client().await?;
+            let src = ctx.p.text(src, "File to upload:", "SRC", None, Some("path, or - for stdin"))?;
+            if src != "-" && !std::path::Path::new(&src).is_file() {
+                bail!("{src} is not a file");
             }
+            let prompted_src = ctx.p.used;
+            let uri = match uri {
+                Some(u) => u,
+                None => {
+                    let start = if src == "-" { format!("near://{}/", c.account()) } else { format!("near://{}/{}", c.account(), basename(&src)?) };
+                    ctx.p.uri(None, "Save as:", &start, None)?
+                }
+            };
+            let uri = NearUri::parse(&uri)?;
+            let public = public || (prompted_src && ctx.p.confirm("Store it unencrypted (public)?", false)?);
+            let mut words = vec!["put".to_string(), src.clone(), uri.to_string()];
+            if public {
+                words.push("--public".into());
+            }
+            if let Some(cl) = &class {
+                words.extend(["--class".into(), cl.clone()]);
+            }
+            ctx.echo(&words);
+            let opts = PutOptions { public, content_type, share_with: share, class };
+            // streaming: bounded memory, parallel chunk uploads
+            let rec = if src == "-" { c.put_reader(tokio::io::stdin(), &uri, &opts).await? } else { c.put_file(&src, &uri, &opts).await? };
+            eprintln!("{uri} seq={} size={} stored={}", rec.seq, rec.size, rec.stored_size);
+        }
+        Cmd::Rm { uri } => {
+            let c = ctx.client().await?;
+            let asked = uri.is_none();
+            let uri = ctx.object_uri(uri, "File to delete:", &c).await?;
+            if asked && !ctx.p.confirm(&format!("Delete {uri}?"), false)? {
+                bail!("cancelled");
+            }
+            ctx.echo(&["rm".into(), uri.to_string()]);
+            c.delete(&uri).await?;
         }
         Cmd::Share { uri, recipient } => {
-            let c = client(&cli).await?;
-            let uri = NearUri::parse(uri)?;
-            let rec = if recipient.starts_with("x25519:") {
-                c.share(&uri, recipient).await?
-            } else {
-                c.share_with_account(&uri, recipient).await?
-            };
+            let c = ctx.client().await?;
+            let uri = ctx.object_uri(uri, "File to share:", &c).await?;
+            let recipient = ctx.p.text(recipient, "Share with:", "RECIPIENT", None, Some("an account (bob.near) or an x25519:<base58> key"))?;
+            ctx.echo(&["share".into(), uri.to_string(), recipient.clone()]);
+            let rec = if recipient.starts_with("x25519:") { c.share(&uri, &recipient).await? } else { c.share_with_account(&uri, &recipient).await? };
             eprintln!("shared; seq={}", rec.seq);
         }
-        Cmd::Grant { uri, read, write, payer } => {
-            let c = client(&cli).await?;
-            let uri = NearUri::parse(uri)?;
-            if uri.namespace != c.account() {
-                bail!("you can only set rules for your own namespace ({}), not {}", c.account(), uri.namespace);
+        Cmd::Grant { uri, mut read, mut write, mut payer } => {
+            let account = ctx.account()?;
+            let asked = uri.is_none();
+            let uri = ctx.p.uri(uri, "Folder (prefix) the rule applies to:", &format!("near://{account}/"), Some("{account} matches any account id in that segment"))?;
+            let uri = NearUri::parse(&uri)?;
+            if uri.namespace != account {
+                bail!("you can only set rules for your own namespace ({account}), not {}", uri.namespace);
             }
-            let rule = Rule { prefix: uri.path.clone(), read: read.clone(), write: write.clone(), payer: payer.clone() };
-            let rules = c.grant(rule).await?;
+            if asked {
+                let help = Some("comma-separated accounts; {account} = the account named in the path; empty = only you");
+                read = split_list(&ctx.p.optional_text("Who can read:", help)?.unwrap_or_default());
+                write = split_list(&ctx.p.optional_text("Who can write:", help)?.unwrap_or_default());
+                payer = ctx.p.optional_text("Who pays for storage (empty = you):", None)?;
+            }
+            let rule = Rule { prefix: uri.path.clone(), read, write, payer };
+            let mut words = vec!["grant".to_string(), uri.to_string()];
+            if !rule.read.is_empty() {
+                words.extend(["--read".into(), rule.read.join(",")]);
+            }
+            if !rule.write.is_empty() {
+                words.extend(["--write".into(), rule.write.join(",")]);
+            }
+            if let Some(p) = &rule.payer {
+                words.extend(["--payer".into(), p.clone()]);
+            }
+            ctx.echo(&words);
+            let mut rules = ctx.contract()?.get_rules(&account).await?;
+            near_drive_chain::upsert_rule(&mut rules, rule);
+            let args = serde_json::json!({ "rules": rules });
+            let deposit = near_drive_chain::storage_deposit_for(args.to_string().len());
+            ctx.transact("set_rules", args, deposit).await?;
             println!("{}", serde_json::to_string_pretty(&rules)?);
         }
         Cmd::Rules { namespace } => {
-            let rules = contract(&cli)?.get_rules(namespace).await?;
+            let namespace = match namespace {
+                Some(n) => n,
+                None if ctx.cli.account.is_some() || !ctx.p.enabled => ctx.account()?,
+                None => {
+                    let a = ctx.account()?;
+                    ctx.p.text(None, "Namespace (account):", "NAMESPACE", Some(&a), None)?
+                }
+            };
+            ctx.echo(&["rules".into(), namespace.clone()]);
+            let rules = ctx.contract()?.get_rules(&namespace).await?;
             println!("{}", serde_json::to_string_pretty(&rules)?);
         }
+        Cmd::Login { allowance } => {
+            if ctx.cli.credentials.is_some() {
+                bail!("login adds a key through near-cli; drop --credentials");
+            }
+            let account = ctx.account()?;
+            ctx.echo(&["login".into()]);
+            let conn = ctx.conn()?.clone();
+            if let Ok(found) = nearcli::find_request_key(&ctx.cfg, &conn, &account, &ctx.cli.contract).await {
+                if found.kind == KeyKind::Session {
+                    eprintln!("{account} already has a NEAR Drive session key {} ({})", found.public_key, found.source);
+                    return offer_keygen(ctx, &account).await;
+                }
+            }
+            ctx.near().add_session_key(&account, &ctx.network, &ctx.cli.contract, &allowance)?;
+            let found = nearcli::find_request_key(&ctx.cfg, &conn, &account, &ctx.cli.contract).await?;
+            if found.kind != KeyKind::Session {
+                bail!("the new key is not visible yet (found {} instead); retry `near drive whoami` in a few seconds", found.public_key);
+            }
+            eprintln!("logged in: requests from {account} are signed with {} ({})", found.public_key, found.source);
+            offer_keygen(ctx, &account).await?;
+        }
+        Cmd::Logout => {
+            let account = ctx.account()?;
+            ctx.echo(&["logout".into()]);
+            let conn = ctx.conn()?.clone();
+            let found = nearcli::find_request_key(&ctx.cfg, &conn, &account, &ctx.cli.contract).await?;
+            if found.kind != KeyKind::Session {
+                bail!("{account} has no NEAR Drive session key stored here (found {:?} key {})", found.kind, found.public_key);
+            }
+            ctx.near().delete_key(&account, &ctx.network, &found.public_key)?;
+            eprintln!("deleted {} from {account} (the local copy in {} is now unused)", found.public_key, found.source);
+        }
+        Cmd::Keygen { ckd, random, ckd_contract, ckd_domain } => {
+            ctx.account()?; // ask for the account before the key type
+            let ckd = if ckd || random { ckd } else if ctx.p.enabled { choose_ckd(ctx)? } else { false };
+            let mut words = vec!["keygen".to_string(), if ckd { "--ckd" } else { "--random" }.into()];
+            if let Some(c) = &ckd_contract {
+                words.extend(["--ckd-contract".into(), c.clone()]);
+            }
+            ctx.echo(&words);
+            ctx.keygen(ckd, ckd_contract, ckd_domain).await?;
+        }
         Cmd::PublishKey => {
-            let key = client(&cli).await?.publish_enc_key().await?;
+            let account = ctx.account()?;
+            ctx.echo(&["publish-key".into()]);
+            let root = load_root(&ctx.root_key_path(&account)?)?.context("no root key; run `near drive keygen` first")?;
+            let key = root.x25519_public();
+            ctx.transact("set_enc_key", serde_json::json!({ "key": key }), near_drive_chain::storage_deposit_for(key.len())).await?;
             println!("{key}");
         }
+        Cmd::Whoami => {
+            let (account, sk, found) = ctx.request_key().await?;
+            ctx.echo(&["whoami".into()]);
+            println!("account:  {account} ({})", ctx.network);
+            println!(
+                "near-cli: {} (keys in {})",
+                ctx.cfg.path.as_ref().map_or("no config.toml; built-in networks".into(), |p| p.display().to_string()),
+                ctx.cfg.credentials_home.display()
+            );
+            let pk = keys::format_public_key(&sk.verifying_key());
+            match found {
+                Some(f) => {
+                    let kind = match f.kind {
+                        KeyKind::Session => "NEAR Drive session key",
+                        KeyKind::FullAccess => "full-access key; `near drive login` adds a limited session key",
+                        KeyKind::Unverified => "not checked onchain",
+                    };
+                    println!("signing:  {pk} ({kind}; from {})", f.source);
+                }
+                None => println!("signing:  {pk} (from --credentials)"),
+            }
+            let root_path = ctx.root_key_path(&account)?;
+            match load_root(&root_path)? {
+                Some(r) => println!("x25519:   {}\nroot key: {}", r.x25519_public(), root_path.display()),
+                None => println!("x25519:   (no root key; run `near drive keygen`)"),
+            }
+        }
         Cmd::Gateways => {
-            for g in contract(&cli)?.all_gateways().await? {
+            for g in ctx.contract()?.all_gateways().await? {
                 let state = if g.active { "active" } else { "leaving" };
                 println!("{:<24} {:<7} {:<40} regions={} backends={} {}", g.operator, state, g.url, g.regions.join(","), g.backends.join(","), g.price_hint);
             }
         }
-        Cmd::Whoami => {
-            let c = client(&cli).await?;
-            println!("account: {}", c.account());
-            println!("x25519:  {}", c.x25519_public().unwrap_or_else(|| "(no root key; run `near drive keygen`)".into()));
-        }
-        Cmd::Rm { uri } => {
-            client(&cli).await?.delete(&NearUri::parse(uri)?).await?;
+        Cmd::DevKey { out } => {
+            let account = ctx.account()?;
+            let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+            let json = serde_json::json!({
+                "account_id": account,
+                "public_key": keys::format_public_key(&sk.verifying_key()),
+                "private_key": keys::format_secret_key(&sk),
+            });
+            write_private(&out, &serde_json::to_string_pretty(&json)?)?;
+            println!("{}", keys::format_public_key(&sk.verifying_key()));
         }
         Cmd::S3Proxy { listen, access_key, secret_key, buckets, public_prefixes, max_body_mib, region } => {
             use near_drive_s3::{backend::ClientBackend, credentials, sigv4::Credentials, Proxy, ProxyConfig};
-            near_drive_s3::check_loopback(listen)?;
+            near_drive_s3::check_loopback(&listen)?;
             tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn,near_drive_s3=info".into()))
                 .with_writer(std::io::stderr)
                 .init();
-            let c = client(&cli).await?;
-            let home = near_drive_home(&cli)?;
+            let c = ctx.client().await?;
+            ctx.echo(&["s3-proxy".into()]);
+            let home = ctx.drive_home()?;
             let creds = match (access_key, secret_key) {
-                (Some(a), Some(s)) => Credentials { access_key: a.clone(), secret_key: s.clone() },
+                (Some(a), Some(s)) => Credentials { access_key: a, secret_key: s },
                 _ => {
                     let path = home.join("s3-proxy.json");
                     let (creds, created) = credentials::load_or_create(&path)?;
@@ -372,14 +757,37 @@ async fn main() -> Result<()> {
             }
             let account = c.account().to_string();
             let mut cfg = ProxyConfig::new(creds, home.join("s3-staging"));
-            cfg.extra_buckets = buckets.clone();
-            cfg.public_prefixes = public_prefixes.clone();
+            cfg.extra_buckets = buckets;
+            cfg.public_prefixes = public_prefixes;
             cfg.max_body_bytes = max_body_mib * 1024 * 1024;
-            cfg.region = region.clone();
+            cfg.region = region;
             let proxy = Proxy::new(cfg, ClientBackend::new(c));
             eprintln!("NEAR Drive S3 proxy for {account} on http://{listen} (bucket = namespace, e.g. http://{listen}/{account}/key)");
-            near_drive_s3::run(*listen, proxy).await?;
+            near_drive_s3::run(listen, proxy).await?;
         }
+    }
+    Ok(())
+}
+
+fn choose_ckd(ctx: &mut Ctx) -> Result<bool> {
+    ctx.p.select(
+        "How should your encryption key be created?",
+        "--ckd/--random",
+        vec![
+            choice(true, "Derive from my NEAR account (MPC CKD; same key on every device; one transaction)"),
+            choice(false, "Random key on this machine only (back it up yourself)"),
+        ],
+    )
+}
+
+/// After login: offer to create the root key when there is none.
+async fn offer_keygen(ctx: &mut Ctx, account: &str) -> Result<()> {
+    if ctx.root_key_path(account)?.exists() || !ctx.p.enabled {
+        return Ok(());
+    }
+    if ctx.p.confirm("No encryption key on this machine yet. Create it now?", true)? {
+        let ckd = choose_ckd(ctx)?;
+        ctx.keygen(ckd, None, None).await?;
     }
     Ok(())
 }
@@ -393,8 +801,4 @@ fn parse_range(s: &str) -> Result<std::ops::Range<u64>> {
         bail!("empty range");
     }
     Ok(start..end)
-}
-
-fn ed25519_dalek_key() -> ed25519_dalek::SigningKey {
-    ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
 }

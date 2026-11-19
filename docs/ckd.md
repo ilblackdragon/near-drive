@@ -38,7 +38,11 @@ Status: implemented in `crates/near-drive-ckd` and `near drive keygen --ckd`. It
   6. decode `SuccessValue`, then decrypt and verify.
 
   The borsh bytes are checked byte-for-byte against `@near-js/transactions`.
-- `near drive keygen --ckd [--network testnet] [--ckd-contract C] [--ckd-rpc URL] [--ckd-domain N]` writes the derived key to the same `~/.near-drive/keys/<account>.root` cache as the local fallback, so nothing downstream changes. Running it again on another device recovers the same key.
+- `near drive keygen --ckd [--network testnet] [--ckd-contract C] [--ckd-domain N]` sends the request through
+  near-cli (`near --quiet contract call-function as-transaction <mpc> request_app_private_key ...`; near-cli asks for
+  the signer and prints the `CKDResponse` on stdout), then decrypts and verifies it locally. The MPC contract and RPC
+  come from the near-cli connection (`mpc_contract_account_id`, `rpc_url`). With `--credentials <file>` it uses the
+  hand-built transaction above instead. Either way it writes the derived key to the same `~/.near-drive/keys/<account>.root` cache as the local fallback, so nothing downstream changes. Running it again on another device recovers the same key.
 
 ## Caveats
 

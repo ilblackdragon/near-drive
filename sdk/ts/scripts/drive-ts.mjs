@@ -23,7 +23,7 @@ process.on("unhandledRejection", (e) => {
 });
 const c = await clientFromFiles({
   gateway: env.NEAR_DRIVE_GATEWAY ?? "http://127.0.0.1:8787",
-  credentials: env.NEAR_DRIVE_CREDENTIALS ?? defaultCredentialsPath(account, env.NEAR_NETWORK ?? "mainnet"),
+  credentials: env.NEAR_DRIVE_CREDENTIALS ?? defaultCredentialsPath(account, env.NEAR_DRIVE_NETWORK ?? env.NEAR_NETWORK ?? "mainnet"),
   rootKey: defaultRootKeyPath(account),
 });
 if (c.accountId !== account) throw new Error(`credentials are for ${c.accountId}, not ${account}`);

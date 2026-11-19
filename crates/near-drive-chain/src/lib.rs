@@ -12,7 +12,7 @@ pub mod tx;
 
 use anyhow::Result;
 use near_drive_core::policy::Rule;
-pub use rpc::{default_rpc_url, CallOutcome, NearRpc, NoContract, Signer, ONE_NEAR, STORAGE_BYTE_COST, TGAS};
+pub use rpc::{default_rpc_url, CallOutcome, KeyPermission, NearRpc, NoContract, Signer, ONE_NEAR, STORAGE_BYTE_COST, TGAS};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
