@@ -1,4 +1,5 @@
 //! nstorage gateway: stateless HTTP front for the index store and blob backends.
+pub mod billing;
 pub mod bridge;
 pub mod cache;
 pub mod keys;
@@ -53,6 +54,9 @@ pub struct Config {
     /// Blob backends, storage classes, index store, chunk cache (see README).
     #[serde(default)]
     pub storage: StorageConfig,
+    /// NEAR AI Cloud credits billing (metering, reporting, credit gate). Off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<billing::BillingConfig>,
 }
 
 impl Default for Config {
@@ -65,6 +69,7 @@ impl Default for Config {
             dev_keys: HashMap::new(),
             policies: HashMap::new(),
             storage: StorageConfig::default(),
+            billing: None,
         }
     }
 }
@@ -79,13 +84,23 @@ pub struct AppState {
     pub index: Arc<dyn IndexStore>,
     pub keys: keys::KeyResolver,
     pub usage: usage::UsageSink,
+    pub billing: Option<Arc<billing::Billing>>,
     replay: Mutex<HashMap<String, Instant>>,
 }
 
 impl AppState {
     pub async fn new(cfg: Config) -> anyhow::Result<Arc<Self>> {
         tokio::fs::create_dir_all(&cfg.data_dir).await?;
+        let billing = match &cfg.billing {
+            Some(b) => {
+                let b = Arc::new(billing::Billing::open(b, &cfg.data_dir)?);
+                b.spawn();
+                Some(b)
+            }
+            None => None,
+        };
         Ok(Arc::new(Self {
+            billing,
             blobs: Placement::from_config(&cfg.storage, &cfg.data_dir)?,
             index: cfg.storage.index.build(&cfg.data_dir)?,
             keys: keys::KeyResolver::new(cfg.rpc_url.clone(), cfg.storage_contract.clone(), cfg.dev_keys.clone()),
@@ -110,23 +125,34 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(StatusCode, String, Option<serde_json::Value>);
+
+impl ApiError {
+    /// Error with extra top-level JSON fields (an object) besides `error`.
+    pub fn with(code: StatusCode, msg: impl Into<String>, extra: serde_json::Value) -> Self {
+        ApiError(code, msg.into(), Some(extra))
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({"error": self.1}))).into_response()
+        let mut body = json!({"error": self.1});
+        if let Some(serde_json::Value::Object(extra)) = self.2 {
+            body.as_object_mut().unwrap().extend(extra);
+        }
+        (self.0, Json(body)).into_response()
     }
 }
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
         tracing::error!("internal error: {e:#}");
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal error".into(), None)
     }
 }
 
 fn err(code: StatusCode, msg: impl Into<String>) -> ApiError {
-    ApiError(code, msg.into())
+    ApiError(code, msg.into(), None)
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -192,6 +218,7 @@ async fn put_chunk(
     if !policy::can_write_somewhere(&ns, st.rules(&ns), &signer.account) {
         return Err(err(StatusCode::FORBIDDEN, "no write access to namespace"));
     }
+    billing::check_chunk(st.billing.as_deref(), &ns, st.rules(&ns), &signer.account).await?;
     if !nstorage_core::is_valid_cid(&cid) || nstorage_core::cid(&body) != cid {
         return Err(err(StatusCode::BAD_REQUEST, "cid does not match content"));
     }
@@ -247,6 +274,10 @@ async fn put_object(
         return Err(err(StatusCode::BAD_REQUEST, format!("chunk {missing} not uploaded")));
     }
     let prev = st.index.get(&ns, &path).await?;
+    // Writes that grow the payer's storage need credit; shrinking or replacing in place does not.
+    if rec.stored_size > prev.as_ref().map(|p| p.stored_size).unwrap_or(0) {
+        billing::check(st.billing.as_deref(), &access.payer).await?;
+    }
     match st.index.cas_put(&rec).await {
         Ok(()) => {}
         Err(CasError::Conflict { current }) => {
@@ -302,9 +333,20 @@ async fn get_object(
     let rec = st.index.get(&ns, &path).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "not found"))?;
     let (manifest, _) = load_manifest(&st, &rec.manifest_cid).await?;
     match q.chunk {
-        None if q.mode.as_deref() == Some("locate") => Ok(Json(locate::locate(&st, rec, manifest).await?).into_response()),
+        None if q.mode.as_deref() == Some("locate") => {
+            billing::check(st.billing.as_deref(), &access.payer).await?;
+            let located = locate::locate(&st, rec, manifest).await?;
+            // Chunks handed out as direct URLs bypass the gateway; meter them as
+            // egress here (an upper bound: the client may fetch fewer bytes).
+            let direct: u64 = located.chunks.iter().filter(|c| c.url.is_some()).map(|c| c.len).sum();
+            if direct > 0 {
+                st.usage.record(usage::Event::egress(&ns, &path, &signer.account, &access.payer, direct)).await;
+            }
+            Ok(Json(located).into_response())
+        }
         None => Ok(Json(json!({"record": rec, "manifest": manifest})).into_response()),
         Some(cid) => {
+            billing::check(st.billing.as_deref(), &access.payer).await?;
             let len = if cid == rec.manifest_cid {
                 None
             } else {

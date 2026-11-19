@@ -136,7 +136,9 @@ async fn classes_and_direct_urls() {
     let before = egress_events(&s.gw);
     alice.get_to_file(&bulk, tmp.path().join("bulk.out")).await.unwrap();
     assert_eq!(hash_file(&tmp.path().join("bulk.out")), h);
-    assert_eq!(egress_events(&s.gw), before, "all chunks fetched directly from the bridge");
+    // No chunk went through the gateway; the one egress event is the locate
+    // response, which meters the bytes handed out as direct URLs.
+    assert_eq!(egress_events(&s.gw), before + 1, "all chunks fetched directly from the bridge");
     let r = alice.get_range(&bulk, 100_000..300_000).await.unwrap();
     assert_eq!(r, std::fs::read(&src).unwrap()[100_000..300_000]);
 
