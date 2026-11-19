@@ -126,10 +126,6 @@ pub struct Client {
     pub chunk_size: usize,
     /// Concurrent chunk transfers for put_file / put_reader / get_to_file / get_range.
     pub parallelism: usize,
-    /// Last request timestamp; keeps timestamps strictly increasing so two
-    /// identical concurrent requests never produce the same signature (the
-    /// gateway's replay cache would reject the second one).
-    last_ts: AtomicU64,
     /// `drive.near` access for sharing-by-account and policy grants.
     chain: Option<near_drive_chain::StorageContract>,
     net: NetConfig,
@@ -140,6 +136,12 @@ pub(crate) fn debug(msg: &str) {
         eprintln!("near-drive: {msg}");
     }
 }
+
+/// Last request timestamp, process-wide: timestamps strictly increase across
+/// every client in the process, so two identical concurrent requests (even
+/// from two clients with the same key) never produce the same signature,
+/// which the gateway's replay cache would reject.
+static LAST_TS: AtomicU64 = AtomicU64::new(0);
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
@@ -170,18 +172,17 @@ impl Client {
             root,
             chunk_size: DEFAULT_CHUNK_SIZE,
             parallelism: DEFAULT_PARALLELISM,
-            last_ts: AtomicU64::new(0),
             chain: None,
         }
     }
 
     fn next_ts(&self) -> u64 {
         let now = now_ms();
-        let prev = self.last_ts.fetch_max(now, Ordering::SeqCst);
+        let prev = LAST_TS.fetch_max(now, Ordering::SeqCst);
         if prev < now {
             return now;
         }
-        self.last_ts.fetch_add(1, Ordering::SeqCst) + 1
+        LAST_TS.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     pub fn account(&self) -> &str {

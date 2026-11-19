@@ -1,6 +1,8 @@
-export { Client, DEFAULT_CHUNK_SIZE, GatewayError, keySigner, verifyHead } from "./client.js";
-export type { ClientOptions, ListEntry, ObjectHead, PutOptions, Signer } from "./client.js";
-export { ALG, TAG_LEN, RootKey, addRecipient, decryptObject, encryptFor, encryptObject, plaintextChunks } from "./crypto.js";
+export { CLASS_HEADER, Client, ConflictError, DEFAULT_CHUNK_SIZE, DEFAULT_PARALLELISM, GatewayError, keySigner, mapLimit, verifyHead } from "./client.js";
+export type { ClientOptions, ListEntry, Located, LocatedChunk, ObjectHead, PutOptions, Signer } from "./client.js";
+export { DEFAULT_NET, retryDelay, timeoutFor } from "./net.js";
+export type { NetConfig } from "./net.js";
+export { ALG, TAG_LEN, ChunkOpener, ChunkSealer, RootKey, addRecipient, chunkCount, chunkPlainLen, decryptObject, encryptFor, encryptObject, plaintextChunks } from "./crypto.js";
 export type { EncInfo, Recipient, WrappedKey } from "./crypto.js";
 export { MAX_CHUNK_BYTES, manifestCid, manifestToBytes, manifestToJson, normalizeManifest, parseManifest, storedSize, validateManifest } from "./manifest.js";
 export type { ChunkRef, Manifest } from "./manifest.js";

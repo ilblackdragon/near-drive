@@ -156,6 +156,13 @@ pub fn conflicted_name(rel: &str, host: &str, now: chrono::DateTime<chrono::Loca
     format!("{dir}{stem} (conflicted copy from {host} {}){ext}", now.format("%Y-%m-%d %H%M%S"))
 }
 
+/// Local time, as used in conflicted-copy names.
+pub type Now = chrono::DateTime<chrono::Local>;
+
+pub fn now() -> Now {
+    chrono::Local::now()
+}
+
 pub fn host_name() -> String {
     for v in ["NEAR_DRIVE_DEVICE_NAME", "COMPUTERNAME", "HOSTNAME"] {
         if let Ok(h) = std::env::var(v) {

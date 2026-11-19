@@ -67,6 +67,41 @@ app.put("near://app.near/users/bob.near/chat/0001.json", message,
 msg = bob.get("near://app.near/users/bob.near/chat/0001.json")
 ```
 
+### Large files, bad networks and resuming
+
+```python
+from near_drive import Client, NetConfig, Conflict, TransferInterrupted
+
+client = Client(gateway, account, sk, root,
+                net=NetConfig(attempts=8, base_delay=0.25, max_delay=30.0),   # the defaults
+                parallelism=8)                                                 # chunk transfers in flight
+
+# Stream a file up / down with bounded memory (about (parallelism + 2) x chunk_size).
+client.put_file("model.bin", "near://alice.near/models/v1.bin", resume_dir="~/.cache/drive-journal")
+client.get_to_file("near://alice.near/models/v1.bin", "model.bin")
+part = client.get_range("near://alice.near/models/v1.bin", 0, 1 << 20)   # only the chunks covering the range
+```
+
+- Every request has a deadline of `30 s + size / 64 KiB/s` (plus 10 s connect and 60 s idle timeouts) and is
+  retried on connection errors, timeouts, truncated bodies, chunks whose bytes don't match their id, 5xx, 408
+  and 429, with full-jitter exponential backoff (250 ms doubling, capped at 30 s), honouring `Retry-After`;
+  8 attempts. Each attempt is signed afresh. Tune with `NetConfig` (`Client(net=...)` or `client.set_net(...)`).
+- The record write is a compare-and-swap: if its response is lost, the client checks whether the current
+  version is its own write before retrying, so a retry never produces a spurious extra version. Deletes are
+  retried the same way.
+- Conditional writes: `put(..., expect_seq=n)` / `put_file(..., expect_seq=n)` (0 = must not exist) and
+  `delete_if(uri, seq)` raise `Conflict` (with `.current`, the seq now) instead of overwriting a newer version.
+- `get_to_file` writes `{file}.drive-part` + `{file}.drive-part.json`. If it raises `TransferInterrupted`,
+  run it again: chunks already on disk are verified (their id re-derived from the bytes) and only the missing
+  ones are fetched. A newer version of the object starts over.
+- `put_file(..., resume_dir=...)` keeps a journal (same format as the Rust client). Rerunning after
+  `TransferInterrupted` reuses the object key so stored chunks are skipped; if the file changed meanwhile, the
+  upload restarts with a fresh key (a nonce is never reused for different bytes). Resuming an encrypted upload
+  needs the owner's root key.
+- Small objects are read in one request (the gateway inlines their chunks in `?mode=locate`; still verified).
+- `storage_class="bulk"` (or another class the gateway defines) applies to the chunks and is recorded with the
+  object; `share` keeps it.
+
 ### Custom signers
 
 `signer` may be any object with a `public_key` attribute (`ed25519:<base58>`) and a
@@ -81,8 +116,10 @@ msg = bob.get("near://app.near/users/bob.near/chat/0001.json")
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install -e '.[test]'
-.venv/bin/pytest -q                 # Rust test vectors (../../testvectors) + unit tests
+.venv/bin/pytest -q                 # test vectors, unit tests, resilience tests (fake gateway, and the
+                                    # real ../../target/debug/near-drive-gateway on 127.0.0.1 when built)
 ../../testvectors/interop.sh        # Rust <-> TS <-> Python against a live local gateway
 ```
 
-Objects are buffered in memory (chunked at 4 MiB by default; `chunk_size` argument).
+`put` / `get` buffer the object in memory; `put_file` / `get_to_file` / `get_to_writer` stream it
+(chunked at 4 MiB by default; `chunk_size` argument).

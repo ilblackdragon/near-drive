@@ -24,8 +24,9 @@ End-to-end encrypted files at `near://alice.near/path`, shared by account name, 
   stay in near-cli. Your encryption key can be re-derived from your account on any device.
 - 🤝 **Share by account name.** `near drive share report.pdf bob.near`. Folder-level rules ("each user reads and
   writes their own folder, the app pays") live onchain.
-- 📁 **Dropbox-style sync** on Linux, macOS and Windows, plus a CLI, an S3-compatible endpoint for existing tools, and
-  Rust / TypeScript / Python SDKs.
+- 📁 **Dropbox-style sync and files on demand** on Linux, macOS and Windows: a synced folder (selective, with a
+  tray icon), or a mounted drive where files download only when opened. Plus a CLI, an S3-compatible endpoint for
+  existing tools, and Rust / TypeScript / Python SDKs.
 - 🌐 **No single operator.** Gateways are stateless and anyone can run one; storage sits on S3 / R2, Filecoin or
   Shelby behind them, and you never have to pick.
 - 🏋️ **Built for big files too.** Parallel, resumable transfers, byte-range reads and direct downloads for model
@@ -66,6 +67,7 @@ your NEAR keys).
 ```sh
 cargo install near-cli-rs                                                       # if you don't have `near` yet
 cargo install --git https://github.com/ilblackdragon/near-drive near-drive-cli    # installs `near-drive`
+cargo install --git https://github.com/ilblackdragon/near-drive near-drive-tray   # optional: tray / menu-bar icon
 ```
 
 Once `near-drive` is on your `PATH`, it also runs as a near-cli subcommand: `near drive ...`.
@@ -99,8 +101,18 @@ near drive up                           # keep it in sync in the background
 near drive sync status
 ```
 
-Edits sync both ways, conflicts keep both copies, deletes from other devices go to a local trash, and edits made
-offline go up when you're back online. Details: [docs/sync.md](docs/sync.md).
+Edits sync both ways (changes elsewhere arrive within seconds), conflicts keep both copies, deletes from other
+devices go to a local trash, and edits made offline go up when you're back online. Leave subfolders out with
+`sync exclude`. `near-drive-tray` puts the status and your folders in the system tray / menu bar.
+Details: [docs/sync.md](docs/sync.md).
+
+Rather not download everything? Mount it instead; files download when opened:
+
+```sh
+near drive mount ~/NEAR\ Drive           # Linux (FUSE), macOS (macFUSE / FUSE-T), Windows (Cloud Files, like OneDrive)
+```
+
+Details: [docs/mount.md](docs/mount.md).
 
 ## Use it from S3 apps
 
@@ -140,6 +152,7 @@ All three SDKs read and write the same format and use the same keys as the CLI.
 |---|---|
 | [docs/cli.md](docs/cli.md) | every command, paths, keys and near-cli, sharing and access rules, large files |
 | [docs/sync.md](docs/sync.md) | synced folders: behaviour, conflicts, deletes, file names |
+| [docs/mount.md](docs/mount.md) | files on demand (`near drive mount`) |
 | [docs/s3.md](docs/s3.md) | the S3-compatible endpoint |
 | [docs/gateway.md](docs/gateway.md) | running a gateway: storage backends, classes, caches, billing |
 | [docs/contract.md](docs/contract.md) | the `drive.near` contract |

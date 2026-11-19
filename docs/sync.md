@@ -37,6 +37,8 @@ near drive sync exclude ~/NearDrive Videos    # selective sync: leave a subfolde
   folders: `~/.near-drive/sync.json`. The background service re-reads it, so `sync add` / `remove` take effect within
   seconds. Log: `~/.near-drive/daemon.log`.
 
+For files that download only when opened, use [`near drive mount`](mount.md) instead.
+
 ## Selective sync
 
 `sync exclude <folder> <subfolder>` leaves a subfolder out in both directions: its remote files are not downloaded,

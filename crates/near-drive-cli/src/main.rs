@@ -200,6 +200,20 @@ enum Cmd {
     },
     /// Stop the background service started by `up`.
     Down,
+    /// Mount a NEAR Drive folder as a drive: everything is listed, files
+    /// download when opened and upload when closed (Linux; macOS with
+    /// macFUSE / FUSE-T). Runs until Ctrl-C.
+    Mount {
+        /// Empty local folder to mount on.
+        mountpoint: Option<PathBuf>,
+        /// NEAR Drive folder (default `Drive/` in your namespace).
+        remote: Option<String>,
+        #[arg(long)]
+        read_only: bool,
+        /// Local cache for opened files, in MiB.
+        #[arg(long, default_value_t = 10240)]
+        cache_mib: u64,
+    },
     /// Keep local folders in sync with NEAR Drive (like Dropbox).
     Sync {
         #[command(subcommand)]
@@ -228,7 +242,11 @@ enum SyncCmd {
     /// Stop syncing a folder (its files stay).
     Remove { dir: Option<PathBuf> },
     /// Synced folders, last sync, conflicts and errors.
-    Status,
+    Status {
+        /// Machine-readable (used by the tray app).
+        #[arg(long)]
+        json: bool,
+    },
     /// Selective sync: stop syncing a subfolder (e.g. `Videos`) of a synced folder.
     Exclude { dir: PathBuf, subfolder: String },
     /// Sync a previously excluded subfolder again.
@@ -260,7 +278,7 @@ fn menu() -> Vec<interactive::Choice<Cmd>> {
         choice(Cmd::PublishKey, "publish-key - Let others share files with you"),
         choice(Cmd::Gateways, "gateways    - List registered gateways"),
         choice(Cmd::Sync { action: Some(SyncCmd::Add { dir: None, remote: None }) }, "sync add    - Keep a local folder in sync (like Dropbox)"),
-        choice(Cmd::Sync { action: Some(SyncCmd::Status) }, "sync status - Synced folders and their state"),
+        choice(Cmd::Sync { action: Some(SyncCmd::Status { json: false }) }, "sync status - Synced folders and their state"),
         choice(Cmd::Up { proxy: ProxyArgs::default(), no_s3: false }, "up          - Start syncing + the local S3 endpoint (background)"),
         choice(Cmd::Down, "down        - Stop the local S3 endpoint"),
         choice(Cmd::Logout, "logout      - Remove the NEAR Drive session key"),
@@ -836,7 +854,7 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
                     "SUBCOMMAND",
                     vec![
                         choice(SyncCmd::Add { dir: None, remote: None }, "add    - Sync a local folder"),
-                        choice(SyncCmd::Status, "status - Synced folders and their state"),
+                        choice(SyncCmd::Status { json: false }, "status - Synced folders and their state"),
                         choice(SyncCmd::Run { dir: None, remote: None, watch: false, exclude: vec![] }, "run    - Sync a folder now"),
                         choice(SyncCmd::Remove { dir: None }, "remove - Stop syncing a folder"),
                     ],
@@ -862,7 +880,8 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
                     let dir = PathBuf::from(ctx.p.text(dir.map(|d| d.display().to_string()), "Folder to stop syncing:", "DIR", None, None)?);
                     syncs::remove(ctx, dir)?;
                 }
-                SyncCmd::Status => syncs::status(ctx)?,
+                SyncCmd::Status { json: false } => syncs::status(ctx)?,
+                SyncCmd::Status { json: true } => syncs::status_json(ctx)?,
                 SyncCmd::Exclude { dir, subfolder } => syncs::set_excluded(ctx, dir, &subfolder, true)?,
                 SyncCmd::Include { dir, subfolder } => syncs::set_excluded(ctx, dir, &subfolder, false)?,
                 SyncCmd::Run { dir, remote, watch, exclude } => {
@@ -872,6 +891,36 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             }
         }
         Cmd::Up { proxy, no_s3 } => daemon::up(ctx, proxy, no_s3).await?,
+        Cmd::Mount { mountpoint, remote, read_only, cache_mib } => {
+            if !near_drive_mount::SUPPORTED {
+                bail!("{}", if cfg!(target_os = "macos") {
+                    "this build has no mount support: install macFUSE or FUSE-T and build with `--features macfuse` (or use `near drive sync`)"
+                } else {
+                    "mounting is not available on this platform; use `near drive sync add <folder>` instead"
+                });
+            }
+            let account = ctx.account()?;
+            let default_mp = home_dir().map(|h| h.join("NEAR Drive").display().to_string()).unwrap_or_else(|_| "NEAR Drive".into());
+            let mp = PathBuf::from(ctx.p.text(mountpoint.map(|d| d.display().to_string()), "Mount at:", "MOUNTPOINT", Some(&default_mp), Some("an empty folder; created if missing"))?);
+            let remote = syncs::remote_prefix(remote.as_deref(), &account)?;
+            ctx.echo(&["mount".into(), mp.display().to_string(), remote.to_string()]);
+            std::fs::create_dir_all(&mp)?;
+            // FUSE mounts over the folder, hiding what's there; on Windows the
+            // folder itself holds the placeholders, so reconnecting is fine.
+            if cfg!(unix) && std::fs::read_dir(&mp)?.next().is_some() {
+                bail!("{} is not empty", mp.display());
+            }
+            syncs::init_tracing();
+            let c = std::sync::Arc::new(ctx.client().await?);
+            let mut opts = near_drive_mount::MountOptions::new(ctx.drive_home()?.join("cache").join(&account));
+            opts.read_only = read_only;
+            opts.cache_max_bytes = cache_mib << 20;
+            let m = near_drive_mount::mount(c, remote.clone(), &mp, opts, tokio::runtime::Handle::current())?;
+            eprintln!("{remote} mounted at {} (files download when opened). Ctrl-C to {}.", mp.display(), if cfg!(windows) { "disconnect" } else { "unmount" });
+            tokio::signal::ctrl_c().await?;
+            tokio::task::spawn_blocking(move || m.unmount()).await??;
+            eprintln!("unmounted {}", mp.display());
+        }
         Cmd::Down => {
             ctx.echo(&["down".into()]);
             daemon::down(&ctx.drive_home()?)?;

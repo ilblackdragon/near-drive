@@ -162,6 +162,37 @@ pub fn status(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// `sync status --json`: everything the tray shows, no network calls.
+pub fn status_json(ctx: &Ctx) -> Result<()> {
+    let home = ctx.drive_home()?;
+    let cfg = SyncConfig::load(&home)?;
+    let service = crate::daemon::service(&home);
+    let folders: Vec<serde_json::Value> = cfg
+        .folders
+        .iter()
+        .map(|f| {
+            let st = near_drive_sync::read_status(&f.local);
+            serde_json::json!({
+                "local": f.local, "remote": f.remote, "account": f.account, "network": f.network, "exclude": f.exclude,
+                "last_pass_ms": st.as_ref().map(|s| s.last_pass_ms),
+                "ok": st.as_ref().map(|s| s.ok),
+                "error": st.as_ref().and_then(|s| s.error.clone()).or_else(|| st.as_ref().and_then(|s| s.report.errors.first().map(|(p, e)| format!("{p}: {e}")))),
+                "pending": st.as_ref().is_some_and(|s| s.report.pending),
+                "conflicts": st.as_ref().map(|s| s.report.conflicts.clone()).unwrap_or_default(),
+                "summary": st.as_ref().map(|s| s.report.summary()),
+            })
+        })
+        .collect();
+    let out = serde_json::json!({
+        "running": service.is_some(),
+        "service": service.map(|(account, network)| serde_json::json!({"account": account, "network": network})),
+        "log": home.join("daemon.log"),
+        "folders": folders,
+    });
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }

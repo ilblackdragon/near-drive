@@ -41,6 +41,20 @@ def _opt_str(v: Any, what: str) -> Optional[str]:
     return None if v is None else _str(v, what)
 
 
+def enc_from_dict(e: Any) -> Optional[EncInfo]:
+    """Parse a manifest's ``enc`` (None/missing -> None)."""
+    if e is None:
+        return None
+    if not isinstance(e, dict) or not isinstance(e.get("wrapped_keys"), list):
+        raise ValueError("manifest: bad enc")
+    wks = []
+    for w in e["wrapped_keys"]:
+        if not isinstance(w, dict):
+            raise ValueError("manifest: wrapped key must be an object")
+        wks.append(WrappedKey(_str(w.get("recipient"), "recipient"), _str(w.get("nonce"), "nonce"), _str(w.get("ct"), "ct"), _opt_str(w.get("epk"), "epk")))
+    return EncInfo(_str(e.get("alg"), "alg"), _str(e.get("object_id"), "object_id"), _str(e.get("nonce_prefix"), "nonce_prefix"), wks)
+
+
 @dataclass
 class ChunkRef:
     cid: str
@@ -98,17 +112,7 @@ class Manifest:
             if not isinstance(c, dict):
                 raise ValueError("manifest: chunk must be an object")
             refs.append(ChunkRef(_str(c.get("cid"), "cid"), _u64(c.get("len"), "len")))
-        enc = None
-        e = v.get("enc")
-        if e is not None:
-            if not isinstance(e, dict) or not isinstance(e.get("wrapped_keys"), list):
-                raise ValueError("manifest: bad enc")
-            wks = []
-            for w in e["wrapped_keys"]:
-                if not isinstance(w, dict):
-                    raise ValueError("manifest: wrapped key must be an object")
-                wks.append(WrappedKey(_str(w.get("recipient"), "recipient"), _str(w.get("nonce"), "nonce"), _str(w.get("ct"), "ct"), _opt_str(w.get("epk"), "epk")))
-            enc = EncInfo(_str(e.get("alg"), "alg"), _str(e.get("object_id"), "object_id"), _str(e.get("nonce_prefix"), "nonce_prefix"), wks)
+        enc = enc_from_dict(v.get("enc"))
         return cls(
             _u64(v.get("version"), "version"),
             _u64(v.get("size"), "size"),

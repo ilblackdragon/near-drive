@@ -26,6 +26,11 @@ fn read_state(home: &Path) -> Option<State> {
     serde_json::from_slice(&std::fs::read(state_path(home)).ok()?).ok()
 }
 
+/// The running service's account and network.
+pub fn service(home: &Path) -> Option<(String, String)> {
+    read_state(home).filter(|s| alive(s.pid)).map(|s| (s.account, s.network))
+}
+
 /// Is the background service up?
 pub fn running(home: &Path) -> bool {
     read_state(home).is_some_and(|s| alive(s.pid))

@@ -24,6 +24,7 @@ Run `near drive --help` or `near drive <command> --help` for every flag.
 | `rules [account]` | show an account's rules |
 | `publish-key` | publish your sharing key onchain so others can share to you by account name |
 | `sync add/remove/status/run/exclude/include` | keep local folders in sync, selectively ([sync.md](sync.md)) |
+| `mount <folder> [remote]` | files on demand: everything listed, downloaded when opened ([mount.md](mount.md)) |
 | `up` / `down` | start / stop the background service: synced folders + local S3 endpoint ([s3.md](s3.md)) |
 | `s3-proxy` | the S3 endpoint in the foreground (containers, systemd) |
 | `gateways` | gateways registered onchain |

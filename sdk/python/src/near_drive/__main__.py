@@ -54,15 +54,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"account: {account}")
             print(f"x25519:  {c.x25519_public() or '(no root key; run keygen)'}")
         elif a.cmd == "put":
-            data = sys.stdin.buffer.read() if a.src == "-" else open(a.src, "rb").read()
-            r = c.put(a.uri, data, public=a.public, content_type=a.content_type, share_with=a.share)
+            if a.src == "-":
+                r = c.put(a.uri, sys.stdin.buffer.read(), public=a.public, content_type=a.content_type, share_with=a.share)
+            else:
+                r = c.put_file(a.src, a.uri, public=a.public, content_type=a.content_type, share_with=a.share)
             print(f"{NearUri.parse(a.uri)} seq={r.seq} size={r.size} stored={r.stored_size}", file=sys.stderr)
         elif a.cmd == "get":
-            data = c.get(a.uri)
             if a.dst:
-                open(a.dst, "wb").write(data)
+                c.get_to_file(a.uri, a.dst)
             else:
-                sys.stdout.buffer.write(data)
+                c.get_to_writer(a.uri, sys.stdout.buffer)
         elif a.cmd == "ls":
             for e in c.list(a.uri):
                 print(f"{e.size:>12}  seq={e.seq:<4} {e.writer:<24} {e.path}")

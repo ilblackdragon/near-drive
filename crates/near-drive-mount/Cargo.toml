@@ -1,0 +1,38 @@
+[package]
+name = "near-drive-mount"
+description = "NEAR Drive as a mounted drive with files on demand (FUSE: Linux; macOS with macFUSE / FUSE-T)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# macOS: needs macFUSE (or FUSE-T's libfuse) installed to build and run.
+macfuse = ["dep:fuser"]
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+near-drive-client.workspace = true
+near-drive-sync.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18", default-features = false }
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.18", optional = true }
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+cloud-filter = "0.0.7"
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+near-drive-gateway.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+axum.workspace = true

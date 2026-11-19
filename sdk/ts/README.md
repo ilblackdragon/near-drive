@@ -90,12 +90,49 @@ await putFile(c, "./model.bin", "near://alice.near/weights/model.bin");
 await getFile(c, "near://alice.near/weights/model.bin", "./copy.bin");
 ```
 
+## Bad networks and resuming
+
+Every request has a deadline (`30 s + size / 64 KiB/s`) and an idle timeout (60 s without response
+bytes). Transient failures (network errors, timeouts, truncated bodies, chunks whose bytes don't match
+their id, 5xx, 408, 429) are retried with full-jitter exponential backoff (250 ms doubling, capped at
+30 s, `Retry-After` honoured), 8 attempts, each signed afresh. Tune it per client:
+
+```ts
+const client = new Client({ gateway, accountId, signer, rootKey, net: { attempts: 4, baseTimeoutMs: 10_000 } });
+client.setNet({ attempts: 1 });   // fail fast
+```
+
+- The record commit is a compare-and-swap. If its response is lost, the client checks whether the
+  current version is its own write before retrying, so a write lands exactly once. Deletes likewise
+  (a 404 after a failed attempt means it was already deleted).
+- Conditional writes: `put(uri, data, { expectSeq: n })` (0 = must not exist) and `deleteIf(uri, seq)`
+  throw `ConflictError` (`err.current` = current seq) instead of overwriting or deleting a newer version.
+- `{ class: "bulk" }` picks the storage class (also sent with the record); `share` keeps the object's class.
+- Small objects are read in one request: `?mode=locate` inlines their chunks (verified like any fetch).
+
+Resuming large transfers (`@near-drive/sdk/node`, memory about `(parallelism + 2) * chunkSize`):
+
+```ts
+// Upload: journals each stored chunk under resumeDir; rerun the same call to resume.
+await putFile(c, "./model.bin", "near://alice.near/weights/model.bin", { resumeDir: "./.drive-journal" });
+// Download: keeps ./model.bin.drive-part (+ .drive-part.json); rerun to fetch only what is missing.
+await getFile(c, "near://alice.near/weights/model.bin", "./model.bin");
+```
+
+- Downloads: on a rerun each chunk already on disk is checked by re-deriving its id (hash, or re-encrypt
+  with the object key); a newer version of the object starts over.
+- Uploads reuse the object key, so unchanged chunks re-encrypt to the same ids and are skipped. Before a
+  chunk is sent its plaintext hash is durably journaled; if the file changed (even with the same size and
+  mtime) the upload restarts with a fresh key, so a nonce is never reused for different bytes. Encrypted
+  uploads resume only with the owner's root key. The journal uses the same JSONL layout as the Rust client's.
+
 `scripts/drive-ts.mjs` is a small `near-drive`-compatible CLI (`whoami`, `put`, `get`, `ls`, `rm`, `share`)
 used by the interop test.
 
 ## Notes
 
-- Objects are buffered in memory (chunked at 4 MiB by default; `chunkSize` option).
+- `put`/`get` buffer the object in memory (chunked at 4 MiB by default; `chunkSize` option); `putFile`/`getFile`
+  stream with bounded memory. `parallelism` (default 8) sets concurrent chunk transfers.
 - Browsers: the gateway must send CORS headers allowing the `x-near-*` request headers.
 - Request timestamps are made strictly increasing per client, because the gateway's replay
   cache is keyed by signature and ed25519 signatures are deterministic.
@@ -104,7 +141,8 @@ used by the interop test.
 
 ```sh
 npm install
-npm test            # vitest: Rust test vectors (../../testvectors) + unit tests
+npm test            # vitest: Rust test vectors (../../testvectors), unit tests, bad-network tests
+                    # (in-memory gateway, plus ../../target/debug/near-drive-gateway on 127.0.0.1 if built)
 npm run build       # tsc -> dist/
 ../../testvectors/interop.sh   # Rust <-> TS <-> Python against a live local gateway
 ```

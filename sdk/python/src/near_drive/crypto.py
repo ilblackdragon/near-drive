@@ -269,3 +269,63 @@ def add_recipient(root: RootKey, enc: EncInfo, r: Recipient) -> EncInfo:
     dek = _unwrap_dek(root, enc, object_id)
     w = _wrap_dek(dek, object_id, r)
     return replace(enc, wrapped_keys=[x for x in enc.wrapped_keys if x.recipient != w.recipient] + [w])
+
+
+# --- streaming (one chunk at a time), same format as the one-shot functions above ---
+
+
+def chunk_count(size: int, chunk_size: int) -> int:
+    """Number of chunks of an object of ``size`` plaintext bytes (an empty object is one chunk)."""
+    return 1 if size == 0 else -(-size // chunk_size)
+
+
+def chunk_plain_len(size: int, chunk_size: int, idx: int) -> int:
+    """Plaintext length of chunk ``idx``."""
+    return max(0, min(chunk_size, size - idx * chunk_size))
+
+
+class ChunkOpener:
+    """Opens (and deterministically re-seals) chunks of an existing object."""
+
+    def __init__(self, root: RootKey, enc: EncInfo):
+        if enc.alg != ALG:
+            raise ValueError(f"unsupported alg {enc.alg}")
+        self._object_id = _hex16(enc.object_id, "object_id")
+        self._prefix = _hex16(enc.nonce_prefix, "nonce_prefix")
+        self._dek = _unwrap_dek(root, enc, self._object_id)
+
+    def open(self, idx: int, last: bool, ciphertext: bytes) -> bytes:
+        try:
+            return _open(self._dek, _chunk_nonce(self._prefix, idx), bytes(ciphertext), _chunk_aad(self._object_id, idx, last))
+        except nacl.exceptions.CryptoError as e:
+            raise ValueError(f"chunk {idx} failed authentication") from e
+
+    def reseal(self, idx: int, last: bool, plaintext: bytes) -> bytes:
+        """Re-encrypt ``plaintext`` as chunk ``idx`` (deterministic), e.g. to check that bytes
+        already on disk are exactly chunk ``idx`` by comparing cids."""
+        return _seal(self._dek, _chunk_nonce(self._prefix, idx), bytes(plaintext), _chunk_aad(self._object_id, idx, last))
+
+
+class ChunkSealer:
+    """Seals the chunks of one new object, one at a time."""
+
+    def __init__(self, dek: bytes, object_id: bytes, nonce_prefix: bytes, enc: EncInfo):
+        self._dek, self._object_id, self._prefix, self.enc_info = dek, object_id, nonce_prefix, enc
+
+    @classmethod
+    def new(cls, recipients: Sequence[Recipient]) -> "ChunkSealer":
+        if not recipients:
+            raise ValueError("need at least one recipient")
+        dek, object_id, nonce_prefix = os.urandom(32), os.urandom(16), os.urandom(16)
+        wrapped = [_wrap_dek(dek, object_id, r) for r in recipients]
+        return cls(dek, object_id, nonce_prefix, EncInfo(ALG, object_id.hex(), nonce_prefix.hex(), wrapped))
+
+    @classmethod
+    def reopen(cls, root: RootKey, enc: EncInfo) -> "ChunkSealer":
+        """Continue sealing an object started earlier (resumed upload); needs the owner's key.
+        Sealing the same plaintext at the same index reproduces the same ciphertext."""
+        o = ChunkOpener(root, enc)
+        return cls(o._dek, o._object_id, o._prefix, enc)
+
+    def seal(self, idx: int, last: bool, plaintext: bytes) -> bytes:
+        return _seal(self._dek, _chunk_nonce(self._prefix, idx), bytes(plaintext), _chunk_aad(self._object_id, idx, last))

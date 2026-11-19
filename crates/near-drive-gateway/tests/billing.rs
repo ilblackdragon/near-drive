@@ -260,7 +260,8 @@ async fn permanent_rejections_go_to_the_dead_letter_log() {
     m.status.lock().unwrap().insert("alice.near".into(), (true, "ok"));
     let env = start(&mock, json!({})).await;
     env.client("alice.near").put(&u("near://alice.near/a"), b"x", &PutOptions::default()).await.unwrap();
-    env.billing().meter_tick(now_ms() + H + 60_000).await.unwrap();
+    // Past the window end plus the close grace, whatever the time of day.
+    env.billing().meter_tick(now_ms() + 2 * H).await.unwrap();
     // Pre-record the same key with different data: cloud-api answers 409.
     let line = env.billing().pending().await[0].line.clone();
     m.recorded.lock().unwrap().insert(line.idempotency_key.clone(), json!({"other": true}));

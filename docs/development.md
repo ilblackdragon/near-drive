@@ -9,6 +9,8 @@
 | `crates/near-drive-gateway` | the gateway: NEAR key auth, backends (fs / S3 / R2 / MinIO / blob bridge), storage classes, index, caches, metering, billing |
 | `crates/near-drive-s3` | the local S3-compatible endpoint (SigV4/SigV2, aws-chunked, multipart) on top of the client |
 | `crates/near-drive-sync` | folder sync engine (Linux / macOS / Windows) |
+| `crates/near-drive-mount` | files on demand: FUSE (Linux, macOS with macFUSE) and the Windows Cloud Files API |
+| `crates/near-drive-tray` | tray / menu-bar app (`near-drive-tray`) |
 | `crates/near-drive-cli` | the `near-drive` binary / `near drive` near-cli extension |
 | `crates/near-drive-chain` | NEAR JSON-RPC views and signed function calls for `drive.near` |
 | `crates/near-drive-ckd` | MPC confidential key derivation for root keys ([ckd.md](ckd.md)) |
@@ -83,6 +85,9 @@ covers:
 - `tests/contract_policy.rs`: rules from `drive.near` through a mock RPC;
 - `crates/near-drive-sync/tests/sync.rs`: two devices syncing through a gateway (first sync, edits both ways, deletes
   to trash, conflicted copies, touch without transfer, conditional writes, offline, settle, the watch loop);
+- `crates/near-drive-mount/tests/mount.rs`: a real FUSE mount (skipped without `/dev/fuse`): on-demand download,
+  create / edit / rename / delete, remote changes, conflicted copies; `tests/windows.rs` does the same against the
+  Cloud Files API on Windows (CI);
 - `crates/near-drive-s3/tests/s3_e2e.rs`: the S3 endpoint driven by the AWS Rust SDK and raw signed requests.
 
 Windows builds can be checked from Linux: `cargo check --workspace --tests --target x86_64-pc-windows-gnu`. CI

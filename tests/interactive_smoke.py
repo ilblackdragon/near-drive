@@ -200,6 +200,22 @@ try:
     assert "running" in r.stdout and "last sync" in r.stdout, r.stdout
     assert "stopped" in nd("down").stderr
     assert "stopped syncing" in nd("sync", "remove", laptop).stdout
+
+    # Files on demand: mount the same folder; reading a file downloads it.
+    if os.path.exists("/dev/fuse"):
+        mp = os.path.join(t, "mnt")
+        p = subprocess.Popen([f"{BIN}/near-drive", "--no-interactive", "--network", "local", "--account", ACCOUNT, "mount", mp, "Shared"],
+                             env=env, cwd=t, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        for _ in range(40):
+            time.sleep(0.25)
+            if os.path.isdir(os.path.join(mp, "plans")):
+                break
+        with open(os.path.join(mp, "plans", "q1.md")) as f:
+            assert f.read() == "# Q1\n"
+        p.send_signal(2)  # Ctrl-C
+        assert "unmounted" in p.communicate(timeout=20)[1]
+        assert os.listdir(mp) == []
+        ok("mount: files listed, downloaded on open; Ctrl-C unmounts")
     ok("sync: `sync add` + `up --no-s3` syncs in the background; `sync run` pulls into a second folder")
 
     # Non-interactive: a missing argument is an error, not a prompt.

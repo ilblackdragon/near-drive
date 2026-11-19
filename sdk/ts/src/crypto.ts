@@ -224,3 +224,83 @@ export function addRecipient(root: RootKey, enc: EncInfo, r: Recipient): EncInfo
 }
 
 export { hexToBytes };
+
+/** Number of chunks an object of `size` plaintext bytes is split into (an empty object has one). */
+export function chunkCount(size: number, chunkSize: number): number {
+  return size === 0 ? 1 : Math.ceil(size / chunkSize);
+}
+
+/** Plaintext length of chunk `idx` of an object. */
+export function chunkPlainLen(size: number, chunkSize: number, idx: number): number {
+  return Math.max(0, Math.min(chunkSize, size - idx * chunkSize));
+}
+
+/**
+ * Seals the chunks of one object one at a time (same format as {@link encryptFor}).
+ * Chunks are independent: the caller passes the index and whether it is the last one.
+ */
+export class ChunkSealer {
+  readonly #dek: Uint8Array;
+  readonly #objectId: Uint8Array;
+  readonly #prefix: Uint8Array;
+  /** Goes into `Manifest.enc`. */
+  readonly encInfo: EncInfo;
+
+  private constructor(dek: Uint8Array, objectId: Uint8Array, prefix: Uint8Array, enc: EncInfo) {
+    this.#dek = dek;
+    this.#objectId = objectId;
+    this.#prefix = prefix;
+    this.encInfo = enc;
+  }
+
+  /** Fresh DEK / object id / nonce prefix, the DEK wrapped to every recipient. */
+  static create(recipients: Recipient[]): ChunkSealer {
+    if (recipients.length === 0) throw new Error("need at least one recipient");
+    const dek = randomBytes(32);
+    const objectId = randomBytes(16);
+    const prefix = randomBytes(16);
+    const wrapped_keys = recipients.map((r) => wrapDek(dek, objectId, r));
+    return new ChunkSealer(dek, objectId, prefix, { alg: ALG, object_id: bytesToHex(objectId), nonce_prefix: bytesToHex(prefix), wrapped_keys });
+  }
+
+  /**
+   * The sealer of an object started earlier, rebuilt from its `enc` (DEK
+   * unwrapped with `root`). Identical plaintext re-seals to identical chunks.
+   * Never seal *different* plaintext under an index used before: that reuses a nonce.
+   */
+  static reopen(root: RootKey, enc: EncInfo): ChunkSealer {
+    const o = new ChunkOpener(root, enc);
+    return new ChunkSealer(o.dek, o.objectId, o.prefix, enc);
+  }
+
+  seal(idx: number, last: boolean, plaintext: Uint8Array): Uint8Array {
+    return seal(this.#dek, chunkNonce(this.#prefix, idx), plaintext, chunkAad(this.#objectId, idx, last));
+  }
+}
+
+/** Opens (and deterministically re-seals) chunks of an existing object. */
+export class ChunkOpener {
+  /** @internal */ readonly dek: Uint8Array;
+  /** @internal */ readonly objectId: Uint8Array;
+  /** @internal */ readonly prefix: Uint8Array;
+
+  constructor(root: RootKey, enc: EncInfo) {
+    if (enc.alg !== ALG) throw new Error(`unsupported alg ${enc.alg}`);
+    this.objectId = hexN(enc.object_id, 16, "object_id");
+    this.prefix = hexN(enc.nonce_prefix, 16, "nonce_prefix");
+    this.dek = unwrapDek(root, enc, this.objectId);
+  }
+
+  open(idx: number, last: boolean, ct: Uint8Array): Uint8Array {
+    try {
+      return open(this.dek, chunkNonce(this.prefix, idx), ct, chunkAad(this.objectId, idx, last));
+    } catch {
+      throw new Error(`chunk ${idx} failed authentication`);
+    }
+  }
+
+  /** Re-encrypt plaintext as chunk `idx`, e.g. to check bytes on disk against a cid. */
+  reseal(idx: number, last: boolean, plaintext: Uint8Array): Uint8Array {
+    return seal(this.dek, chunkNonce(this.prefix, idx), plaintext, chunkAad(this.objectId, idx, last));
+  }
+}
