@@ -11,12 +11,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "nst", about = "NEAR storage client")]
 struct Cli {
-    #[arg(
-        long,
-        env = "NSTORAGE_GATEWAY",
-        default_value = "http://127.0.0.1:8787",
-        global = true
-    )]
+    #[arg(long, env = "NSTORAGE_GATEWAY", default_value = "http://127.0.0.1:8787", global = true)]
     gateway: String,
     /// NEAR account to act as.
     #[arg(long, env = "NSTORAGE_ACCOUNT", global = true)]
@@ -82,9 +77,7 @@ enum Cmd {
 }
 
 fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME not set")
+    std::env::var_os("HOME").map(PathBuf::from).context("HOME not set")
 }
 
 fn root_key_path(cli: &Cli, account: &str) -> Result<PathBuf> {
@@ -119,29 +112,19 @@ fn write_private(path: &PathBuf, contents: &str) -> Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(path)
-        .with_context(|| {
-            format!(
-                "creating {} (refusing to overwrite an existing key)",
-                path.display()
-            )
-        })?;
+        .with_context(|| format!("creating {} (refusing to overwrite an existing key)", path.display()))?;
     f.write_all(contents.as_bytes())?;
     Ok(())
 }
 
 fn account(cli: &Cli) -> Result<String> {
-    cli.account
-        .clone()
-        .context("--account (or NSTORAGE_ACCOUNT) is required")
+    cli.account.clone().context("--account (or NSTORAGE_ACCOUNT) is required")
 }
 
 fn credentials_path(cli: &Cli, account: &str) -> Result<PathBuf> {
     Ok(match &cli.credentials {
         Some(p) => p.clone(),
-        None => home_dir()?
-            .join(".near-credentials")
-            .join(&cli.network)
-            .join(format!("{account}.json")),
+        None => home_dir()?.join(".near-credentials").join(&cli.network).join(format!("{account}.json")),
     })
 }
 
@@ -159,69 +142,28 @@ fn client(cli: &Cli) -> Result<Client> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
-        Cmd::Keygen { ckd: false, .. } => {
-            let account = account(&cli)?;
-            let path = root_key_path(&cli, &account)?;
-            write_private(&path, &hex::encode(RootKey::generate().as_bytes()))?;
-            eprintln!(
-                "root key written to {} — back it up; losing it loses your encrypted data",
-                path.display()
-            );
-        }
-        Cmd::Keygen {
-            ckd: true,
-            ckd_contract,
-            ckd_rpc,
-            ckd_domain,
-        } => {
+        Cmd::Keygen { ckd: true, ckd_contract, ckd_rpc, ckd_domain } => {
             let account = account(&cli)?;
             let path = root_key_path(&cli, &account)?;
             if path.exists() {
                 bail!("{} already exists; refusing to overwrite", path.display());
             }
-            let mut net = match nstorage_ckd::CkdNetwork::for_network(&cli.network) {
-                Ok(n) => n,
-                Err(_) => nstorage_ckd::CkdNetwork {
-                    network: cli.network.clone(),
-                    rpc_url: ckd_rpc
-                        .clone()
-                        .context("--ckd-rpc is required for this network")?,
-                    contract: ckd_contract
-                        .clone()
-                        .context("--ckd-contract is required for this network")?,
-                    domain_id: 2,
-                },
-            };
-            if let Some(c) = ckd_contract {
-                net.contract = c.clone();
-            }
-            if let Some(r) = ckd_rpc {
-                net.rpc_url = r.clone();
-            }
-            if let Some(d) = ckd_domain {
-                net.domain_id = *d;
-            }
-            let (cred_account, key) =
-                keys::NearCredentials::load(&credentials_path(&cli, &account)?)?;
+            let net = nstorage_ckd::CkdNetwork::resolve(&cli.network, ckd_contract.clone(), ckd_rpc.clone(), *ckd_domain)?;
+            let (cred_account, key) = keys::NearCredentials::load(&credentials_path(&cli, &account)?)?;
             if cred_account != account {
                 bail!("credentials are for {cred_account}, not {account}");
             }
-            eprintln!(
-                "requesting CKD root key from {} (domain {}) on {} as {account} (1 yoctoNEAR + gas)…",
-                net.contract, net.domain_id, net.network
-            );
-            let signer = nstorage_ckd::near::Signer {
-                account_id: account.clone(),
-                key,
-            };
-            let root =
-                nstorage_ckd::near::request_root_key(&net, &signer, nstorage_ckd::DERIVATION_PATH)
-                    .await?;
+            eprintln!("requesting CKD root key from {} (domain {}) on {} as {account} (1 yoctoNEAR + gas)…", net.contract, net.domain_id, net.network);
+            let signer = nstorage_ckd::near::Signer { account_id: account.clone(), key };
+            let root = nstorage_ckd::near::request_root_key(&net, &signer, nstorage_ckd::DERIVATION_PATH).await?;
             write_private(&path, &hex::encode(root.as_bytes()))?;
-            eprintln!(
-                "CKD root key cached at {}; rerun `nst keygen --ckd` on any device to recover it",
-                path.display()
-            );
+            eprintln!("CKD root key cached at {}; rerun `nst keygen --ckd` on any device to recover it", path.display());
+        }
+        Cmd::Keygen { ckd: false, .. } => {
+            let account = account(&cli)?;
+            let path = root_key_path(&cli, &account)?;
+            write_private(&path, &hex::encode(RootKey::generate().as_bytes()))?;
+            eprintln!("root key written to {} — back it up; losing it loses your encrypted data", path.display());
         }
         Cmd::DevKey { out } => {
             let account = account(&cli)?;
@@ -234,13 +176,7 @@ async fn main() -> Result<()> {
             write_private(out, &serde_json::to_string_pretty(&json)?)?;
             println!("{}", keys::format_public_key(&sk.verifying_key()));
         }
-        Cmd::Put {
-            src,
-            uri,
-            public,
-            content_type,
-            share,
-        } => {
+        Cmd::Put { src, uri, public, content_type, share } => {
             let c = client(&cli)?;
             let uri = NearUri::parse(uri)?;
             let mut data = vec![];
@@ -249,21 +185,8 @@ async fn main() -> Result<()> {
             } else {
                 data = std::fs::read(src).with_context(|| format!("reading {src}"))?;
             }
-            let rec = c
-                .put(
-                    &uri,
-                    &data,
-                    &PutOptions {
-                        public: *public,
-                        content_type: content_type.clone(),
-                        share_with: share.clone(),
-                    },
-                )
-                .await?;
-            eprintln!(
-                "{uri} seq={} size={} stored={}",
-                rec.seq, rec.size, rec.stored_size
-            );
+            let rec = c.put(&uri, &data, &PutOptions { public: *public, content_type: content_type.clone(), share_with: share.clone() }).await?;
+            eprintln!("{uri} seq={} size={} stored={}", rec.seq, rec.size, rec.stored_size);
         }
         Cmd::Get { uri, dst } => {
             let c = client(&cli)?;
@@ -276,26 +199,17 @@ async fn main() -> Result<()> {
         Cmd::Ls { uri } => {
             let c = client(&cli)?;
             for e in c.list(&NearUri::parse(uri)?).await? {
-                println!(
-                    "{:>12}  seq={:<4} {:<24} {}",
-                    e.size, e.seq, e.writer, e.path
-                );
+                println!("{:>12}  seq={:<4} {:<24} {}", e.size, e.seq, e.writer, e.path);
             }
         }
         Cmd::Share { uri, recipient } => {
-            let rec = client(&cli)?
-                .share(&NearUri::parse(uri)?, recipient)
-                .await?;
+            let rec = client(&cli)?.share(&NearUri::parse(uri)?, recipient).await?;
             eprintln!("shared; seq={}", rec.seq);
         }
         Cmd::Whoami => {
             let c = client(&cli)?;
             println!("account: {}", c.account());
-            println!(
-                "x25519:  {}",
-                c.x25519_public()
-                    .unwrap_or_else(|| "(no root key; run `nst keygen`)".into())
-            );
+            println!("x25519:  {}", c.x25519_public().unwrap_or_else(|| "(no root key; run `nst keygen`)".into()));
         }
         Cmd::Rm { uri } => {
             client(&cli)?.delete(&NearUri::parse(uri)?).await?;

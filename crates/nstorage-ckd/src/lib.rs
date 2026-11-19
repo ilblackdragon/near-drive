@@ -73,6 +73,37 @@ impl CkdNetwork {
             domain_id: 2,
         })
     }
+
+    /// Known deployment for `network` with optional overrides; unknown
+    /// networks need both `contract` and `rpc_url`.
+    pub fn resolve(
+        network: &str,
+        contract: Option<String>,
+        rpc_url: Option<String>,
+        domain_id: Option<u64>,
+    ) -> Result<Self> {
+        let mut n = match Self::for_network(network) {
+            Ok(n) => n,
+            Err(e) => Self {
+                network: network.into(),
+                rpc_url: rpc_url.clone().ok_or(e)?,
+                contract: contract
+                    .clone()
+                    .context("--ckd-contract is required for this network")?,
+                domain_id: 2,
+            },
+        };
+        if let Some(c) = contract {
+            n.contract = c;
+        }
+        if let Some(r) = rpc_url {
+            n.rpc_url = r;
+        }
+        if let Some(d) = domain_id {
+            n.domain_id = d;
+        }
+        Ok(n)
+    }
 }
 
 /// `app_id` exactly as the MPC contract computes it from the predecessor.
