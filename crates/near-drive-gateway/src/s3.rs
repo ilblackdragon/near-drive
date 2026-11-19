@@ -19,12 +19,11 @@
 //! record (CAS) with a tombstone `{"tombstone":true,"seq":n}` because plain S3
 //! DELETE is not conditional; tombstones are invisible to get/list and the
 //! next write of that path starts again at seq 1.
-use crate::store::{BlobStore, CasError, DirectUrl, IndexStore};
+use crate::store::{BlobStore, CasError, DirectUrl, IndexEntry, IndexStore};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
-use near_drive_core::record::PointerRecord;
 use object_store::{
     aws::{AmazonS3, AmazonS3Builder},
     path::{Path as OPath, PathPart},
@@ -197,7 +196,7 @@ struct Tombstone {
 }
 
 enum Stored {
-    Live(PointerRecord),
+    Live(IndexEntry),
     Deleted,
 }
 
@@ -279,14 +278,14 @@ fn decode_part(s: &str) -> String {
 
 #[async_trait]
 impl IndexStore for ObjectIndexStore {
-    async fn get(&self, ns: &str, path: &str) -> Result<Option<PointerRecord>> {
+    async fn get(&self, ns: &str, path: &str) -> Result<Option<IndexEntry>> {
         Ok(match self.read(&self.key(ns, path)).await? {
             Some((Stored::Live(r), _)) => Some(r),
             _ => None,
         })
     }
 
-    async fn cas_put(&self, rec: &PointerRecord) -> Result<(), CasError> {
+    async fn cas_put(&self, rec: &IndexEntry) -> Result<(), CasError> {
         let key = self.key(&rec.namespace, &rec.path);
         let body = serde_json::to_vec(rec).map_err(anyhow::Error::from)?;
         match self.read(&key).await? {
@@ -310,7 +309,7 @@ impl IndexStore for ObjectIndexStore {
         }
     }
 
-    async fn list(&self, ns: &str, prefix: &str) -> Result<Vec<PointerRecord>> {
+    async fn list(&self, ns: &str, prefix: &str) -> Result<Vec<IndexEntry>> {
         // List the deepest complete "directory" of the prefix, filter the rest.
         let dir = match prefix.rfind('/') {
             Some(i) => &prefix[..i],
@@ -330,7 +329,7 @@ impl IndexStore for ObjectIndexStore {
                 p.join("/").starts_with(prefix)
             })
             .collect();
-        let mut out: Vec<PointerRecord> = futures_util::stream::iter(keys)
+        let mut out: Vec<IndexEntry> = futures_util::stream::iter(keys)
             .map(|k| async move { self.read(&k).await })
             .buffer_unordered(self.list_concurrency)
             .try_filter_map(|r| async move {
@@ -353,8 +352,11 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use object_store::memory::InMemory;
 
-    fn rec(path: &str, seq: u64, sk: &SigningKey) -> PointerRecord {
-        PointerRecord::new_signed("alice.near", path, &near_drive_core::cid(path.as_bytes()), 1, 2, seq, "alice.near", sk, 1)
+    use near_drive_core::record::PointerRecord;
+
+    fn rec(path: &str, seq: u64, sk: &SigningKey) -> IndexEntry {
+        let record = PointerRecord::new_signed("alice.near", path, &near_drive_core::cid(path.as_bytes()), 1, 2, seq, "alice.near", sk, 1);
+        IndexEntry { record, class: Some("bulk".into()) }
     }
 
     #[tokio::test]
@@ -365,12 +367,13 @@ mod tests {
         assert!(matches!(idx.cas_put(&rec("a/b", 1, &sk)).await, Err(CasError::Conflict { current: 1 })));
         assert!(matches!(idx.cas_put(&rec("a/b", 3, &sk)).await, Err(CasError::Conflict { current: 1 })));
         idx.cas_put(&rec("a/b", 2, &sk)).await.unwrap();
-        assert_eq!(idx.get("alice.near", "a/b").await.unwrap().unwrap().seq, 2);
+        let got = idx.get("alice.near", "a/b").await.unwrap().unwrap();
+        assert_eq!((got.seq, got.class.as_deref()), (2, Some("bulk")), "class round-trips");
         // weird characters round-trip and list by partial segment
         for p in ["a/bc%20d", "a/b[1]#?", "a/b c/ü*x", "ab", "a/b~"] {
             idx.cas_put(&rec(p, 1, &sk)).await.unwrap();
         }
-        let ls: Vec<_> = idx.list("alice.near", "a/b").await.unwrap().into_iter().map(|r| r.path).collect();
+        let ls: Vec<_> = idx.list("alice.near", "a/b").await.unwrap().into_iter().map(|r| r.record.path).collect();
         assert_eq!(ls, vec!["a/b", "a/b c/ü*x", "a/b[1]#?", "a/bc%20d", "a/b~"]);
         assert_eq!(idx.list("alice.near", "a").await.unwrap().len(), 6);
         assert_eq!(idx.list("alice.near", "a/b c/").await.unwrap().len(), 1);

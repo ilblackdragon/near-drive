@@ -16,7 +16,7 @@ use near_drive_client::{
 };
 use near_drive_gateway::{
     s3::{ObjectIndexStore, S3Config},
-    store::{CasError, IndexStore},
+    store::{CasError, IndexEntry, IndexStore},
 };
 use serde_json::json;
 
@@ -59,7 +59,7 @@ async fn s3_index_store_cas_on_real_s3() {
     let cfg: S3Config = serde_json::from_value(s3_with_prefix(&base, &format!("{}/index/", run_id()))).unwrap();
     let idx = ObjectIndexStore::new(&cfg).unwrap();
     let sk = SigningKey::from_bytes(&[5; 32]);
-    let rec = |p: &str, seq| PointerRecord::new_signed("alice.near", p, &near_drive_client::near_drive_core::cid(b"m"), 1, 2, seq, "alice.near", &sk, 1);
+    let rec = |p: &str, seq| IndexEntry { record: PointerRecord::new_signed("alice.near", p, &near_drive_client::near_drive_core::cid(b"m"), 1, 2, seq, "alice.near", &sk, 1), class: None };
     idx.cas_put(&rec("m/a", 1)).await.unwrap();
     assert!(matches!(idx.cas_put(&rec("m/a", 1)).await, Err(CasError::Conflict { current: 1 })));
     idx.cas_put(&rec("m/a", 2)).await.unwrap();
@@ -67,7 +67,7 @@ async fn s3_index_store_cas_on_real_s3() {
         idx.cas_put(&rec(p, 1)).await.unwrap();
         assert_eq!(idx.get("alice.near", p).await.unwrap().unwrap().path, p);
     }
-    let ls: Vec<_> = idx.list("alice.near", "m/a").await.unwrap().into_iter().map(|r| r.path).collect();
+    let ls: Vec<_> = idx.list("alice.near", "m/a").await.unwrap().into_iter().map(|r| r.record.path).collect();
     assert_eq!(ls, vec!["m/a", "m/a b", "m/a%2F", "m/ab"]);
     assert_eq!(idx.list("alice.near", "").await.unwrap().len(), 6);
     assert_eq!(idx.list("alice.near", "m/ü/").await.unwrap().len(), 1);

@@ -35,13 +35,16 @@ pub struct Located {
     pub manifest: Manifest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_raw: Option<String>,
+    /// Storage class of the object, when the gateway recorded one.
+    #[serde(default)]
+    pub class: Option<String>,
     #[serde(default)]
     pub chunks: Vec<LocatedChunk>,
 }
 
 impl Located {
     pub fn head(&self) -> ObjectHead {
-        ObjectHead { record: self.record.clone(), manifest: self.manifest.clone(), manifest_raw: self.manifest_raw.clone() }
+        ObjectHead { record: self.record.clone(), manifest: self.manifest.clone(), manifest_raw: self.manifest_raw.clone(), class: self.class.clone() }
     }
 
     fn direct_url(&self, idx: usize) -> Option<&str> {

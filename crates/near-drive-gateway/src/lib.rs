@@ -34,7 +34,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use placement::{Placement, StorageConfig};
-use store::{CasError, IndexStore};
+use store::{CasError, IndexEntry, IndexStore};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,16 +295,16 @@ async fn put_chunk(
     Ok(StatusCode::CREATED)
 }
 
-async fn load_manifest(st: &AppState, cid: &str) -> Result<(Manifest, u64), ApiError> {
-    let (m, raw) = load_manifest_raw(st, cid).await?;
+async fn load_manifest(st: &AppState, class: Option<&str>, cid: &str) -> Result<(Manifest, u64), ApiError> {
+    let (m, raw) = load_manifest_raw(st, class, cid).await?;
     Ok((m, raw.len() as u64))
 }
 
 /// Parsed manifest plus the exact stored bytes. Responses carry the bytes as
 /// `manifest_raw` (base64) so clients hash what was signed rather than a
 /// re-serialization (robust to manifest fields a client does not know yet).
-async fn load_manifest_raw(st: &AppState, cid: &str) -> Result<(Manifest, Vec<u8>), ApiError> {
-    let b = st.blobs.get(cid).await?.ok_or_else(|| err(StatusCode::BAD_REQUEST, "manifest chunk not uploaded"))?;
+async fn load_manifest_raw(st: &AppState, class: Option<&str>, cid: &str) -> Result<(Manifest, Vec<u8>), ApiError> {
+    let b = st.blobs.get(class, cid).await?.ok_or_else(|| err(StatusCode::BAD_REQUEST, "manifest chunk not uploaded"))?;
     let m = Manifest::from_bytes(&b).map_err(|e| err(StatusCode::BAD_REQUEST, format!("invalid manifest: {e}")))?;
     Ok((m, b.to_vec()))
 }
@@ -337,11 +337,18 @@ async fn put_object(
     if now_ms().abs_diff(rec.ts_ms) > auth::MAX_SKEW_MS {
         return bad("record timestamp outside allowed window");
     }
-    let (m, mlen) = load_manifest(&st, &rec.manifest_cid).await?;
+    // The class the client uploaded the chunks with (same header as on the
+    // chunk PUTs); recorded so reads go to that class's backends first.
+    let class = match headers.get(placement::CLASS_HEADER).map(|v| v.to_str()) {
+        None => st.blobs.default_class().to_string(),
+        Some(Ok(c)) if st.blobs.has_class(c) => c.to_string(),
+        Some(c) => return Err(err(StatusCode::BAD_REQUEST, format!("unknown storage class {:?}", c.unwrap_or("")))),
+    };
+    let (m, mlen) = load_manifest(&st, Some(&class), &rec.manifest_cid).await?;
     if m.size != rec.size || m.stored_size() + mlen != rec.stored_size {
         return bad("record sizes do not match manifest");
     }
-    if let Some(missing) = missing_chunk(&st, &m).await? {
+    if let Some(missing) = missing_chunk(&st, &class, &m).await? {
         return Err(err(StatusCode::BAD_REQUEST, format!("chunk {missing} not uploaded")));
     }
     let prev = st.index.get(&ns, &path).await?;
@@ -349,7 +356,8 @@ async fn put_object(
     if rec.stored_size > prev.as_ref().map(|p| p.stored_size).unwrap_or(0) {
         billing::check(st.billing.as_deref(), &access.payer).await?;
     }
-    match st.index.cas_put(&rec).await {
+    let entry = IndexEntry { record: rec, class: Some(class) };
+    match st.index.cas_put(&entry).await {
         Ok(()) => {}
         Err(CasError::Conflict { current }) => {
             return Err(err(StatusCode::CONFLICT, format!("seq conflict: current seq is {current}")));
@@ -357,18 +365,18 @@ async fn put_object(
         Err(CasError::Other(e)) => return Err(e.into()),
     }
     st.usage
-        .record(usage::Event::put(&ns, &path, &signer.account, &access.payer, rec.stored_size, prev.map(|p| p.stored_size).unwrap_or(0)))
+        .record(usage::Event::put(&ns, &path, &signer.account, &access.payer, entry.stored_size, prev.map(|p| p.stored_size).unwrap_or(0)))
         .await;
-    Ok((StatusCode::CREATED, Json(json!({"seq": rec.seq}))).into_response())
+    Ok((StatusCode::CREATED, Json(json!({"seq": entry.seq}))).into_response())
 }
 
 /// First chunk of `m` that no backend has (checked concurrently).
-async fn missing_chunk(st: &AppState, m: &Manifest) -> anyhow::Result<Option<String>> {
+async fn missing_chunk(st: &AppState, class: &str, m: &Manifest) -> anyhow::Result<Option<String>> {
     use futures_util::{StreamExt, TryStreamExt};
     let cids: Vec<String> = m.chunks.iter().map(|c| c.cid.clone()).collect();
     let mut s = futures_util::stream::iter(cids)
         .map(move |cid: String| async move {
-            let has = st.blobs.has(&cid).await?;
+            let has = st.blobs.has(Some(class), &cid).await?;
             Ok::<_, anyhow::Error>((cid, has))
         })
         .buffer_unordered(32);
@@ -401,13 +409,14 @@ async fn get_object(
     if !access.read {
         return Err(err(StatusCode::FORBIDDEN, "no read access"));
     }
-    let rec = st.index.get(&ns, &path).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "not found"))?;
-    let (manifest, manifest_raw) = load_manifest_raw(&st, &rec.manifest_cid).await?;
+    let entry = st.index.get(&ns, &path).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "not found"))?;
+    let class = entry.class.as_deref();
+    let (manifest, manifest_raw) = load_manifest_raw(&st, class, &entry.manifest_cid).await?;
     let manifest_raw = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &manifest_raw);
     match q.chunk {
         None if q.mode.as_deref() == Some("locate") => {
             billing::check(st.billing.as_deref(), &access.payer).await?;
-            let located = locate::locate(&st, rec, manifest, manifest_raw).await?;
+            let located = locate::locate(&st, entry, manifest, manifest_raw).await?;
             // Chunks handed out as direct URLs bypass the gateway; meter them as
             // egress here (an upper bound: the client may fetch fewer bytes).
             let direct: u64 = located.chunks.iter().filter(|c| c.url.is_some()).map(|c| c.len).sum();
@@ -416,10 +425,10 @@ async fn get_object(
             }
             Ok(Json(located).into_response())
         }
-        None => Ok(Json(json!({"record": rec, "manifest": manifest, "manifest_raw": manifest_raw})).into_response()),
+        None => Ok(Json(json!({"record": entry.record, "manifest": manifest, "manifest_raw": manifest_raw, "class": entry.class})).into_response()),
         Some(cid) => {
             billing::check(st.billing.as_deref(), &access.payer).await?;
-            let len = if cid == rec.manifest_cid {
+            let len = if cid == entry.manifest_cid {
                 None
             } else {
                 Some(manifest.chunks.iter().find(|c| c.cid == cid).ok_or_else(|| err(StatusCode::NOT_FOUND, "chunk is not part of this object"))?.len)
@@ -430,14 +439,14 @@ async fn get_object(
                 // ranged read of a data chunk: fetch only the range from the backend
                 (Some(len), Some(h)) => match bridge::parse_range(Some(h), len) {
                     Ok(Some(r)) => {
-                        let bytes = st.blobs.get_range(&cid, r.clone()).await?.ok_or_else(missing)?;
+                        let bytes = st.blobs.get_range(class, &cid, r.clone()).await?.ok_or_else(missing)?;
                         let cr = format!("bytes {}-{}/{len}", r.start, r.end - 1);
                         (StatusCode::PARTIAL_CONTENT, [("content-type", "application/octet-stream".to_string()), ("content-range", cr)], bytes).into_response()
                     }
-                    Ok(None) => bridge::ranged_response(&headers, st.blobs.get(&cid).await?.ok_or_else(missing)?),
+                    Ok(None) => bridge::ranged_response(&headers, st.blobs.get(class, &cid).await?.ok_or_else(missing)?),
                     Err(bridge::Unsatisfiable) => return Err(err(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable")),
                 },
-                _ => bridge::ranged_response(&headers, st.blobs.get(&cid).await?.ok_or_else(missing)?),
+                _ => bridge::ranged_response(&headers, st.blobs.get(class, &cid).await?.ok_or_else(missing)?),
             };
             let served = axum::body::HttpBody::size_hint(resp.body()).exact().unwrap_or(0);
             st.usage.record(usage::Event::egress(&ns, &path, &signer.account, &access.payer, served)).await;
@@ -492,7 +501,7 @@ async fn list_objects(
         .await?
         .into_iter()
         .filter(|r| policy::resolve(&ns, &rules, &r.path, &signer.account).read)
-        .map(|r| json!({"path": r.path, "size": r.size, "seq": r.seq, "writer": r.writer, "ts_ms": r.ts_ms, "manifest_cid": r.manifest_cid}))
+        .map(|r| json!({"path": r.path, "size": r.size, "seq": r.seq, "writer": r.writer, "ts_ms": r.ts_ms, "manifest_cid": r.manifest_cid, "class": r.class}))
         .collect();
     Ok(Json(entries).into_response())
 }

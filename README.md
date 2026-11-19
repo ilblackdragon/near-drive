@@ -140,8 +140,13 @@ dev gateway. The optional `storage` section of the gateway config sets up the fo
 
 **Storage classes** are lists of backends:
 - An upload writes each chunk to every backend in its class. It succeeds once `min_successes` writes succeed (default: all backends).
-- Reads try every backend, default class first, so readers never need to know the class.
 - Clients pick a class per upload with the `x-near-drive-class` chunk header (`PutOptions::class`, `near drive put --class bulk`). The default class is `hot`.
+- The gateway records the class in the object's index entry. Reads try that class's backends first, then its `previous`
+  backends, then all others, so a misplaced chunk is still found (and logged). Objects stored before classes were
+  recorded read the default class first.
+- **Migrating a class:** list the old backends in `previous` and the new ones in `backends`. New writes go to the new
+  backends; reads still find old chunks. Drop `previous` once the old chunks are copied. No per-chunk state is kept,
+  so any number of gateways can share the config.
 
 **The index** can live on S3/R2/MinIO and use conditional writes. With that setup, any number of gateways can share it safely.
 
@@ -154,7 +159,7 @@ dev gateway. The optional `storage` section of the gateway config sets up the fo
     "local": {"type": "fs", "path": "/var/lib/near-drive/chunks"}
   },
   "classes": {
-    "hot":  {"backends": ["r2", "fil"], "min_successes": 1},
+    "hot":  {"backends": ["r2", "fil"], "min_successes": 1, "previous": ["local"]},
     "bulk": {"backends": ["fil"]}
   },
   "default_class": "hot",

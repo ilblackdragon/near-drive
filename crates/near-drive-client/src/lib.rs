@@ -34,6 +34,9 @@ pub struct ObjectHead {
     /// Exact stored manifest bytes (base64), when the gateway provides them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_raw: Option<String>,
+    /// Storage class the gateway recorded for the object (None: not recorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,7 +235,8 @@ impl Client {
         for attempt in 0..2 {
             let prev = self.head(uri).await?.map(|h| h.record.seq).unwrap_or(0);
             let rec = PointerRecord::new_signed(&uri.namespace, &uri.path, &mref.cid, manifest.size, stored, prev + 1, &self.account, &self.sk, now_ms());
-            let resp = self.send(Method::PUT, &Self::obj_path(uri), "", serde_json::to_vec(&rec)?).await?;
+            // Same class header as the chunks: the gateway records it in the index.
+            let resp = self.send_with(Method::PUT, &Self::obj_path(uri), "", serde_json::to_vec(&rec)?.into(), class).await?;
             if resp.status() == StatusCode::CONFLICT && attempt == 0 {
                 continue;
             }
@@ -256,7 +260,8 @@ impl Client {
         let enc = head.manifest.enc.as_ref().ok_or_else(|| anyhow!("{uri} is public; nothing to share"))?;
         let enc = crypto::add_recipient(root, enc, &crypto::Recipient::X25519(crypto::parse_x25519(recipient)?))?;
         let manifest = Manifest { enc: Some(enc), ..head.manifest };
-        self.commit_manifest(uri, &manifest, None).await
+        // Chunks are reused, so the object keeps its class.
+        self.commit_manifest(uri, &manifest, head.class.as_deref()).await
     }
 
     pub async fn get(&self, uri: &NearUri) -> Result<(ObjectHead, Vec<u8>)> {

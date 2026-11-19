@@ -9,7 +9,10 @@
 //! `url: null` means "fetch through the gateway":
 //! `GET /v1/o/{ns}/{path}?chunk={cid}` (signed; supports `Range`).
 //! Clients must verify every fetched chunk against its cid.
-use crate::{store::DirectUrl, AppState};
+use crate::{
+    store::{DirectUrl, IndexEntry},
+    AppState,
+};
 use futures_util::{StreamExt, TryStreamExt};
 use near_drive_core::{manifest::Manifest, record::PointerRecord};
 use serde::Serialize;
@@ -29,15 +32,19 @@ pub struct Located {
     /// Exact stored manifest bytes, base64.
     pub manifest_raw: String,
     pub chunks: Vec<LocatedChunk>,
+    /// Storage class of the object (absent for objects stored before classes were recorded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
 }
 
 const LOCATE_CONCURRENCY: usize = 32;
 
-pub async fn locate(st: &AppState, record: PointerRecord, manifest: Manifest, manifest_raw: String) -> anyhow::Result<Located> {
+pub async fn locate(st: &AppState, entry: IndexEntry, manifest: Manifest, manifest_raw: String) -> anyhow::Result<Located> {
+    let class = entry.class.as_deref();
     let refs: Vec<(String, u64)> = manifest.chunks.iter().map(|c| (c.cid.clone(), c.len)).collect();
     let chunks = futures_util::stream::iter(refs)
         .map(move |(cid, len): (String, u64)| async move {
-            let d = match st.blobs.direct_url(&cid).await {
+            let d = match st.blobs.direct_url(class, &cid).await {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!("direct url for {cid}: {e:#}");
@@ -53,5 +60,5 @@ pub async fn locate(st: &AppState, record: PointerRecord, manifest: Manifest, ma
         .buffered(LOCATE_CONCURRENCY)
         .try_collect()
         .await?;
-    Ok(Located { record, manifest, manifest_raw, chunks })
+    Ok(Located { class: entry.class.clone(), record: entry.record, manifest, manifest_raw, chunks })
 }

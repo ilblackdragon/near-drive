@@ -60,18 +60,38 @@ pub fn slice_range(b: &Bytes, range: &Range<u64>) -> Bytes {
     b.slice(s..e)
 }
 
+/// What the index holds per object: the writer-signed record plus fields the
+/// gateway adds (not covered by the record signature). Serialized flat, so
+/// entries written before a field existed still parse.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct IndexEntry {
+    #[serde(flatten)]
+    pub record: PointerRecord,
+    /// Storage class the object's chunks were written with; reads go to that
+    /// class's backends first. None for entries from before classes were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+}
+
+impl std::ops::Deref for IndexEntry {
+    type Target = PointerRecord;
+    fn deref(&self) -> &PointerRecord {
+        &self.record
+    }
+}
+
 /// Mutable pointer-record index (DESIGN.md §3.2). Implementations: fs
 /// ([`FsIndexStore`], single gateway) and object-store / S3 with conditional
 /// writes ([`crate::s3::ObjectIndexStore`], safe with many gateways).
 #[async_trait]
 pub trait IndexStore: Send + Sync {
-    async fn get(&self, ns: &str, path: &str) -> Result<Option<PointerRecord>>;
+    async fn get(&self, ns: &str, path: &str) -> Result<Option<IndexEntry>>;
     /// Store `rec` iff the current seq equals `rec.seq - 1` (0 = absent).
-    async fn cas_put(&self, rec: &PointerRecord) -> Result<(), CasError>;
+    async fn cas_put(&self, rec: &IndexEntry) -> Result<(), CasError>;
     /// Delete iff current seq == `expected_seq`.
     async fn delete(&self, ns: &str, path: &str, expected_seq: u64) -> Result<(), CasError>;
     /// All live records in `ns` whose path starts with `prefix`, sorted by path.
-    async fn list(&self, ns: &str, prefix: &str) -> Result<Vec<PointerRecord>>;
+    async fn list(&self, ns: &str, prefix: &str) -> Result<Vec<IndexEntry>>;
 }
 
 pub struct FsBlobStore {
@@ -160,7 +180,7 @@ impl FsIndexStore {
     fn file(&self, ns: &str, path: &str) -> PathBuf {
         self.root.join(ns).join(hex::encode(path))
     }
-    async fn read(&self, ns: &str, path: &str) -> Result<Option<PointerRecord>> {
+    async fn read(&self, ns: &str, path: &str) -> Result<Option<IndexEntry>> {
         match tokio::fs::read(self.file(ns, path)).await {
             Ok(b) => Ok(Some(serde_json::from_slice(&b)?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -171,10 +191,10 @@ impl FsIndexStore {
 
 #[async_trait]
 impl IndexStore for FsIndexStore {
-    async fn get(&self, ns: &str, path: &str) -> Result<Option<PointerRecord>> {
+    async fn get(&self, ns: &str, path: &str) -> Result<Option<IndexEntry>> {
         self.read(ns, path).await
     }
-    async fn cas_put(&self, rec: &PointerRecord) -> Result<(), CasError> {
+    async fn cas_put(&self, rec: &IndexEntry) -> Result<(), CasError> {
         let _g = self.lock.lock().await;
         let current = self.read(&rec.namespace, &rec.path).await?.map(|r| r.seq).unwrap_or(0);
         if current + 1 != rec.seq {
@@ -192,7 +212,7 @@ impl IndexStore for FsIndexStore {
         tokio::fs::remove_file(self.file(ns, path)).await.map_err(anyhow::Error::from)?;
         Ok(())
     }
-    async fn list(&self, ns: &str, prefix: &str) -> Result<Vec<PointerRecord>> {
+    async fn list(&self, ns: &str, prefix: &str) -> Result<Vec<IndexEntry>> {
         let dir = self.root.join(ns);
         let mut rd = match tokio::fs::read_dir(&dir).await {
             Ok(rd) => rd,

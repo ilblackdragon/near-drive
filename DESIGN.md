@@ -92,7 +92,12 @@ A placement policy per storage class decides where chunks go:
 | `shelby` | Shelby hot storage | public testnet ended 2026-10-01; now an invite-only private beta with an S3-compatible API, which the bridge uses. No mainnet yet |
 | `local` | gateway filesystem | dev / tests |
 
-Users never choose a backend directly. At most they choose a class. The manifest does not record locations; locations are resolved by cid through a placement log the gateways write. Migration is therefore copy-then-update-log.
+Users never choose a backend directly. At most they choose a class. Locations are not stored per chunk, so gateways stay stateless:
+
+- The manifest (signed by the writer) records no locations.
+- The index entry records the object's **class**. The gateway writes it next to the signed record (it is not covered by the signature); clients send it as `x-near-drive-class` on the chunk PUTs and on the record PUT.
+- A read works out the backends from the class and the shared config: the class's `backends`, then its `previous` backends, then every other backend as a fallback. Entries without a class (written before this existed) read the default class first.
+- **Migration is a config change plus a copy:** move the old backends to `previous`, put the new ones in `backends`, and new writes go to the new backends while reads still find old chunks. A copier (not built) moves old chunks; `previous` is then removed. Chunks found outside their class are logged.
 
 ## 4. Identity, auth, access control
 
@@ -233,7 +238,7 @@ client.share(uri, account) ; client.grant(prefix, rule)   # onchain policy tx
 | **2** | `drive.near` contract (rules, enc keys, gateway registry, cred epochs, anchors); gateway reads rules from chain; `near drive grant/rules/publish-key/gateways`, gateway discovery; CKD root keys (`near drive keygen --ckd`); FOC bridge (Synapse) | Done in code. Contract verified in a local sandbox only. CKD verified against the official vectors and live read-only queries, not a real request. FOC bridge type-checked and mock-tested; no funded upload completed |
 | **3** | NEAR Intents / stablecoin escrow (`ft_on_transfer`, `mt_on_transfer`, capped `settle`, delayed withdrawals; `docs/payments.md`); Shelby bridge (S3 mode + experimental SDK mode) | Done in code; sandbox and mock tests only |
 | **CLI** | One `near-drive` binary, also `near drive` as a near-cli-rs extension; NEAR keys and transactions delegated to near-cli (`login` adds a function-call session key via `near account add-key`; `grant`/`publish-key`/`keygen --ckd`/`logout` are near-cli transactions); interactive prompts in a terminal | Done. Verified on a local sandbox with near-cli-rs 0.29 (`tests/near_cli_e2e.sh`, including near-cli's interactive signer menu) and in a pty (`tests/interactive_smoke.py`). OS-keychain lookup is the same entry format near-cli writes but was only exercised through the legacy-file fallback (headless Linux) |
-| Not built | hosted TEE S3 endpoint; storage reservations, disputes, stake slashing; chunk garbage collection; placement log; hidden-path mode; keychain-wrapped root key cache; NEAR-escrow settler wired into billing (interface exists); prepaid storage so session keys can set rules | |
+| Not built | hosted TEE S3 endpoint; storage reservations, disputes, stake slashing; chunk garbage collection; migration copier and repair for under-replicated chunks; hidden-path mode; keychain-wrapped root key cache; NEAR-escrow settler wired into billing (interface exists); prepaid storage so session keys can set rules | |
 
 ## 10. Open questions
 

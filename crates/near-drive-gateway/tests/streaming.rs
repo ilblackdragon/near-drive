@@ -132,6 +132,9 @@ async fn classes_and_direct_urls() {
     assert_eq!(count_files(&s.bridge_dir), 17);
     assert_eq!(count_files(&s.gw.data_dir.join("../replica")), 17);
     let loc = alice.locate(&bulk).await.unwrap().unwrap();
+    assert_eq!(loc.class.as_deref(), Some("bulk"), "class recorded in the index");
+    assert_eq!(alice.head(&hot).await.unwrap().unwrap().class.as_deref(), Some("hot"));
+    assert_eq!(alice.list(&u("near://alice.near/")).await.unwrap().len(), 2);
     assert!(loc.chunks.iter().all(|c| c.url.as_deref().is_some_and(|u| u.contains("/public/b3:"))));
     let before = egress_events(&s.gw);
     alice.get_to_file(&bulk, tmp.path().join("bulk.out")).await.unwrap();
@@ -147,6 +150,11 @@ async fn classes_and_direct_urls() {
     std::fs::remove_dir_all(&s.bridge_dir).unwrap();
     alice.get_to_file(&bulk, tmp.path().join("bulk2.out")).await.unwrap();
     assert_eq!(hash_file(&tmp.path().join("bulk2.out")), h);
+
+    // share rewrites only the manifest; the object keeps its class
+    let bob_key = RootKey::generate().x25519_public();
+    alice.share(&bulk, &bob_key).await.unwrap();
+    assert_eq!(alice.head(&bulk).await.unwrap().unwrap().class.as_deref(), Some("bulk"));
 
     // unknown class is rejected
     let e = alice.put(&u("near://alice.near/x"), b"x", &PutOptions { class: Some("nope".into()), ..Default::default() }).await.unwrap_err();
