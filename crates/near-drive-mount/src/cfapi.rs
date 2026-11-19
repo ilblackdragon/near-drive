@@ -125,22 +125,24 @@ impl Provider {
             .mark_in_sync()
     }
 
+    /// Folders are populated eagerly by `refresh` (the whole tree as
+    /// placeholders), so they never need an on-demand listing.
     fn dir_info(name: &str) -> PlaceholderCreateInfo {
-        PlaceholderCreateInfo::new(name).metadata(Metadata::directory()).mark_in_sync()
+        PlaceholderCreateInfo::new(name).metadata(Metadata::directory()).has_no_children().mark_in_sync()
     }
 
     /// Placeholders for the direct children of `dir` (rel, "" = root).
-    fn children(&self, dir: &str, all: &BTreeMap<String, RemoteFile>) -> Vec<PlaceholderCreateInfo> {
+    fn children(&self, dir: &str, all: &BTreeMap<String, RemoteFile>) -> Vec<(String, PlaceholderCreateInfo)> {
         let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
         let mut dirs = HashSet::new();
         let mut out = vec![];
         for (rel, f) in all.range(prefix.clone()..) {
             let Some(rest) = rel.strip_prefix(&prefix) else { break };
             match rest.split_once('/') {
-                None => out.push(Self::file_info(rest, f)),
+                None => out.push((rest.to_string(), Self::file_info(rest, f))),
                 Some((d, _)) => {
                     if dirs.insert(d.to_string()) {
-                        out.push(Self::dir_info(d));
+                        out.push((d.to_string(), Self::dir_info(d)));
                     }
                 }
             }
@@ -220,7 +222,7 @@ impl Provider {
             let next = dir.join(d);
             if !next.exists() {
                 if let Err(e) = Self::dir_info(d).create(&dir) {
-                    tracing::debug!("placeholder folder {}: {e}", next.display());
+                    tracing::warn!("placeholder folder {}: {e}", next.display());
                     std::fs::create_dir_all(&next)?;
                 }
             }
@@ -245,8 +247,9 @@ impl Provider {
             match std::fs::File::open(&path) {
                 Err(_) => {
                     let name = rel.rsplit('/').next().unwrap_or(rel);
-                    if let Err(e) = Self::file_info(name, f).create(&parent) {
-                        tracing::warn!("placeholder {rel}: {e}");
+                    match Self::file_info(name, f).create(&parent) {
+                        Ok(_) => tracing::debug!("placeholder {rel}"),
+                        Err(e) => tracing::warn!("placeholder {rel}: {e}"),
                     }
                 }
                 Ok(file) => {
@@ -310,10 +313,17 @@ impl SyncFilter for Provider {
         tracing::debug!("fetch_placeholders {}", request.path().display());
         let dir = rel_of(&self.root, &request.path()).ok_or(CloudErrorKind::NotUnderSyncRoot)?;
         let all = self.list_all().map_err(cerr)?;
-        let mut items = self.children(&dir, &all);
-        // Entries that already exist locally fail individually; that's fine.
-        let _ = ticket.pass_with_placeholders(&mut items);
-        Ok(())
+        let here = if dir.is_empty() { self.root.clone() } else { self.local(&dir) };
+        // Only what isn't there yet (refresh may have created some already).
+        let mut items: Vec<PlaceholderCreateInfo> = self
+            .children(&dir, &all)
+            .into_iter()
+            .filter(|(name, _)| !here.join(name).exists())
+            .map(|(_, i)| i)
+            .collect();
+        let r = ticket.pass_with_placeholders(&mut items);
+        tracing::debug!("fetch_placeholders {dir:?}: {} new, {r:?}", items.len());
+        r.map_err(|e| cerr(e.into()))
     }
 
     fn fetch_data(&self, request: Request, ticket: ticket::FetchData, info: info::FetchData) -> CResult<()> {
@@ -435,16 +445,15 @@ pub fn mount(client: Arc<Client>, remote: NearUri, folder: &Path, _opts: MountOp
         .context("registering the sync root")?;
     }
     let pending = Arc::new(Mutex::new(HashSet::new()));
-    let provider = Provider { client: client.clone(), remote: remote.clone(), root: root.clone(), rt: rt.clone(), pending: pending.clone() };
-    let conn = Session::new().connect(&root, provider).context("connecting the sync root")?;
-
-    // Background: uploads of local changes (after they settle) and remote refreshes.
-    let worker = Arc::new(Provider { client: client.clone(), remote: remote.clone(), root, rt: rt.clone(), pending });
-    // Show the whole tree right away (placeholders only, no file data).
+    let worker = Arc::new(Provider { client: client.clone(), remote: remote.clone(), root: root.clone(), rt: rt.clone(), pending: pending.clone() });
+    // The whole tree as placeholders (no file data), before connecting.
     {
         let w = worker.clone();
         tokio::task::block_in_place(|| w.refresh()).context("listing the remote folder")?;
     }
+    let provider = Provider { client: client.clone(), remote: remote.clone(), root, rt: rt.clone(), pending };
+    let conn = Session::new().connect(&worker.root, provider).context("connecting the sync root")?;
+    // Background: uploads of local changes (after they settle) and remote refreshes.
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
     let changed = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let changed2 = changed.clone();
