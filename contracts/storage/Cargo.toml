@@ -21,3 +21,8 @@ serde_json = "1"
 anyhow = "1"
 nstorage-near = { path = "../../crates/nstorage-near" }
 nstorage-core = { path = "../../crates/nstorage-core" }
+nstorage-client = { path = "../../crates/nstorage-client" }
+nstorage-gateway = { path = "../../crates/nstorage-gateway" }
+tempfile = "3"
+ed25519-dalek = "2"
+axum = "0.8"

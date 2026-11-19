@@ -16,7 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use nstorage_core;
 
+mod chain;
 mod large;
+pub use chain::discover_gateway;
 pub use large::{Located, LocatedChunk};
 
 pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -60,6 +62,8 @@ pub struct Client {
     pub chunk_size: usize,
     /// Concurrent chunk transfers for put_file / put_reader / get_to_file / get_range.
     pub parallelism: usize,
+    /// `storage.near` access for sharing-by-account and policy grants.
+    chain: Option<nstorage_near::StorageContract>,
 }
 
 fn now_ms() -> u64 {
@@ -89,6 +93,7 @@ impl Client {
             root,
             chunk_size: DEFAULT_CHUNK_SIZE,
             parallelism: DEFAULT_PARALLELISM,
+            chain: None,
         }
     }
 
