@@ -249,8 +249,21 @@ impl App {
     }
 }
 
+/// `--version` / `--help` without starting the tray.
+fn handle_args() -> bool {
+    match std::env::args().nth(1).as_deref() {
+        Some("--version" | "-V") => println!("near-drive-tray {}", env!("CARGO_PKG_VERSION")),
+        Some("--help" | "-h") => println!("near-drive-tray: NEAR Drive status in the system tray / menu bar.\nUsage: near-drive-tray [--version]"),
+        _ => return false,
+    }
+    true
+}
+
 #[cfg(target_os = "linux")]
 fn main() -> Result<()> {
+    if handle_args() {
+        return Ok(());
+    }
     // ksni runs the tray on its own thread; this thread polls and handles clicks.
     let mut app = App::new()?;
     loop {
@@ -265,6 +278,9 @@ fn main() -> Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn main() -> Result<()> {
+    if handle_args() {
+        return Ok(());
+    }
     use tao::event::{Event, StartCause};
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     let event_loop = EventLoopBuilder::new().build();

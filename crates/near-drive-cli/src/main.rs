@@ -28,7 +28,7 @@ const DEFAULT_CONTRACT: &str = "drive.near";
 const CALL_TGAS: u64 = 50;
 
 #[derive(Parser)]
-#[command(name = "near-drive", about = "NEAR Drive: end-to-end encrypted storage addressed by NEAR accounts (also runs as `near drive`)")]
+#[command(name = "near-drive", version, about = "NEAR Drive: end-to-end encrypted storage addressed by NEAR accounts (also runs as `near drive`)")]
 struct Cli {
     #[arg(long, env = "NEAR_DRIVE_GATEWAY", default_value = DEFAULT_GATEWAY, global = true)]
     gateway: String,

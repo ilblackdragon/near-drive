@@ -2,7 +2,7 @@ use clap::Parser;
 use near_drive_gateway::{router, AppState, Config};
 
 #[derive(Parser)]
-#[command(about = "NEAR Drive gateway")]
+#[command(version, about = "NEAR Drive gateway")]
 struct Args {
     /// Path to JSON config.
     #[arg(long, env = "NEAR_DRIVE_CONFIG")]

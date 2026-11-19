@@ -6,6 +6,7 @@
 End-to-end encrypted files at `near://alice.near/path`, shared by account name, synced across your devices.
 
 [![CI](https://github.com/ilblackdragon/near-drive/actions/workflows/ci.yml/badge.svg)](https://github.com/ilblackdragon/near-drive/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ilblackdragon/near-drive)](https://github.com/ilblackdragon/near-drive/releases/latest)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
 ![Status](https://img.shields.io/badge/status-alpha-orange)
@@ -61,14 +62,21 @@ that the request is signed by a key of the account, and that the account's rules
 
 ## Install
 
-You need [Rust](https://rustup.rs) and [near-cli-rs](https://github.com/near/near-cli-rs) (NEAR Drive uses it for
-your NEAR keys).
+**Linux / macOS**
 
 ```sh
-cargo install near-cli-rs                                                       # if you don't have `near` yet
-cargo install --git https://github.com/ilblackdragon/near-drive near-drive-cli    # installs `near-drive`
-cargo install --git https://github.com/ilblackdragon/near-drive near-drive-tray   # optional: tray / menu-bar icon
+curl -fsSL https://github.com/ilblackdragon/near-drive/releases/latest/download/install.sh | sh
 ```
+
+**Windows** (PowerShell)
+
+```powershell
+irm https://github.com/ilblackdragon/near-drive/releases/latest/download/install.ps1 | iex
+```
+
+Prebuilt for Linux (x86_64, arm64), macOS (universal) and Windows (x64); the installers verify checksums. NEAR Drive
+uses [near-cli-rs](https://github.com/near/near-cli-rs) for your NEAR keys; the installer tells you how to get it if
+`near` is missing. Manual downloads, building from source and uninstalling: [docs/install.md](docs/install.md).
 
 Once `near-drive` is on your `PATH`, it also runs as a near-cli subcommand: `near drive ...`.
 
@@ -150,6 +158,7 @@ All three SDKs read and write the same format and use the same keys as the CLI.
 
 | | |
 |---|---|
+| [docs/install.md](docs/install.md) | installers, manual downloads, building from source |
 | [docs/cli.md](docs/cli.md) | every command, paths, keys and near-cli, sharing and access rules, large files |
 | [docs/sync.md](docs/sync.md) | synced folders: behaviour, conflicts, deletes, file names |
 | [docs/mount.md](docs/mount.md) | files on demand (`near drive mount`) |

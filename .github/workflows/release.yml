@@ -1,0 +1,145 @@
+name: release
+# Push a tag like v0.2.0 to build and publish binaries for every platform.
+# Asset names carry no version, so `releases/latest/download/<asset>` always
+# points at the newest release (used by install.sh / install.ps1).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  BINS: near-drive near-drive-gateway near-drive-tray
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on Ubuntu 22.04 so the binaries run on glibc 2.35+ distros.
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest, target: universal-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target == 'universal-apple-darwin' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: build (Linux / Windows)
+        if: matrix.target != 'universal-apple-darwin'
+        shell: bash
+        run: |
+          args=""; for b in $BINS; do args="$args --bin $b"; done
+          cargo build --release --locked --target ${{ matrix.target }} $args
+          mkdir -p out
+          for b in $BINS; do cp target/${{ matrix.target }}/release/$b$( [ "$RUNNER_OS" = Windows ] && echo .exe ) out/; done
+
+      - name: build (macOS universal)
+        if: matrix.target == 'universal-apple-darwin'
+        run: |
+          args=""; for b in $BINS; do args="$args --bin $b"; done
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do cargo build --release --locked --target $t $args; done
+          mkdir -p out
+          for b in $BINS; do
+            lipo -create -output out/$b target/aarch64-apple-darwin/release/$b target/x86_64-apple-darwin/release/$b
+          done
+          # Ad-hoc signature: required on Apple Silicon for modified (lipo'd) binaries.
+          for b in $BINS; do codesign --force --sign - out/$b; done
+          lipo -info out/near-drive
+
+      - name: smoke test
+        shell: bash
+        run: for b in near-drive near-drive-gateway; do ./out/$b --version; done
+
+      - name: package
+        shell: bash
+        run: |
+          name=near-drive-${{ matrix.target }}
+          mkdir -p dist/$name
+          cp out/* LICENSE-MIT LICENSE-APACHE README.md dist/$name/
+          cd dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a -tzip $name.zip $name >/dev/null
+          else
+            tar czf $name.tar.gz $name
+          fi
+          rm -rf $name
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: near-drive-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          cp install.sh install.ps1 dist/
+          notes="Install: see https://github.com/${{ github.repository }}/blob/main/docs/install.md"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "NEAR Drive $TAG" --notes "$notes"
+          fi
+
+  # Install from the published release with the real installers.
+  install:
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: install.sh
+        if: runner.os != 'Windows'
+        env:
+          NEAR_DRIVE_VERSION: ${{ inputs.tag || github.ref_name }}
+        run: |
+          sh install.sh
+          ~/.local/bin/near-drive --version
+          ~/.local/bin/near-drive-gateway --version
+          ~/.local/bin/near-drive-tray --version
+      - name: install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          NEAR_DRIVE_VERSION: ${{ inputs.tag || github.ref_name }}
+        run: |
+          ./install.ps1
+          & "$env:LOCALAPPDATA\NEAR Drive\bin\near-drive.exe" --version
+          & "$env:LOCALAPPDATA\NEAR Drive\bin\near-drive-gateway.exe" --version
