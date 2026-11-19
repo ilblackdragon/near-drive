@@ -38,6 +38,9 @@ pub struct PutOptions {
     /// Store plaintext (for public data such as open model weights).
     pub public: bool,
     pub content_type: Option<String>,
+    /// Extra recipients (`x25519:<base58>` keys) who can decrypt. Lets an app
+    /// write data only the user can read: no owner root key + `share_with`.
+    pub share_with: Vec<String>,
 }
 
 pub struct Client {
@@ -135,8 +138,15 @@ impl Client {
         let (chunks, enc) = if opts.public {
             (crypto::plaintext_chunks(data, self.chunk_size)?, None)
         } else {
-            let root = self.root.as_ref().ok_or_else(|| anyhow!("no root key loaded; run `nst keygen` or use --public"))?;
-            let (c, e) = crypto::encrypt_object(root, data, self.chunk_size)?;
+            let mut rs = Vec::new();
+            if let Some(root) = &self.root {
+                rs.push(crypto::Recipient::Owner(root));
+            }
+            for k in &opts.share_with {
+                rs.push(crypto::Recipient::X25519(crypto::parse_x25519(k)?));
+            }
+            ensure!(!rs.is_empty(), "no root key loaded and no share_with recipients; run `nst keygen` or use --public");
+            let (c, e) = crypto::encrypt_for(&rs, data, self.chunk_size)?;
             (c, Some(e))
         };
         let mut refs = Vec::with_capacity(chunks.len());
@@ -151,6 +161,11 @@ impl Client {
             enc,
             content_type: opts.content_type.clone(),
         };
+        self.commit_manifest(uri, &manifest).await
+    }
+
+    /// Publish `manifest` (chunks already uploaded) as the new version of `uri`.
+    async fn commit_manifest(&self, uri: &NearUri, manifest: &Manifest) -> Result<PointerRecord> {
         let mbytes = manifest.to_bytes();
         let stored = manifest.stored_size() + mbytes.len() as u64;
         let mref = self.put_chunk(&uri.namespace, mbytes).await?;
@@ -166,6 +181,23 @@ impl Client {
             return Ok(rec);
         }
         bail!("concurrent write conflict on {uri}")
+    }
+
+    /// This account's public key for receiving shared objects.
+    pub fn x25519_public(&self) -> Option<String> {
+        self.root.as_ref().map(RootKey::x25519_public)
+    }
+
+    /// Re-wrap the object key of `uri` to `recipient` (`x25519:<base58>`).
+    /// Chunks are reused; only a new manifest and record are written. The
+    /// recipient also needs read access via namespace policy.
+    pub async fn share(&self, uri: &NearUri, recipient: &str) -> Result<PointerRecord> {
+        let root = self.root.as_ref().ok_or_else(|| anyhow!("sharing requires the root key"))?;
+        let head = self.head(uri).await?.ok_or_else(|| anyhow!("{uri} not found"))?;
+        let enc = head.manifest.enc.as_ref().ok_or_else(|| anyhow!("{uri} is public; nothing to share"))?;
+        let enc = crypto::add_recipient(root, enc, &crypto::Recipient::X25519(crypto::parse_x25519(recipient)?))?;
+        let manifest = Manifest { enc: Some(enc), ..head.manifest };
+        self.commit_manifest(uri, &manifest).await
     }
 
     pub async fn get(&self, uri: &NearUri) -> Result<(ObjectHead, Vec<u8>)> {

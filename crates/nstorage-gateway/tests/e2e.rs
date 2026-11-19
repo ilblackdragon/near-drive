@@ -189,3 +189,26 @@ fn walk(p: std::path::PathBuf) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+#[tokio::test]
+async fn sharing_and_app_writes_for_user() {
+    let env = start().await;
+    let bob_root = RootKey::generate();
+    let bob_pk = bob_root.x25519_public();
+    let bob = env.client("bob.near", Some(bob_root));
+    // app writes into bob's prefix, encrypted only to bob; app can't read it back
+    let app = env.client("app.near", None);
+    let uri = u("near://app.near/users/bob.near/inbox/1");
+    app.put(&uri, b"secret for bob", &PutOptions { share_with: vec![bob_pk.clone()], ..Default::default() }).await.unwrap();
+    assert_eq!(bob.get(&uri).await.unwrap().1, b"secret for bob");
+    assert!(app.get(&uri).await.is_err());
+
+    // alice shares one of her objects with bob after the fact
+    let alice = env.client("alice.near", Some(RootKey::generate()));
+    let a_uri = u("near://alice.near/doc");
+    alice.put(&a_uri, b"shared doc", &PutOptions::default()).await.unwrap();
+    let rec = alice.share(&a_uri, &bob_pk).await.unwrap();
+    assert_eq!(rec.seq, 2);
+    // gateway policy still blocks bob (no grant) -> 403; decryption alone is not access
+    assert!(bob.get(&a_uri).await.unwrap_err().to_string().contains("403"));
+}

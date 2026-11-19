@@ -46,7 +46,14 @@ enum Cmd {
         public: bool,
         #[arg(long)]
         content_type: Option<String>,
+        /// Also encrypt to this recipient (`x25519:<base58>`); repeatable.
+        #[arg(long = "share")]
+        share: Vec<String>,
     },
+    /// Give a recipient (`x25519:<base58>`) the key to an existing object.
+    Share { uri: String, recipient: String },
+    /// Print this account's public key for receiving shared objects.
+    Whoami,
     /// Download to a file (default stdout).
     Get { uri: String, dst: Option<PathBuf> },
     /// List objects under a prefix.
@@ -135,7 +142,7 @@ async fn main() -> Result<()> {
             write_private(out, &serde_json::to_string_pretty(&json)?)?;
             println!("{}", keys::format_public_key(&sk.verifying_key()));
         }
-        Cmd::Put { src, uri, public, content_type } => {
+        Cmd::Put { src, uri, public, content_type, share } => {
             let c = client(&cli)?;
             let uri = NearUri::parse(uri)?;
             let mut data = vec![];
@@ -144,7 +151,7 @@ async fn main() -> Result<()> {
             } else {
                 data = std::fs::read(src).with_context(|| format!("reading {src}"))?;
             }
-            let rec = c.put(&uri, &data, &PutOptions { public: *public, content_type: content_type.clone() }).await?;
+            let rec = c.put(&uri, &data, &PutOptions { public: *public, content_type: content_type.clone(), share_with: share.clone() }).await?;
             eprintln!("{uri} seq={} size={} stored={}", rec.seq, rec.size, rec.stored_size);
         }
         Cmd::Get { uri, dst } => {
@@ -160,6 +167,15 @@ async fn main() -> Result<()> {
             for e in c.list(&NearUri::parse(uri)?).await? {
                 println!("{:>12}  seq={:<4} {:<24} {}", e.size, e.seq, e.writer, e.path);
             }
+        }
+        Cmd::Share { uri, recipient } => {
+            let rec = client(&cli)?.share(&NearUri::parse(uri)?, recipient).await?;
+            eprintln!("shared; seq={}", rec.seq);
+        }
+        Cmd::Whoami => {
+            let c = client(&cli)?;
+            println!("account: {}", c.account());
+            println!("x25519:  {}", c.x25519_public().unwrap_or_else(|| "(no root key; run `nst keygen`)".into()));
         }
         Cmd::Rm { uri } => {
             client(&cli)?.delete(&NearUri::parse(uri)?).await?;
