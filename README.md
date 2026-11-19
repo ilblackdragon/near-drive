@@ -1,374 +1,158 @@
+<div align="center">
+
 # NEAR Drive
 
-NEAR-account-addressed, end-to-end-encrypted object storage: `near://alice.near/path/to/object`.
-See [DESIGN.md](DESIGN.md) for the architecture and roadmap.
+**Private storage for every NEAR account.**
+End-to-end encrypted files at `near://alice.near/path`, shared by account name, synced across your devices.
 
-## Components
+[![CI](https://github.com/ilblackdragon/near-drive/actions/workflows/ci.yml/badge.svg)](https://github.com/ilblackdragon/near-drive/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
+![Status](https://img.shields.io/badge/status-alpha-orange)
 
-| crate | what |
-|---|---|
-| `near-drive-core` | URIs, chunked XChaCha20-Poly1305 envelope encryption, manifests, signed pointer records, request signing, namespace policy |
-| `near-drive-client` | Rust SDK: chunk + encrypt + sign, verifies everything it reads; streaming `put_file`/`get_to_file`/`get_range` for large objects |
-| `near-drive-gateway` | stateless HTTP gateway; NEAR access-key auth (RPC `view_access_key` or dev keys); blob backends fs / S3 / R2 / MinIO / HTTP blob bridge with storage classes and replication; fs or S3 (multi-gateway CAS) index; chunk cache; `?mode=locate` direct URLs; JSONL usage metering |
-| `near-drive-s3` | S3-compatible local sidecar: SigV4/SigV2 verification, aws-chunked + checksum trailers, S3 ops → native API |
-| `near-drive-cli` | the `near-drive` binary, also `near drive` (near-cli-rs extension): `login`/`logout`, `keygen [--ckd]`, `put`, `get` (streaming, `--range`, `--class`), `ls`, `rm`, `share`, `grant`, `rules`, `publish-key`, `whoami`, `gateways`, `up`/`down` (S3 endpoint; `s3-proxy` in the foreground); interactive when run in a terminal. NEAR keys come from near-cli ([below](#cli-near-drive--near-drive)) |
-| `near-drive-chain` | NEAR JSON-RPC views + signed function calls (small hand-rolled borsh tx builder) for `drive.near` |
-| `contracts/drive` | the `drive.near` contract: namespace rules, X25519 keys, gateway registry, credential epochs, anchors, stablecoin / NEAR Intents escrow ([docs/payments.md](docs/payments.md)) |
+[Install](#install) · [Quick start](#quick-start) · [Sync a folder](#sync-a-folder) · [S3 apps](#use-it-from-s3-apps) · [SDKs](#sdks) · [Docs](#documentation)
 
-## CLI: `near drive` / `near-drive`
+</div>
 
-One binary, two ways to run it:
+---
 
-- `near drive <command>` once `near-drive` is on `PATH`. near-cli-rs runs `near-<name>` for subcommands it
-  does not know (like `cargo`). (`near storage` is taken: near-cli keeps it as a legacy alias of `view-state`.)
-- `near-drive <command>` standalone.
+## Why NEAR Drive
+
+- 🔐 **End-to-end encrypted.** Files are encrypted on your device. Gateways and storage providers only ever see
+  ciphertext.
+- 🪪 **Your NEAR account is your login.** No new accounts or passwords: requests are signed with your NEAR keys, which
+  stay in near-cli. Your encryption key can be re-derived from your account on any device.
+- 🤝 **Share by account name.** `near drive share report.pdf bob.near`. Folder-level rules ("each user reads and
+  writes their own folder, the app pays") live onchain.
+- 📁 **Dropbox-style sync** on Linux, macOS and Windows, plus a CLI, an S3-compatible endpoint for existing tools, and
+  Rust / TypeScript / Python SDKs.
+- 🌐 **No single operator.** Gateways are stateless and anyone can run one; storage sits on S3 / R2, Filecoin or
+  Shelby behind them, and you never have to pick.
+- 🏋️ **Built for big files too.** Parallel, resumable transfers, byte-range reads and direct downloads for model
+  weights and datasets.
+
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph dev["Your devices: encryption happens here"]
+        cli["near drive CLI"]
+        sync["Synced folder"]
+        s3["S3 apps<br/>(boto3, aws-cli)"]
+        sdk["Rust / TS / Python SDKs"]
+    end
+    keys["near-cli<br/>NEAR keys"]
+    gw["Gateways<br/>stateless, anyone can run one"]
+    contract["drive.near contract<br/>access rules · sharing keys<br/>gateway registry · payments"]
+    store[("Storage<br/>S3 / R2 · Filecoin · Shelby")]
+
+    keys -. signs .-> dev
+    dev -- "encrypted chunks,<br/>signed requests" --> gw
+    gw --> store
+    gw -. "checks keys & rules" .-> contract
+    dev -. "grant · publish-key" .-> contract
+```
+
+A file is split into chunks, encrypted with a key only you (and whoever you share with) can unwrap, and uploaded
+through any gateway. Each chunk is addressed by its hash, so everything you read back is verified. The gateway checks
+that the request is signed by a key of the account, and that the account's rules allow it. More in
+[DESIGN.md](DESIGN.md).
+
+## Install
+
+You need [Rust](https://rustup.rs) and [near-cli-rs](https://github.com/near/near-cli-rs) (NEAR Drive uses it for
+your NEAR keys).
 
 ```sh
-cargo install --path crates/near-drive-cli        # installs near-drive
-near drive login                                  # pick an account; adds a NEAR Drive session key via near-cli
-near drive keygen --ckd                           # encryption key derived from the account (MPC CKD)
-near drive put ./notes.txt docs/                  # -> near://<you>/docs/notes.txt (bare paths = your namespace)
-near drive get docs/notes.txt ./notes.txt          # other namespaces: near://bob.near/...
-near drive sync add ~/NearDrive                   # Dropbox-style folder <-> near://<you>/Drive/
-near drive up                                     # background: synced folders + local S3 endpoint (AWS_* exports)
-near drive down
-near drive                                        # no arguments: menu
+cargo install near-cli-rs                                                       # if you don't have `near` yet
+cargo install --git https://github.com/ilblackdragon/near-drive near-drive-cli    # installs `near-drive`
 ```
 
-**NEAR keys are near-cli's.** NEAR Drive never stores or creates NEAR keys itself:
+Once `near-drive` is on your `PATH`, it also runs as a near-cli subcommand: `near drive ...`.
 
-- Requests to the gateway are signed with a key from near-cli's keychain: the OS keychain entries `near` writes
-  (`near-<network>-<account>` / `<account>:<public key>`) or the legacy files under `~/.near-credentials/<network>/`.
-  The CLI lists the account's keys onchain and picks a function-call key for the drive contract first, then a
-  full-access key. `near drive whoami` shows which one and where it came from.
-- `near drive login` runs `near account add-key <account> grant-function-call-access --contract-account-id drive.near
-  ... autogenerate-new-keypair save-to-keychain`: near-cli generates the session key, stores it, and signs the
-  `AddKey` with whatever signer you choose (keychain, Ledger, seed phrase, ...). `near drive logout` deletes it.
-- Transactions (`grant`, `publish-key`, `keygen --ckd`, `login`, `logout`) are run by `near contract call-function
-  as-transaction ...`, so near-cli asks for the signer. Without a terminal it uses `sign-with-keychain send`; override
-  with `--near-sign "sign-with-ledger send"` (or `NEAR_DRIVE_NEAR_SIGN`).
-- `--network` is a near-cli connection name (`mainnet`, `testnet`, or your own from `near config add-connection`);
-  the RPC URL and the CKD MPC contract come from that connection.
-- `--credentials <file>` bypasses near-cli for everything (dev gateways, CI): requests and transactions are signed
-  with that key file.
+> **Alpha.** There is no public gateway or mainnet `drive.near` deployment yet. Point the CLI at a gateway with
+> `--gateway <url>` (or `NEAR_DRIVE_GATEWAY`), or [run your own](docs/gateway.md).
 
-The encryption root key is not a NEAR key and stays in `~/.near-drive/keys/<account>.root` (the TS and Python SDKs
-read it there). With `keygen --ckd` it can be re-derived from the account on any device.
-
-**Interactive mode.** In a terminal, anything missing is asked for with the same prompt library near-cli uses:
-`near drive` alone opens a menu; `near drive get` lists your files to pick from; `put` suggests a destination;
-`grant` asks who can read, write and pay; `keygen` asks CKD or random. Afterwards it prints the equivalent
-non-interactive command. Without a terminal (or with `--no-interactive`) missing arguments are errors.
-
-## Quickstart (dev)
+## Quick start
 
 ```sh
-cargo build
-PK=$(target/debug/near-drive --account alice.near dev-key --out /tmp/alice.json)
-cat > /tmp/gw.json <<JSON
-{"listen":"127.0.0.1:8787","data_dir":"/tmp/drive-data","dev_keys":{"alice.near":["$PK"]}}
-JSON
-target/debug/near-drive-gateway --config /tmp/gw.json &
+near drive login                        # pick your account; near-cli adds a limited NEAR Drive key
+near drive keygen --ckd                 # your encryption key, derived from your account (same on every device)
 
-export NEAR_DRIVE_ACCOUNT=alice.near NEAR_DRIVE_CREDENTIALS=/tmp/alice.json
-target/debug/near-drive keygen
-echo hello | target/debug/near-drive put - near://alice.near/memory/today.txt
-target/debug/near-drive ls near://alice.near/
-target/debug/near-drive get near://alice.near/memory/today.txt
+near drive put notes.txt                # -> near://<you>/notes.txt
+near drive put report.pdf docs/         # -> near://<you>/docs/report.pdf
+near drive ls
+near drive get docs/report.pdf
+near drive share docs/report.pdf bob.near
+
+near drive                              # no arguments: an interactive menu
 ```
 
-With real NEAR accounts, set `"rpc_url": "https://rpc.mainnet.near.org"` in the gateway config and drop
-`NEAR_DRIVE_CREDENTIALS`: the CLI then uses near-cli's keys (`near drive login`). The gateway accepts a full-access key
-or a function-call key for `storage_contract`.
+In a terminal, anything you leave out is asked for, and afterwards the CLI prints the full command so you can script
+it. Full reference: [docs/cli.md](docs/cli.md).
 
-With `rpc_url` set, the gateway reads namespace rules from the `storage_contract` (`get_rules`, cached 30 s; set
-`"contract_policies": false` to disable). Config `policies` entries override the contract for their namespaces, and are
-the only policy source without `rpc_url`. For example, an app pays for its users' data:
-
-```json
-"policies": {"app.near": [
-  {"prefix": "users/{account}/", "read": ["{account}"], "write": ["{account}", "app.near"], "payer": "app.near"}
-]}
-```
-
-The same rule onchain, plus sharing by account name (`--rpc-url` defaults to the near-cli connection's; `--contract`
-defaults to `drive.near`; `NEAR_DRIVE_GATEWAY=auto` picks the fastest healthy gateway from the onchain registry):
+## Sync a folder
 
 ```sh
-near drive --account app.near grant 'near://app.near/users/{account}/' --read '{account}' --write '{account},app.near' --payer app.near
-near drive rules app.near
-near drive --account bob.near publish-key            # set_enc_key with bob's x25519 key
-near drive --account alice.near share near://alice.near/doc/x bob.near   # looks up bob's key onchain
-near drive gateways
+near drive sync add ~/NearDrive         # ~/NearDrive <-> near://<you>/Drive/
+near drive up                           # keep it in sync in the background
+near drive sync status
 ```
 
-Onchain writes attach a NEAR deposit for storage staking (excess refunded), so near-cli must sign them with a
-full-access key (or Ledger); the session key cannot.
+Edits sync both ways, conflicts keep both copies, deletes from other devices go to a local trash, and edits made
+offline go up when you're back online. Details: [docs/sync.md](docs/sync.md).
 
-## drive.near contract
+## Use it from S3 apps
 
-`contracts/` is a separate cargo workspace (wasm). Build and test:
-
-```sh
-contracts/build.sh                                   # cargo near build → contracts/target/near/*/
-cd contracts && cargo test -p near-drive-contract      # unit tests + local sandbox (near-workspaces) tests
-```
-
-Methods (JSON args; `U128` = decimal string):
-
-| area | methods |
-|---|---|
-| policy | `set_rules(rules)` (payable; caller's namespace; ≤32 rules, one `{account}` per prefix), `get_rules(namespace)` |
-| keys | `set_enc_key(key)` / `remove_enc_key()` (payable), `get_enc_key(account_id)` |
-| revocation | `bump_cred_epoch() -> u64` (payable), `get_cred_epoch(account_id) -> u64` |
-| anchors | `anchor(namespace, root, seq)` (owner or active gateway; seq strictly increasing), `get_anchor(namespace)` |
-| registry | `register_gateway(info)` (stake ≥ `gateway_min_stake` + storage), `update_gateway(info)`, `deregister_gateway()`, `withdraw_gateway_stake()` (after delay), `get_gateway(operator)`, `list_gateways(from_index, limit)`, `gateways_count()` |
-| escrow | `ft_on_transfer`, `mt_on_transfer`, `set_spend_cap(per_day)`, `settle(entries)`, `request_withdraw_balance(asset, amount)`, `cancel_withdraw_balance()`, `withdraw_balance()`, `withdraw_earnings()`, `get_payer`, `get_earnings`, `is_settled`, `get_assets`, `get_settlers` |
-| owner | `new(owner_id, assets?, config?)`, `set_config(patch)`, `set_asset(asset)`, `add_settler(account_id, any_gateway)`, `remove_settler`, `set_owner`, `get_config`, `get_owner` |
-
-`info = {url, regions, backends, price_hint, attestation?}`. See [docs/payments.md](docs/payments.md) for funding
-(USDC `ft_transfer_call`, NEAR Intents `mt_transfer_call` / signed `transfer` intent) and settlement.
-
-## Storage backends, classes and index
-
-By default the gateway keeps chunks in `{data_dir}/chunks` and the index in `{data_dir}/index`. Those defaults suit a single
-dev gateway. The optional `storage` section of the gateway config sets up the following.
-
-**Backends** are named and can be:
-- `fs`: a local directory;
-- `s3`: AWS S3, Cloudflare R2 or MinIO;
-- `bridge`: an HTTP blob bridge, such as the Filecoin or Shelby bridges. The protocol is in [docs/blob-bridge.md](docs/blob-bridge.md).
-
-**Storage classes** are lists of backends:
-- An upload writes each chunk to every backend in its class. It succeeds once `min_successes` writes succeed (default: all backends).
-- Clients pick a class per upload with the `x-near-drive-class` chunk header (`PutOptions::class`, `near drive put --class bulk`). The default class is `hot`.
-- The gateway records the class in the object's index entry. Reads try that class's backends first, then its `previous`
-  backends, then all others, so a misplaced chunk is still found (and logged). Objects stored before classes were
-  recorded read the default class first.
-- **Migrating a class:** list the old backends in `previous` and the new ones in `backends`. New writes go to the new
-  backends; reads still find old chunks. Drop `previous` once the old chunks are copied. No per-chunk state is kept,
-  so any number of gateways can share the config.
-
-**The index** can live on S3/R2/MinIO and use conditional writes. With that setup, any number of gateways can share it safely.
-
-```json
-"storage": {
-  "backends": {
-    "r2":    {"type": "s3", "bucket": "near-drive", "endpoint": "https://<acct>.r2.cloudflarestorage.com", "region": "auto",
-              "access_key_id": "...", "secret_access_key": "...", "prefix": "chunks/", "presign_ttl_secs": 3600},
-    "fil":   {"type": "bridge", "url": "http://127.0.0.1:7070", "token": "..."},
-    "local": {"type": "fs", "path": "/var/lib/near-drive/chunks"}
-  },
-  "classes": {
-    "hot":  {"backends": ["r2", "fil"], "min_successes": 1, "previous": ["local"]},
-    "bulk": {"backends": ["fil"]}
-  },
-  "default_class": "hot",
-  "index": {"type": "s3", "bucket": "near-drive", "endpoint": "https://<acct>.r2.cloudflarestorage.com", "region": "auto", "prefix": "index/"},
-  "cache": {"path": "/var/cache/near-drive", "max_bytes": 10737418240}
-}
-```
-
-### Option reference
-
-- **Omitted fields.**
-  - `storage` omitted: `{"local": fs at data_dir/chunks}`.
-  - `classes` omitted: `hot` = every backend.
-  - `index` omitted: fs.
-- **`s3` fields.**
-  - Credentials, region and endpoint fall back to the standard `AWS_*` env vars.
-  - `allow_http: true` is required for `http://` MinIO.
-  - `virtual_hosted_style: true` switches to bucket-subdomain URLs.
-  - `prefix` defaults to `chunks/` for blobs and `index/` for the index.
-- **Direct URLs for S3 blobs.**
-  - Presigned GET URLs are returned by `?mode=locate`. Set `presign_ttl_secs: 0` to turn them off.
-  - With `public_url_base` (a public bucket or CDN), the gateway returns `{public_url_base}/{key}` instead.
-- **S3 key layout.**
-  - Chunks: `{prefix}b3/{hex[0..2]}/{hex}`.
-  - Index records: `{prefix}{namespace}/{path}`. Each path segment is percent-escaped per `object_store` rules (see `crates/near-drive-gateway/src/s3.rs`).
-  - Updates are `If-Match` CAS writes.
-  - A delete writes a CAS tombstone, because plain S3 DELETE is not conditional.
-- **`cache`.** A bounded, LRU, read-through chunk cache on local disk for remote backends. Chunks are checked against their cid before they are cached.
-- **`small_cache`** (on by default) makes small files cheap:
-  - `max_bytes` (64 MiB; 0 = off) of memory for blobs up to `max_item_bytes` (256 KiB): manifests and small
-    chunks. Uploads write through, so the commit right after an upload finds them in memory.
-  - `inline_max_bytes` (64 KiB; 0 = off): `?mode=locate` returns the chunks of objects up to this stored size inline
-    (`"data"`, base64), so a small read is one request. Inlined bytes are metered as egress.
-  - `index_ttl_ms` (0 = off): caches index entries. Writes and deletes through this gateway update it; with several
-    gateways sharing one index a read can be up to the TTL stale, so only raise it for a single writer gateway.
-  - `index_max_entries` (100 000).
-
-## Browser access (CORS)
-
-Off by default. To let web apps call a gateway directly, list their origins in the gateway config:
-
-```json
-"cors_origins": ["https://app.example"]
-```
-
-`["*"]` allows any origin. Requests are authenticated by NEAR signatures, not cookies, so credentials are never allowed.
-
-## Large objects
-
-The SDK streams data, so memory stays around `(parallelism + 2) × chunk_size` whatever the object size.
-
-| SDK call | What it does |
-|---|---|
-| `Client::put_file` / `put_reader` | Reads, encrypts and uploads chunk by chunk, with `client.parallelism` uploads in flight. Encryption is per chunk, in the same format as `put`. |
-| `Client::get_to_file` | Calls `GET ...?mode=locate` to get the record, the manifest and a direct URL per chunk (a presigned S3 URL or a bridge CDN URL). Fetches chunks in parallel and verifies every cid. Falls back to the gateway (`?chunk=`, which supports `Range`) when a direct URL is missing or fails. Decrypts each chunk and writes it at its offset. |
-| `get_to_writer` | Like `get_to_file`, but streams in order to any writer. |
-| `get_range(uri, a..b)` | Fetches and decrypts only the chunks that cover the range. |
-
-The CLI uses these calls:
-
-```sh
-near drive --chunk-mib 16 --parallel 16 put --class bulk model.safetensors near://alice.near/models/m.safetensors
-near drive get near://alice.near/models/m.safetensors ./m.safetensors
-near drive get --range 0-1048575 near://alice.near/models/m.safetensors > header.bin
-```
-
-### Bad networks and resuming
-
-Every request has a deadline and is retried on transient failures:
-- **Deadlines:** a 10 s connect timeout, a 60 s idle timeout (no bytes arriving), and a per-request deadline of
-  `30 s + size / 64 KiB/s`, so a stalled connection fails fast while a slow but moving one is not cut off.
-- **Retries:** connection errors, timeouts, truncated bodies, chunks whose bytes don't match their cid, 5xx, 408 and
-  429 are retried with full-jitter exponential backoff (250 ms doubling, capped at 30 s), honouring `Retry-After`.
-  The default is 8 attempts (`NetConfig`, CLI `--retries` / `NEAR_DRIVE_RETRIES`). Each attempt is signed afresh.
-- **Safe writes:** chunk uploads are idempotent (content-addressed). The record commit is a compare-and-swap; if its
-  response is lost, the client checks whether the current version is its own write before retrying, so a lost
-  response never turns into a false conflict or a duplicate version. A lost response to a delete is handled the same way.
-
-Interrupted transfers resume:
-- **Downloads** (`get_to_file`, CLI `get`): the partial `{file}.drive-part` and `{file}.drive-part.json` stay after a
-  failure. Running the same download again checks every chunk already on disk (by re-deriving its cid from the
-  bytes) and fetches only what is missing. A newer version of the object starts over.
-- **Uploads** (`put_file` with `PutOptions::resume_dir`; the CLI uses `~/.near-drive/uploads`, `--no-resume` to
-  disable): a journal records each chunk the gateway stored. Running the same upload again reuses the object's key,
-  so unchanged chunks re-encrypt to the same cids and are skipped. Before a chunk is sent, the journal durably
-  records a hash of its plaintext; if the file changed since (even with the same size and mtime), the journal is
-  discarded and the upload starts over with a fresh key, so a nonce is never reused for different bytes.
-- Uploads from stdin and the one-shot `put`/`get` calls retry but do not resume.
-
-`crates/near-drive-gateway/tests/resilience.rs` runs all of this through a fault-injecting proxy (503s, bodies cut
-mid-transfer, writes whose response is lost, dead links).
-
-## Billing (NEAR AI Cloud credits)
-
-Add a `billing` section to the gateway config to bill each prefix's `payer` in NEAR AI Cloud credits. Without the section, nothing changes.
-
-```json
-"billing": {"cloud_api_url": "https://cloud-api.near.ai", "token_env": "NEAR_DRIVE_CLOUD_API_TOKEN", "gateway_id": "gw-eu-1"}
-```
-
-- **Metering.** The gateway tails `usage.jsonl` and keeps live stored bytes per payer: a put adds `bytes` and releases `replaced_bytes`, and a delete releases `bytes`. It closes hourly windows into three meters: storage GiB-hours, egress GiB, and requests (puts, deletes and chunk reads). Bytes handed out as direct URLs by `?mode=locate` count as egress when the locate is served; this is an upper bound. State (log offset, accumulators, outbox) is saved atomically in `data_dir/billing/state.json`, so a restart neither loses nor double-counts usage. Remainders smaller than 0.001 units carry over to the next window.
-- **Reporting.** Every `report_interval_secs` (default 300), the gateway posts closed windows to cloud-api `POST /v1/internal/service-usage` with idempotency key `near-drive:{gateway_id}:{payer}:{window_start}:{service}`. Failed posts retry with exponential backoff (capped at `max_backoff_secs`). cloud-api deduplicates resends after a crash. Lines rejected permanently (400/409), or still failing after `dead_letter_after_secs` (default 7 days), go to `billing/dead_letter.jsonl`. The token comes from the env var named by `token_env` (cloud-api's `CLOUD_API_STORAGE_BILLING_TOKEN`). `gateway_id` must be unique per gateway.
-- **Credit gate.** Before a chunk upload, a put that grows storage, or egress (chunk read or locate), the gateway checks cloud-api `billing-status` for the payer. Answers are cached for 60 s while the payer can pay and 15 s once it cannot. When the payer cannot pay, the request gets `402 {"error": "...", "code": "payment_required", "payer": "...", "reason": "limit_exceeded" | "no_credits" | "unknown_account" | ...}`. Deletes are never gated. If cloud-api is unreachable, the last answer is reused for up to `stale_status_max_secs` (1 h). After that, `fail_open` decides. It defaults to `true`: usage is still metered and reported later, so an outage costs at most unpaid usage by payers with no credit, while failing closed would make cloud-api a hard dependency of every write. Set `fail_open` to `false` to answer `503 billing_unavailable` instead.
-- **Settlement.** `billing::settle::Settlement` is the plug-in point for the NEAR escrow settler (`settle([{payer, amount, gateway, period_id}])`). It ships with `cloud_credits` (default) and `log` (dev: logs lines, gate off) backends.
-- **Limits.** One meter reads one gateway's log, so a payer's bytes must be written and deleted through the same gateway for storage to integrate correctly. A NEAR account is billed to its personal NEAR AI Cloud organization and must have signed in to NEAR AI Cloud once; until then, writes get 402 `unknown_account`.
-
-## Synced folders (`near drive sync`)
-
-A local folder kept in two-way sync with a NEAR Drive folder, like Dropbox, on Linux, macOS and Windows (no kernel
-drivers: it is a real folder, so it works offline and with every app).
-
-```sh
-near drive sync add ~/NearDrive               # <-> near://<you>/Drive/ (or: sync add ~/Work Work/)
-near drive up                                 # keep registered folders in sync in the background (+ S3; --no-s3)
-near drive sync status                        # last sync, conflicts, errors per folder
-near drive sync run ~/NearDrive [--watch]     # sync now in the foreground instead
-near drive sync remove ~/NearDrive            # stop (files stay)
-```
-
-- **Encrypted** like any other write: the gateway and backends only see ciphertext. Every device of the account
-  with the same root key (`keygen --ckd` derives it anywhere) sees the same files.
-- **Change detection:** local changes come from file-system events (inotify / FSEvents / ReadDirectoryChangesW),
-  debounced, plus a rescan each pass; remote changes are picked up by polling (30 s). A file is uploaded once it has
-  been unchanged for 2 s (not mid-save); a touch without a content change transfers nothing.
-- **Never overwrites what it hasn't seen:** uploads and deletes are conditional on the version this device last
-  synced (`PutOptions::expect_seq`, `Client::delete_if`). When both sides changed, the remote version keeps the name
-  and the local one becomes `name (conflicted copy from <device> <date>).ext`, which is uploaded too. Identical
-  content on both sides (a copied folder) is not a conflict.
-- **Deletes are recoverable locally:** a file deleted elsewhere is moved to `<folder>/.near-drive/trash/`. A file
-  deleted locally is deleted remotely (only if unchanged there); a file edited on one side and deleted on the other is
-  kept.
-- **Robust transfers:** chunked, parallel, retried and resumable (see [Large objects](#large-objects)); downloads land
-  in a hidden temp file and are renamed into place atomically. Offline edits wait and go up when the gateway is
-  reachable again.
-- **Cross-platform names:** paths are stored with `/` and Unicode NFC (macOS writes decomposed names). Remote names
-  a platform can't hold (Windows: `<>:"|?*`, `CON`, trailing dots; case-only differences on macOS / Windows) are
-  skipped and reported, never deleted. OS litter (`.DS_Store`, `Thumbs.db`, `~$*`, `*.tmp`, partial downloads) is
-  not synced.
-- **State** lives in `<folder>/.near-drive/` (never synced); registered folders in `~/.near-drive/sync.json`. The
-  background service re-reads it, so `sync add` / `remove` take effect within seconds.
-
-Not built yet: files on demand (placeholders that download when opened: Windows Cloud Files API, macOS File
-Provider, FUSE on Linux), selective sync, push notifications instead of polling, and a tray/menu-bar app.
-
-## S3 sidecar (`near drive up` / `down`)
-
-Existing S3 code (boto3, aws-cli, aws-sdk-*) can talk to NEAR Drive by changing only `endpoint_url` and the keys:
-
-```sh
-near drive up                             # background, 127.0.0.1:9000, loopback only; prints AWS_* exports (also runs synced folders)
-#  keys generated once, stored 0600 in ~/.near-drive/s3-proxy.json; pid/log in ~/.near-drive/s3-proxy.{pid,log}
-near drive down                           # stop it
-near drive s3-proxy                       # same, in the foreground (containers, systemd); takes the same flags
-#  or: --access-key/--secret-key (env NEAR_DRIVE_S3_ACCESS_KEY / NEAR_DRIVE_S3_SECRET_KEY)
-#  --public-prefix weights/public/   store keys under that prefix unencrypted
-#  --bucket other.near               also list this namespace in ListBuckets
-```
+`near drive up` also starts an S3-compatible endpoint on `127.0.0.1:9000` and prints the `AWS_*` settings to export.
+Existing code only changes its endpoint, and your data stays end-to-end encrypted:
 
 ```python
-s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:9000",
-                  aws_access_key_id=AK, aws_secret_access_key=SK, region_name="us-east-1")
-s3.upload_file("ckpt.bin", "alice.near", "ckpts/step-100.bin")
+import boto3
+s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:9000")   # keys from the AWS_* exports
+s3.upload_file("ckpt.bin", "alice.near", "ckpts/step-100.bin")    # = near://alice.near/ckpts/step-100.bin
 ```
 
-The proxy encrypts client-side with the account's root key and signs requests with its NEAR key.
-- **Addressing.** Bucket = NEAR namespace and key = object path. Path-style URLs (`http://127.0.0.1:9000/alice.near/key`) work, and so does virtual-host style when the host is `alice.near.localhost`.
-- **Auth.** Accepted: SigV4 header and presigned auth, including signed `aws-chunked` with every chunk signature verified, `UNSIGNED-PAYLOAD` and `STREAMING-UNSIGNED-PAYLOAD-TRAILER`. `x-amz-checksum-{crc32,crc32c,crc64nvme,sha1,sha256}` and `Content-MD5` are checked. SigV2 is also accepted, because botocore < 1.36 presigns with it. Requests fail on a bad signature, a wrong key or more than 15 minutes of clock skew.
-- **Operations.**
-  - Buckets: ListBuckets, Head/Create/DeleteBucket (own namespace only, as no-ops) and GetBucketLocation.
-  - Objects: Put/Get/Head/Delete Object, with Range and the If-* conditions, plus DeleteObjects and CopyObject.
-  - Listing: ListObjects v1/v2 with prefix, delimiter, pagination and `encoding-type=url`.
-  - Multipart: Create/UploadPart/UploadPartCopy/Complete/Abort/ListParts/ListMultipartUploads. Parts are staged in `~/.near-drive/s3-staging` and uploaded with `put_file` on completion.
-  - Not supported (`NotImplemented`): ACLs, policies, tagging, versioning, lifecycle, CORS, SSE-C headers and SigV4a.
-- **Metadata.** Content-Type is kept in the manifest. `x-amz-meta-*` goes into an encrypted sidecar object `<key>.drive-s3meta`, which listings hide; keys ending in that suffix are reserved. ETag is the first 32 hex characters of the manifest cid, quoted (multipart objects have no `-N` suffix). Last-Modified comes from the record timestamp.
-- **Keys.** They must be valid NEAR Drive paths: no empty, `.` or `..` segments and no trailing `/`. Other keys get `InvalidArgument`.
+Supported operations and options: [docs/s3.md](docs/s3.md).
 
-`tests/boto3_smoke.sh` starts a dev gateway and the proxy and runs `tests/boto3_smoke.py`. Set `PYTHON=` to choose the boto3 install and `AWS_CLI=` to also test `aws s3 cp`.
+## SDKs
 
-## Tests
+| language | where | |
+|---|---|---|
+| Rust | [`crates/near-drive-client`](crates/near-drive-client) | streaming, parallel and resumable transfers |
+| TypeScript | [`sdk/ts`](sdk/ts) | Node ≥ 20 and browsers |
+| Python | [`sdk/python`](sdk/python) | Python ≥ 3.10 |
 
-`cargo test` runs the following:
-- unit tests;
-- a gateway+client e2e covering encryption at rest, overwrite/CAS, listing, namespace isolation, app-pays prefixes, and forged or stale record rejection;
-- `tests/streaming.rs`: streaming vs one-shot interop, ranges, storage classes, a blob bridge with direct URLs and fallback;
-- `crates/near-drive-sync/tests/sync.rs`: two devices syncing through a gateway: first sync, edits both ways, deletes to trash, conflicts (conflicted copies), touch without transfer, identical-content merge, conditional writes, offline, settle, the watch loop;
-- `tests/resilience.rs`: a fault-injecting proxy (503s, truncated bodies, lost write responses, dead links); resumed uploads and downloads send/fetch only what is missing; a changed file restarts with a fresh key; small reads take one request;
-- `tests/large.rs`: a large object with bounded memory;
-- `crates/near-drive-s3/tests/s3_e2e.rs`: gateway + S3 proxy driven by the AWS Rust SDK (and raw signed requests for chunk signatures, trailers, skew and presigned URLs).
-- `tests/contract_policy.rs`: gateway policy from `drive.near` through a mock RPC (cache, override, failure → 503).
+```rust
+use near_drive_client::{near_drive_core::NearUri, Client, PutOptions};
 
-Contract tests (`cd contracts && cargo test`, after `contracts/build.sh`; the sandbox node binary is downloaded on first
-run) include `tests/sandbox.rs` (contract flows with mock FT/MT tokens, plus the `near-drive-chain` tx builder) and
-`tests/gateway_chain.rs` (a real gateway resolving keys and rules from the sandbox chain, sharing by account, discovery).
-
-CLI scripts (after `cargo build`):
-- `tests/near_cli_e2e.sh`: sandbox node + contract + gateway; the CLI with near-cli-rs: key from near-cli's
-  keychain, `login` (session key added by near-cli), put/get/ls signed by it, `grant` and `publish-key` sent by
-  near-cli (also interactively, through near-cli's signer menu), `near drive ...` as an extension, `logout`.
-  Needs `near` and `contracts/build.sh`.
-- `tests/interactive_smoke.py` (pexpect): menu, account/network pickers, put, get from a listing, rm with
-  confirmation, and no prompts without a terminal.
-
-To run the S3 tests against a local MinIO (bind it to localhost only):
-
-```sh
-docker run -d --name drive-minio -p 127.0.0.1:19000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-  -e MINIO_DEFAULT_BUCKETS=near-drive-test bitnamilegacy/minio:latest
-export NEAR_DRIVE_TEST_S3_ENDPOINT=http://127.0.0.1:19000   # also _BUCKET, _ACCESS_KEY, _SECRET_KEY
-cargo test -p near-drive-gateway --test s3          # index CAS on S3, two gateways sharing one index, presigned locate, cache
-NEAR_DRIVE_TEST_LARGE_MB=200 cargo test -p near-drive-gateway --test large -- --nocapture
+let client = Client::new("https://gateway.example", "alice.near", signing_key, Some(root_key));
+let uri = NearUri::parse("near://alice.near/memory/today.json")?;
+client.put(&uri, br#"{"hello":"world"}"#, &PutOptions::default()).await?;
+let (_head, data) = client.get(&uri).await?;
 ```
+
+All three SDKs read and write the same format and use the same keys as the CLI.
+
+## Documentation
+
+| | |
+|---|---|
+| [docs/cli.md](docs/cli.md) | every command, paths, keys and near-cli, sharing and access rules, large files |
+| [docs/sync.md](docs/sync.md) | synced folders: behaviour, conflicts, deletes, file names |
+| [docs/s3.md](docs/s3.md) | the S3-compatible endpoint |
+| [docs/gateway.md](docs/gateway.md) | running a gateway: storage backends, classes, caches, billing |
+| [docs/contract.md](docs/contract.md) | the `drive.near` contract |
+| [docs/ckd.md](docs/ckd.md) | deriving encryption keys from your account (MPC CKD) |
+| [docs/payments.md](docs/payments.md) | paying for storage with stablecoins / NEAR Intents |
+| [docs/backends.md](docs/backends.md), [docs/blob-bridge.md](docs/blob-bridge.md) | storage providers and the bridge protocol |
+| [DESIGN.md](DESIGN.md) | architecture, protocol, roadmap and what is verified |
+| [docs/development.md](docs/development.md) | building from source, running locally, tests |
+
+## Contributing
+
+Issues and pull requests are welcome. See [docs/development.md](docs/development.md) to build and test locally.
+
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.

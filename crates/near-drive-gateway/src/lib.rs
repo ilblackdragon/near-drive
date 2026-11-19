@@ -57,7 +57,7 @@ pub struct Config {
     /// Read namespace rules from `storage_contract` via `rpc_url` (cached 30 s).
     #[serde(default = "default_true")]
     pub contract_policies: bool,
-    /// Blob backends, storage classes, index store, chunk cache (see README).
+    /// Blob backends, storage classes, index store, caches (see docs/gateway.md).
     #[serde(default)]
     pub storage: StorageConfig,
     /// NEAR AI Cloud credits billing (metering, reporting, credit gate). Off when absent.

@@ -2,7 +2,7 @@
 
 A blob bridge is an HTTP service that stores NEAR Drive chunks in some other
 system, such as Filecoin Onchain Cloud or Shelby. The gateway uses it as one
-more blob backend (`{"type": "bridge"}`, see README). Bridges never see
+more blob backend (`{"type": "bridge"}`, see [gateway.md](gateway.md)). Bridges never see
 plaintext: chunks are opaque, content-addressed ciphertext (or public data).
 
 Reference implementations:
@@ -108,7 +108,7 @@ the gateway instead.
 
 ## Gateway behaviour
 
-The gateway uses the bridge as a storage-class member (see README).
+The gateway uses the bridge as a storage-class member (see [gateway.md](gateway.md#storage-backends-classes-and-index)).
 - **Writes:** a storage class writes each chunk to all of its backends
   concurrently. The upload succeeds once `min_successes` of those writes
   succeed.

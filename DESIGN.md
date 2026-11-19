@@ -198,7 +198,7 @@ Metered units:
 
 ## 7. `drive.near` contract (phase 2)
 
-Implemented in `contracts/drive` (method list in README.md; payments in docs/payments.md):
+Implemented in `contracts/drive` (method list in docs/contract.md; payments in docs/payments.md):
 
 - `register_gateway(info)` / `update_gateway` / `deregister_gateway` / `withdraw_gateway_stake` (NEAR stake, unstake delay), `list_gateways`
 - `set_rules(rules)`, `get_rules(namespace)`
