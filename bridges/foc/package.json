@@ -1,0 +1,18 @@
+{
+  "name": "@nstorage/bridge-foc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "nstorage-foc-bridge": "dist/main.js"
+  },
+  "scripts": {
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@nstorage/bridge-common": "0.1.0",
+    "@filoz/synapse-sdk": "^3.0.1",
+    "viem": "^2.58.0",
+    "@filoz/synapse-core": "^0.11.1"
+  }
+}

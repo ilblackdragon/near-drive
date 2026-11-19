@@ -1,0 +1,23 @@
+{
+  "name": "nstorage-bridges",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "common",
+    "foc",
+    "shelby"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -b common foc shelby",
+    "typecheck": "tsc -p tsconfig.tests.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}
