@@ -20,6 +20,9 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+/// Chunk-at-a-time encrypt/decrypt with the same format as `encrypt_for` / `decrypt_object`.
+pub mod stream;
+
 pub const ALG: &str = "xchacha20poly1305-chunked-v1";
 pub const TAG_LEN: usize = 16;
 
