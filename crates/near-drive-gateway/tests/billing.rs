@@ -100,7 +100,10 @@ struct Env {
 impl Env {
     fn client(&self, account: &str) -> Client {
         // 503 billing_unavailable is retried; keep these tests fast.
-        let mut c = Client::new(&self.url, account, self.keys[account].clone(), Some(RootKey::generate()));
+        // Writers check only their own records here (no chain in these tests).
+        let root = RootKey::generate();
+        let trusted = near_drive_client::TrustedWriters::new().key(account, root.sign_public_key());
+        let mut c = Client::new(&self.url, account, self.keys[account].clone(), Some(root)).with_writer_check(near_drive_client::WriterCheck::Trusted(trusted));
         c.set_net(near_drive_client::NetConfig { attempts: 2, base_delay: std::time::Duration::from_millis(10), ..Default::default() });
         c
     }

@@ -15,7 +15,7 @@ import { blake3 } from "@noble/hashes/blake3.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { base58, base64, b58N, b64N, bytesToHex, concatBytes, hexN, hexToBytes, randomBytes, u64be, utf8ToBytes } from "./bytes.js";
-import { formatX25519, parseX25519 } from "./keys.js";
+import { formatX25519, parseX25519, publicKeyOf } from "./keys.js";
 
 export const ALG = "xchacha20poly1305-chunked-v1";
 export const TAG_LEN = 16;
@@ -88,6 +88,19 @@ export class RootKey {
 
   kek(): Uint8Array {
     return this.#derive("near-drive/v1/kek");
+  }
+
+  /**
+   * Ed25519 seed that signs pointer records: HKDF-SHA256(salt="near-drive", ikm=root,
+   * info="near-drive/v1/sign"), used as an RFC 8032 secret key (ed25519-dalek `SigningKey::from_bytes`).
+   */
+  signSeed(): Uint8Array {
+    return this.#derive("near-drive/v1/sign");
+  }
+
+  /** `ed25519:<base58>` record-signing key; publish it with `set_sign_key` (`near drive publish-key`). */
+  signPublicKey(): string {
+    return publicKeyOf(this.signSeed());
   }
 
   /** Short public fingerprint of the KEK so readers can pick the right wrapped key. */

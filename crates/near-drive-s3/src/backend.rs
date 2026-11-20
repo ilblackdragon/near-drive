@@ -58,6 +58,16 @@ pub struct ListItem {
     pub manifest_cid: Option<String>,
 }
 
+/// One page of a backend listing (S3 ListObjects semantics).
+#[derive(Debug, Clone, Default)]
+pub struct ListPage {
+    pub items: Vec<ListItem>,
+    /// Rolled-up prefixes, each ending with the delimiter.
+    pub prefixes: Vec<String>,
+    /// Start-after for the next page; `None` at the end.
+    pub next: Option<String>,
+}
+
 pub enum PutSource {
     Mem(Vec<u8>),
     /// A local file to upload; the backend may delete it afterwards.
@@ -179,8 +189,11 @@ pub trait ObjectBackend: Send + Sync + 'static {
     fn put(&self, ns: &str, path: &str, src: PutSource, p: &PutParams) -> impl Future<Output = BResult<ObjectInfo>> + Send;
     /// `Ok(false)` if the object did not exist.
     fn delete(&self, ns: &str, path: &str) -> impl Future<Output = BResult<bool>> + Send;
-    /// All readable objects whose path starts with `prefix`, any order.
-    fn list(&self, ns: &str, prefix: &str) -> impl Future<Output = BResult<Vec<ListItem>>> + Send;
+    /// One page of the readable objects whose path starts with `prefix`
+    /// (raw string prefix), after `start_after` (a key or, with a delimiter,
+    /// a common prefix whose subtree is skipped), at most `limit` items.
+    /// Pages may be short; continue from `next` until it is `None`.
+    fn list_page(&self, ns: &str, prefix: &str, delimiter: Option<&str>, start_after: Option<&str>, limit: usize) -> impl Future<Output = BResult<ListPage>> + Send;
 }
 
 /// [`ObjectBackend`] over `near_drive_client::Client`.
@@ -360,11 +373,16 @@ impl ObjectBackend for ClientBackend {
         }
     }
 
-    async fn list(&self, ns: &str, prefix: &str) -> BResult<Vec<ListItem>> {
+    async fn list_page(&self, ns: &str, prefix: &str, delimiter: Option<&str>, start_after: Option<&str>, limit: usize) -> BResult<ListPage> {
         // Not validated as an object path: S3 prefixes are arbitrary strings.
         let p = NearUri { namespace: ns.to_string(), path: prefix.to_string() };
-        let entries = self.client.list(&p).await?;
-        Ok(entries.into_iter().map(|e| ListItem { key: e.path, size: e.size, ts_ms: e.ts_ms, manifest_cid: e.manifest_cid }).collect())
+        // The gateway's cursor is a start-after path, so S3 markers map onto it directly.
+        let page = self.client.list_page(&p, delimiter, start_after, Some(limit)).await?;
+        Ok(ListPage {
+            items: page.entries.into_iter().map(|e| ListItem { key: e.path, size: e.size, ts_ms: e.ts_ms, manifest_cid: e.manifest_cid }).collect(),
+            prefixes: page.common_prefixes,
+            next: page.next_cursor,
+        })
     }
 }
 
@@ -452,18 +470,25 @@ impl<B: ObjectBackend> ObjectBackend for Aliased<B> {
         self.inner.delete(&ns, &path).await
     }
 
-    async fn list(&self, ns: &str, prefix: &str) -> BResult<Vec<ListItem>> {
+    async fn list_page(&self, ns: &str, prefix: &str, delimiter: Option<&str>, start_after: Option<&str>, limit: usize) -> BResult<ListPage> {
         match self.aliases.get(ns) {
-            None => self.inner.list(ns, prefix).await,
+            None => self.inner.list_page(ns, prefix, delimiter, start_after, limit).await,
             Some(a) => {
-                let items = self.inner.list(&a.namespace, &format!("{}{prefix}", a.prefix)).await?;
-                Ok(items
-                    .into_iter()
-                    .filter_map(|mut it| {
-                        it.key = it.key.strip_prefix(&a.prefix)?.to_string();
-                        Some(it)
-                    })
-                    .collect())
+                let sa = start_after.map(|s| format!("{}{s}", a.prefix));
+                let page = self.inner.list_page(&a.namespace, &format!("{}{prefix}", a.prefix), delimiter, sa.as_deref(), limit).await?;
+                let strip = |s: String| s.strip_prefix(&a.prefix).map(str::to_string);
+                Ok(ListPage {
+                    items: page
+                        .items
+                        .into_iter()
+                        .filter_map(|mut it| {
+                            it.key = strip(it.key)?;
+                            Some(it)
+                        })
+                        .collect(),
+                    prefixes: page.prefixes.into_iter().filter_map(strip).collect(),
+                    next: page.next.and_then(strip),
+                })
             }
         }
     }

@@ -319,6 +319,9 @@ pub(crate) async fn pass(client: &Client, folder: &Folder, opts: &Options) -> Re
         s.map(|s| (s, skipped))
     })
     .await??;
+    // Local paths the scan could not read (and everything under them): their
+    // files would look deleted locally, so leave them out of the plan entirely.
+    let skipped_local: Vec<String> = skipped.iter().map(|(r, _)| r.clone()).collect();
     report.skipped.extend(skipped);
 
     // Plan (hashing touched files off the async runtime).
@@ -331,8 +334,8 @@ pub(crate) async fn pass(client: &Client, folder: &Folder, opts: &Options) -> Re
     state.files.retain(|k, _| !folder.excluded(k));
     let mut plan = vec![];
     for rel in keys {
-        if skipped_remote.contains(&rel) {
-            continue; // never act on a path we cannot represent here
+        if skipped_remote.contains(&rel) || local::under_skipped(&rel, &skipped_local) {
+            continue; // never act on a path we cannot represent or read here
         }
         let (base, l, r) = (state.files.get(&rel), scan.get(&rel), remote.get(&rel));
         let ls = {

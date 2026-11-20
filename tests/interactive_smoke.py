@@ -69,7 +69,8 @@ for _ in range(40):
         time.sleep(0.25)
 
 env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(t, "config"), NEAR_DRIVE_GATEWAY=f"http://127.0.0.1:{gw_port}",
-           NEAR_DRIVE_HOME=os.path.join(t, "home"), TERM="xterm", NO_COLOR="1")
+           NEAR_DRIVE_HOME=os.path.join(t, "home"), TERM="xterm", NO_COLOR="1",
+           NEAR_DRIVE_INSECURE_SKIP_WRITER_CHECK="1")  # dev gateway: no chain for signing keys
 for k in ("NEAR_DRIVE_ACCOUNT", "NEAR_DRIVE_NETWORK", "NEAR_DRIVE_CREDENTIALS"):
     env.pop(k, None)
 
@@ -88,6 +89,7 @@ try:
     p.expect("near drive|near-drive")
     p.expect(r"keygen --random")
     p.expect("root key written")
+    p.expect("BACK UP THIS KEY")
     p.expect(pexpect.EOF)
     assert os.path.exists(os.path.join(t, "home", "keys", f"{ACCOUNT}.root"))
     ok("keygen: account and key type chosen from menus; equivalent command printed")

@@ -547,6 +547,8 @@
       "kek": "e9f0ddb03ee5f902cb31d7e0d4fbf9177ca2d8043b1797e3cee9bb656aa85c1a",
       "kek_id": "e0f1c671584a328d",
       "root_key": "6465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80818283",
+      "sign_public_key": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5",
+      "sign_seed": "b2c63c73d4872b6a57f93173ae077f41e891799d706c97aad623b4dd1f193749",
       "x25519_public": "x25519:EcKqXKTptcRFuNhMNW9N683gmcJbEAvQbXcG24XgP2YR",
       "x25519_secret": "84c1cf68044774f62c360a8038ac45959e2d3d855080f4f4c0b0333a5cbc5d95"
     },
@@ -554,6 +556,8 @@
       "kek": "866043feb95968847896d72359769e78bf4d64060f77ea743e66070a177e0be9",
       "kek_id": "1481fa8db5bda7f0",
       "root_key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "sign_public_key": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG",
+      "sign_seed": "76aff77006c834b899630bee0d211a4c2551e30012d1d1240b06c84c212d7b70",
       "x25519_public": "x25519:BfAXE3eU9VFRFMVyLH5SditZpA8oMjxtX5ehR5334xCu",
       "x25519_secret": "e7eeb367d8cd3618b6236a551a0e672b0eae70d339ba05ecc90d24b466e83d1d"
     },
@@ -561,10 +565,48 @@
       "kek": "38c3447c83599efe1078652481a0cdd8d50634e6f2dfefa20c969babfcb8a324",
       "kek_id": "a4c23524033d41d5",
       "root_key": "c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7",
+      "sign_public_key": "ed25519:FmMsKaKmhnG395m4ZmeaQrwFaqVvELdXiqJgFp2zMsQi",
+      "sign_seed": "da6d1f90502014c2a812fb8589241e3caab88bbab85c437d612e09d8fc2e97e8",
       "x25519_public": "x25519:EtwEXyvmS9MkxagnUZi7efmd8BQPdErBbcZZFZcT6MBR",
       "x25519_secret": "c340f4bf25905455da15de96a18e3dfea53e7a01af6307d2f296b00fd301a2de"
     }
   },
+  "signed_records": [
+    {
+      "json": "{\"namespace\":\"alice.near\",\"path\":\"memory/today.txt\",\"manifest_cid\":\"b3:cca714a318cfd67ca32f1004cd12af7d060f716ad5bccb9550ef5da1d5aea4dc\",\"size\":6,\"stored_size\":120,\"seq\":1,\"writer\":\"alice.near\",\"writer_pk\":\"ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG\",\"ts_ms\":1763456789999,\"sig\":\"3EWFSCEVuUhQVg1iQQfXMjuxni8hpGV9noHJJFD7m3Xwc4rcP7pXcDME3jm32es7AYJoCQSH6DoHeoPyrcuDXpAr\"}",
+      "record": {
+        "manifest_cid": "b3:cca714a318cfd67ca32f1004cd12af7d060f716ad5bccb9550ef5da1d5aea4dc",
+        "namespace": "alice.near",
+        "path": "memory/today.txt",
+        "seq": 1,
+        "sig": "3EWFSCEVuUhQVg1iQQfXMjuxni8hpGV9noHJJFD7m3Xwc4rcP7pXcDME3jm32es7AYJoCQSH6DoHeoPyrcuDXpAr",
+        "size": 6,
+        "stored_size": 120,
+        "ts_ms": 1763456789999,
+        "writer": "alice.near",
+        "writer_pk": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG"
+      },
+      "root": "owner",
+      "signing_string": "near-drive-record-v1\nalice.near\nmemory/today.txt\nb3:cca714a318cfd67ca32f1004cd12af7d060f716ad5bccb9550ef5da1d5aea4dc\n6\n120\n1\nalice.near\ned25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG\n1763456789999"
+    },
+    {
+      "json": "{\"namespace\":\"app.near\",\"path\":\"users/alice.near/ü x\",\"manifest_cid\":\"b3:344580537255cf8e47fde6c5f0b421824bd6077d36aac1001cab3420edd97db1\",\"size\":0,\"stored_size\":300,\"seq\":7,\"writer\":\"alice.near\",\"writer_pk\":\"ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG\",\"ts_ms\":1763456789999,\"sig\":\"5df3TR13DCHmPaNVjaJRPHwBiqGYyes4x27sNuJzzAiH2E7nHDqe7hWf6JvY1CtC3DA43duhXWGXfy5gbZzUmGSH\"}",
+      "record": {
+        "manifest_cid": "b3:344580537255cf8e47fde6c5f0b421824bd6077d36aac1001cab3420edd97db1",
+        "namespace": "app.near",
+        "path": "users/alice.near/ü x",
+        "seq": 7,
+        "sig": "5df3TR13DCHmPaNVjaJRPHwBiqGYyes4x27sNuJzzAiH2E7nHDqe7hWf6JvY1CtC3DA43duhXWGXfy5gbZzUmGSH",
+        "size": 0,
+        "stored_size": 300,
+        "ts_ms": 1763456789999,
+        "writer": "alice.near",
+        "writer_pk": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG"
+      },
+      "root": "owner",
+      "signing_string": "near-drive-record-v1\napp.near\nusers/alice.near/ü x\nb3:344580537255cf8e47fde6c5f0b421824bd6077d36aac1001cab3420edd97db1\n0\n300\n7\nalice.near\ned25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG\n1763456789999"
+    }
+  ],
   "uri": {
     "encode_path": [
       {
@@ -642,5 +684,307 @@
         "uri": "near://0x.near/a/b.c/...d"
       }
     ]
-  }
+  },
+  "writer_checks": [
+    {
+      "accept": true,
+      "name": "own namespace, first key",
+      "namespace": "alice.near",
+      "path": "a/b",
+      "rules": [],
+      "sign_keys": [
+        {
+          "key": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG",
+          "since_ms": "1763000000000"
+        },
+        {
+          "key": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5",
+          "since_ms": "1763003600000"
+        }
+      ],
+      "ts_ms": 1763000060000,
+      "writer": "alice.near",
+      "writer_pk": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG"
+    },
+    {
+      "accept": true,
+      "name": "first key, 5 min before publication",
+      "namespace": "alice.near",
+      "path": "a/b",
+      "rules": [],
+      "sign_keys": [
+        {
+          "key": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG",
+          "since_ms": "1763000000000"
+        },
+        {
+          "key": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5",
+          "since_ms": "1763003600000"
+        }
+      ],
+      "ts_ms": 1762999700000,
+      "writer": "alice.near",
+      "writer_pk": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG"
+    },
+    {
+      "accept": false,
+      "name": "first key, too early",
+      "namespace": "alice.near",
+      "path": "a/b",
+      "rules": [],
+      "sign_keys": [
+        {
+          "key": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG",
+          "since_ms": "1763000000000"
+        },
+        {
+          "key": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5",
+          "since_ms": "1763003600000"
+        }
+      ],
+      "ts_ms": 1762999699999,
+      "writer": "alice.near",
+      "writer_pk": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG"
+    },
+    {
+      "accept": true,
+      "name": "old key within 5 min after rotation",
+      "namespace": "alice.near",
+      "path": "a/b",
+      "rules": [],
+      "sign_keys": [
+        {
+          "key": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG",
+          "since_ms": "1763000000000"
+        },
+        {
+          "key": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5",
+          "since_ms": "1763003600000"
+        }
+      ],
+      "ts_ms": 1763003899999,
+      "writer": "alice.near",
+      "writer_pk": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG"
+    },
+    {
+      "accept": false,
+      "name": "old key after rotation window",
+      "namespace": "alice.near",
+      "path": "a/b",
+      "rules": [],
+      "sign_keys": [
+        {
+          "key": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG",
+          "since_ms": "1763000000000"
+        },
+        {
+          "key": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5",
+          "since_ms": "1763003600000"
+        }
+      ],
+      "ts_ms": 1763003900000,
+      "writer": "alice.near",
+      "writer_pk": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG"
+    },
+    {
+      "accept": true,
+      "name": "new key",
+      "namespace": "alice.near",
+      "path": "a/b",
+      "rules": [],
+      "sign_keys": [
+        {
+          "key": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG",
+          "since_ms": "1763000000000"
+        },
+        {
+          "key": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5",
+          "since_ms": "1763003600000"
+        }
+      ],
+      "ts_ms": 1763060000000,
+      "writer": "alice.near",
+      "writer_pk": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5"
+    },
+    {
+      "accept": false,
+      "name": "new key before its window",
+      "namespace": "alice.near",
+      "path": "a/b",
+      "rules": [],
+      "sign_keys": [
+        {
+          "key": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG",
+          "since_ms": "1763000000000"
+        },
+        {
+          "key": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5",
+          "since_ms": "1763003600000"
+        }
+      ],
+      "ts_ms": 1763003299999,
+      "writer": "alice.near",
+      "writer_pk": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5"
+    },
+    {
+      "accept": true,
+      "name": "rule grants {account}",
+      "namespace": "app.near",
+      "path": "users/alice.near/x",
+      "rules": [
+        {
+          "payer": "app.near",
+          "prefix": "users/{account}/",
+          "read": [
+            "{account}"
+          ],
+          "write": [
+            "{account}",
+            "app.near"
+          ]
+        },
+        {
+          "payer": null,
+          "prefix": "public/",
+          "read": [
+            "*"
+          ],
+          "write": []
+        }
+      ],
+      "sign_keys": [
+        {
+          "key": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG",
+          "since_ms": "1763000000000"
+        },
+        {
+          "key": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5",
+          "since_ms": "1763003600000"
+        }
+      ],
+      "ts_ms": 1763003660000,
+      "writer": "alice.near",
+      "writer_pk": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5"
+    },
+    {
+      "accept": false,
+      "name": "rule does not grant another user's folder",
+      "namespace": "app.near",
+      "path": "users/bob.near/x",
+      "rules": [
+        {
+          "payer": "app.near",
+          "prefix": "users/{account}/",
+          "read": [
+            "{account}"
+          ],
+          "write": [
+            "{account}",
+            "app.near"
+          ]
+        },
+        {
+          "payer": null,
+          "prefix": "public/",
+          "read": [
+            "*"
+          ],
+          "write": []
+        }
+      ],
+      "sign_keys": [
+        {
+          "key": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG",
+          "since_ms": "1763000000000"
+        },
+        {
+          "key": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5",
+          "since_ms": "1763003600000"
+        }
+      ],
+      "ts_ms": 1763003660000,
+      "writer": "alice.near",
+      "writer_pk": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5"
+    },
+    {
+      "accept": false,
+      "name": "no rule matches: owner only",
+      "namespace": "app.near",
+      "path": "other/x",
+      "rules": [
+        {
+          "payer": "app.near",
+          "prefix": "users/{account}/",
+          "read": [
+            "{account}"
+          ],
+          "write": [
+            "{account}",
+            "app.near"
+          ]
+        },
+        {
+          "payer": null,
+          "prefix": "public/",
+          "read": [
+            "*"
+          ],
+          "write": []
+        }
+      ],
+      "sign_keys": [
+        {
+          "key": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG",
+          "since_ms": "1763000000000"
+        },
+        {
+          "key": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5",
+          "since_ms": "1763003600000"
+        }
+      ],
+      "ts_ms": 1763003660000,
+      "writer": "alice.near",
+      "writer_pk": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5"
+    },
+    {
+      "accept": false,
+      "name": "public/ is not writable",
+      "namespace": "app.near",
+      "path": "public/x",
+      "rules": [
+        {
+          "payer": "app.near",
+          "prefix": "users/{account}/",
+          "read": [
+            "{account}"
+          ],
+          "write": [
+            "{account}",
+            "app.near"
+          ]
+        },
+        {
+          "payer": null,
+          "prefix": "public/",
+          "read": [
+            "*"
+          ],
+          "write": []
+        }
+      ],
+      "sign_keys": [
+        {
+          "key": "ed25519:HiYAhEM4oz96gpxcJX56dWj8EyWoSA5YiaiRtzUxoWcG",
+          "since_ms": "1763000000000"
+        },
+        {
+          "key": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5",
+          "since_ms": "1763003600000"
+        }
+      ],
+      "ts_ms": 1763003660000,
+      "writer": "alice.near",
+      "writer_pk": "ed25519:8osZYEeRoJ2d8VH8VT27CqLc3tJLRX8MX6aSSx119tb5"
+    }
+  ]
 }

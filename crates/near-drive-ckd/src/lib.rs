@@ -55,22 +55,97 @@ pub struct CkdNetwork {
     pub domain_id: u64,
 }
 
+/// CKD domain NEAR Drive derives root keys in. Another domain (e.g. 6, also
+/// CKD) yields a *different* key for the same account, so this is pinned.
+pub const PINNED_DOMAIN: u64 = 2;
+
+/// The MPC contract NEAR Drive derives root keys from on `network_name`
+/// (near-cli's `network_name`: `mainnet`, `testnet`). `None` for custom
+/// networks (sandbox, localnet), which have no pin.
+pub fn pinned_contract(network_name: &str) -> Option<&'static str> {
+    match network_name {
+        "mainnet" => Some("v1.signer"),
+        "testnet" => Some("v1.signer-prod.testnet"),
+        _ => None,
+    }
+}
+
+/// Where a CKD request goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CkdTarget {
+    pub contract: String,
+    pub domain_id: u64,
+    /// The pinned contract and domain of a known network.
+    pub pinned: bool,
+}
+
+/// Picks the MPC contract and domain for `network_name`.
+///
+/// The root key depends on both, so a typo or an edited near-cli connection
+/// (`connection_contract` = its `mpc_contract_account_id`) must not silently
+/// produce a different key. On mainnet/testnet the pinned contract and
+/// [`PINNED_DOMAIN`] are used; anything else (a different `--ckd-contract` or
+/// `--ckd-domain`, or a connection pointing elsewhere) is refused unless
+/// `unpinned`. Custom networks have no pin: both flags must be given.
+pub fn resolve_target(
+    network_name: &str,
+    connection_contract: Option<&str>,
+    flag_contract: Option<&str>,
+    flag_domain: Option<u64>,
+    unpinned: bool,
+) -> Result<CkdTarget> {
+    let Some(pin) = pinned_contract(network_name) else {
+        let (Some(c), Some(d)) = (flag_contract, flag_domain) else {
+            bail!(
+                "network {network_name:?} has no pinned MPC contract (only mainnet and testnet do); \
+                 pass --ckd-contract and --ckd-domain explicitly{}",
+                connection_contract.map(|c| format!(" (the near-cli connection names {c})")).unwrap_or_default()
+            );
+        };
+        return Ok(CkdTarget { contract: c.into(), domain_id: d, pinned: false });
+    };
+    let why = "a different MPC contract or domain derives a different root key, \
+               so data and records made with your usual key would not match";
+    if !unpinned {
+        if let Some(c) = flag_contract.filter(|c| *c != pin) {
+            bail!("--ckd-contract {c} is not NEAR Drive's MPC contract on {network_name} ({pin}): {why}. Pass --ckd-unpinned if you really mean it");
+        }
+        if let Some(d) = flag_domain.filter(|d| *d != PINNED_DOMAIN) {
+            bail!("--ckd-domain {d} is not NEAR Drive's CKD domain ({PINNED_DOMAIN}): {why}. Pass --ckd-unpinned if you really mean it");
+        }
+        if flag_contract.is_none() {
+            if let Some(cc) = connection_contract.filter(|cc| *cc != pin) {
+                bail!(
+                    "the near-cli connection's mpc_contract_account_id is {cc}, not NEAR Drive's MPC contract on {network_name} ({pin}): {why}. \
+                     Fix the connection (`near config edit-connection`), pass --ckd-contract {pin}, or --ckd-unpinned to use {cc}"
+                );
+            }
+        }
+        return Ok(CkdTarget { contract: pin.into(), domain_id: PINNED_DOMAIN, pinned: true });
+    }
+    let contract = flag_contract.or(connection_contract).unwrap_or(pin).to_string();
+    let domain_id = flag_domain.unwrap_or(PINNED_DOMAIN);
+    let pinned = contract == pin && domain_id == PINNED_DOMAIN;
+    Ok(CkdTarget { contract, domain_id, pinned })
+}
+
 impl CkdNetwork {
     /// Known deployments (checked 2026-11-19 via the `state` view: domains 2
-    /// and 6 are CKD on both networks; 2 is the one the near/mpc docs use).
+    /// and 6 are CKD on both networks; 2 is the one the near/mpc docs use and
+    /// the one NEAR Drive pins).
     pub fn for_network(network: &str) -> Result<Self> {
-        let (rpc, contract) = match network {
-            "mainnet" => ("https://rpc.mainnet.near.org", "v1.signer"),
-            "testnet" => ("https://rpc.testnet.near.org", "v1.signer-prod.testnet"),
-            other => {
-                bail!("unknown network {other:?}; pass --ckd-contract and --ckd-rpc explicitly")
-            }
+        let contract = pinned_contract(network).ok_or_else(|| {
+            anyhow!("unknown network {network:?}; pass --ckd-contract and --ckd-rpc explicitly")
+        })?;
+        let rpc = match network {
+            "mainnet" => "https://rpc.mainnet.near.org",
+            _ => "https://rpc.testnet.near.org",
         };
         Ok(Self {
             network: network.into(),
             rpc_url: rpc.into(),
             contract: contract.into(),
-            domain_id: 2,
+            domain_id: PINNED_DOMAIN,
         })
     }
 
@@ -398,6 +473,33 @@ mod tests {
         )
         .is_err());
         assert!(parse_g1("bls12381g1:111").is_err());
+    }
+
+    #[test]
+    fn ckd_target_is_pinned() {
+        let t = resolve_target("mainnet", Some("v1.signer"), None, None, false).unwrap();
+        assert_eq!(t, CkdTarget { contract: "v1.signer".into(), domain_id: 2, pinned: true });
+        let t = resolve_target("testnet", None, Some("v1.signer-prod.testnet"), Some(2), false).unwrap();
+        assert!(t.pinned && t.contract == "v1.signer-prod.testnet");
+        // Other domain / contract / an edited connection: refused without --ckd-unpinned.
+        let e = resolve_target("testnet", None, None, Some(6), false).unwrap_err().to_string();
+        assert!(e.contains("--ckd-unpinned") && e.contains("domain 6"), "{e}");
+        assert!(resolve_target("testnet", None, Some("evil.testnet"), None, false).is_err());
+        let e = resolve_target("mainnet", Some("evil.near"), None, None, false).unwrap_err().to_string();
+        assert!(e.contains("evil.near") && e.contains("v1.signer"), "{e}");
+        // An explicit pinned --ckd-contract overrides the odd connection.
+        assert!(resolve_target("mainnet", Some("evil.near"), Some("v1.signer"), None, false).unwrap().pinned);
+        // --ckd-unpinned: the flag, else the connection; reported as unpinned.
+        let t = resolve_target("testnet", None, None, Some(6), true).unwrap();
+        assert_eq!((t.contract.as_str(), t.domain_id, t.pinned), ("v1.signer-prod.testnet", 6, false));
+        let t = resolve_target("mainnet", Some("evil.near"), None, None, true).unwrap();
+        assert_eq!((t.contract.as_str(), t.pinned), ("evil.near", false));
+        assert!(resolve_target("mainnet", None, None, None, true).unwrap().pinned);
+        // Custom networks: both flags required; the connection alone is not enough.
+        assert!(resolve_target("localnet", Some("v1.signer.test.near"), None, None, false).is_err());
+        assert!(resolve_target("localnet", None, Some("v1.signer.test.near"), None, false).is_err());
+        let t = resolve_target("localnet", None, Some("v1.signer.test.near"), Some(1), false).unwrap();
+        assert_eq!((t.contract.as_str(), t.domain_id, t.pinned), ("v1.signer.test.near", 1, false));
     }
 
     #[test]

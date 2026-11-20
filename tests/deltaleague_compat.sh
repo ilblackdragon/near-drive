@@ -29,6 +29,7 @@ export NEAR_DRIVE_ACCOUNT=league.near NEAR_DRIVE_GATEWAY="http://127.0.0.1:$GWP"
 NEAR_DRIVE_SECRET_KEY=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["private_key"])' "$T/league.json")
 NEAR_DRIVE_ROOT_KEY=$("$PY" -c 'import secrets; print(secrets.token_hex(32))')
 export NEAR_DRIVE_SECRET_KEY NEAR_DRIVE_ROOT_KEY
+export NEAR_DRIVE_INSECURE_SKIP_WRITER_CHECK=1 # dev gateway, no chain to check signing keys against
 export NEAR_DRIVE_S3_ACCESS_KEY=LEAGUEACCESSKEY00001 NEAR_DRIVE_S3_SECRET_KEY=league-secret-key-0123456789abcdefghijkl
 NO_COLOR=1 RUST_LOG=warn "$BIN/near-drive" --no-interactive s3-proxy --listen "127.0.0.1:$PXP" \
   --bucket-alias delta-artifacts=near://league.near/artifacts/ \

@@ -118,14 +118,93 @@ pub trait IndexStore: Send + Sync {
     async fn cas_put(&self, rec: &IndexEntry) -> Result<(), CasError>;
     /// Delete iff current seq == `expected_seq`.
     async fn delete(&self, ns: &str, path: &str, expected_seq: u64) -> Result<(), CasError>;
-    /// All live records in `ns` whose path starts with `prefix`, sorted by path.
-    async fn list(&self, ns: &str, prefix: &str) -> Result<Vec<IndexEntry>>;
+    /// One page of the live records in `ns` whose path starts with `prefix`
+    /// (a raw string prefix, not cut at `/`), sorted by path, after
+    /// `start_after` (exclusive). With a `delimiter`, paths with the delimiter
+    /// after the prefix are rolled up into `common_prefixes` (S3 semantics);
+    /// a `start_after` that is such a common prefix skips everything under it.
+    /// At most `limit` items (entries + common prefixes) are examined; the
+    /// page may hold fewer when some keys turn out to be deleted.
+    /// `next_cursor` is the `start_after` for the next page, `None` at the end.
+    async fn list_page(&self, ns: &str, prefix: &str, delimiter: Option<&str>, start_after: Option<&str>, limit: usize) -> Result<ListPage>;
     /// Every namespace that may hold records (it may also name namespaces
     /// whose records were all deleted). Used by garbage collection with
-    /// `list(ns, "")` to enumerate the whole index.
+    /// [`list_all`]-style page iteration to enumerate the whole index.
     async fn namespaces(&self) -> Result<Vec<String>> {
         Err(anyhow!("index store cannot enumerate namespaces"))
     }
+}
+
+/// Largest page an index listing returns.
+pub const MAX_LIST_LIMIT: usize = 1000;
+
+/// One page of an index listing ([`IndexStore::list_page`]).
+#[derive(Debug, Default, Clone)]
+pub struct ListPage {
+    pub entries: Vec<IndexEntry>,
+    /// Rolled-up prefixes (each ends with the delimiter), sorted.
+    pub common_prefixes: Vec<String>,
+    pub next_cursor: Option<String>,
+}
+
+/// Every live record under `prefix`, page by page (tests and small tools;
+/// full scans like GC should process pages as they come).
+pub async fn list_all(index: &dyn IndexStore, ns: &str, prefix: &str) -> Result<Vec<IndexEntry>> {
+    let mut out = vec![];
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = index.list_page(ns, prefix, None, cursor.as_deref(), MAX_LIST_LIMIT).await?;
+        out.extend(page.entries);
+        match page.next_cursor {
+            Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
+            Some(_) => return Err(anyhow!("index listing of {ns}/{prefix} did not advance")),
+            None => return Ok(out),
+        }
+    }
+}
+
+/// A listed key or rolled-up common prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Listed {
+    Key(String),
+    Prefix(String),
+}
+
+/// Whether `key` is excluded by the cursor: at or before it, or (when the
+/// cursor is a common prefix, i.e. ends with the delimiter) under it.
+pub(crate) fn before_cursor(key: &str, start_after: Option<&str>, delimiter: Option<&str>) -> bool {
+    match start_after {
+        None => false,
+        Some(sa) => key <= sa || (delimiter.is_some_and(|d| sa.ends_with(d)) && key.starts_with(sa)),
+    }
+}
+
+/// One page over `sorted` keys (ascending): S3 ListObjects semantics for
+/// prefix / delimiter / start-after / limit. Returns the page's items in
+/// order and the cursor for the next page.
+pub(crate) fn paginate(sorted: impl IntoIterator<Item = String>, prefix: &str, delimiter: Option<&str>, start_after: Option<&str>, limit: usize) -> (Vec<Listed>, Option<String>) {
+    let limit = limit.max(1);
+    let delimiter = delimiter.filter(|d| !d.is_empty());
+    let mut out: Vec<Listed> = vec![];
+    let mut last: Option<String> = None;
+    for k in sorted {
+        if !k.starts_with(prefix) || before_cursor(&k, start_after, delimiter) {
+            continue;
+        }
+        let item = match delimiter.and_then(|d| k[prefix.len()..].find(d).map(|i| k[..prefix.len() + i + d.len()].to_string())) {
+            Some(cp) if last.as_deref() == Some(cp.as_str()) => continue,
+            Some(cp) => Listed::Prefix(cp),
+            None => Listed::Key(k),
+        };
+        if out.len() == limit {
+            return (out, last);
+        }
+        last = Some(match &item {
+            Listed::Key(k) | Listed::Prefix(k) => k.clone(),
+        });
+        out.push(item);
+    }
+    (out, None)
 }
 
 pub struct FsBlobStore {
@@ -344,25 +423,37 @@ impl IndexStore for FsIndexStore {
         tokio::fs::remove_file(self.file(ns, path)).await.map_err(anyhow::Error::from)?;
         Ok(())
     }
-    async fn list(&self, ns: &str, prefix: &str) -> Result<Vec<IndexEntry>> {
+    /// Scans the namespace directory's file names (O(namespace)), but reads
+    /// only the page's records. Single-node dev store.
+    async fn list_page(&self, ns: &str, prefix: &str, delimiter: Option<&str>, start_after: Option<&str>, limit: usize) -> Result<ListPage> {
         let dir = self.root.join(ns);
         let mut rd = match tokio::fs::read_dir(&dir).await {
             Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ListPage::default()),
             Err(e) => return Err(e.into()),
         };
-        let mut out = vec![];
+        let mut paths = vec![];
         while let Some(e) = rd.next_entry().await? {
             let name = e.file_name().to_string_lossy().to_string();
             let Ok(p) = hex::decode(&name).map(|b| String::from_utf8_lossy(&b).to_string()) else { continue };
             if p.starts_with(prefix) {
-                if let Some(r) = self.read(ns, &p).await? {
-                    out.push(r);
+                paths.push(p);
+            }
+        }
+        paths.sort();
+        let (items, next_cursor) = paginate(paths, prefix, delimiter, start_after, limit);
+        let mut page = ListPage { next_cursor, ..Default::default() };
+        for it in items {
+            match it {
+                Listed::Prefix(p) => page.common_prefixes.push(p),
+                Listed::Key(p) => {
+                    if let Some(r) = self.read(ns, &p).await? {
+                        page.entries.push(r);
+                    }
                 }
             }
         }
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(out)
+        Ok(page)
     }
     async fn namespaces(&self) -> Result<Vec<String>> {
         let mut rd = match tokio::fs::read_dir(&self.root).await {
@@ -425,6 +516,43 @@ mod tests {
         assert!(!s.has(&cids[0]).await.unwrap());
         assert!(!s.delete_if_older(&cids[0], cutoff).await.unwrap(), "already gone");
         assert_eq!(s.list().unwrap().try_collect::<Vec<_>>().await.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn paginate_semantics() {
+        let keys = ["a/1", "a/2", "a/b/1", "a/b/2", "a/c", "ab", "b/1"].map(String::from);
+        let k = |s: &str| Listed::Key(s.into());
+        let p = |s: &str| Listed::Prefix(s.into());
+        assert_eq!(paginate(keys.clone(), "a", None, None, 10), (vec![k("a/1"), k("a/2"), k("a/b/1"), k("a/b/2"), k("a/c"), k("ab")], None));
+        assert_eq!(paginate(keys.clone(), "a/", Some("/"), None, 10), (vec![k("a/1"), k("a/2"), p("a/b/"), k("a/c")], None));
+        assert_eq!(paginate(keys.clone(), "", Some("/"), None, 2), (vec![p("a/"), k("ab")], Some("ab".into())));
+        assert_eq!(paginate(keys.clone(), "", Some("/"), Some("ab"), 2), (vec![p("b/")], None));
+        assert_eq!(paginate(keys.clone(), "a/", Some("/"), Some("a/b/"), 1), (vec![k("a/c")], None), "prefix cursor skips its subtree");
+        assert_eq!(paginate(keys.clone(), "a/", None, Some("a/b/1"), 2), (vec![k("a/b/2"), k("a/c")], None));
+        assert_eq!(paginate(keys, "a/", None, None, 2), (vec![k("a/1"), k("a/2")], Some("a/2".into())));
+    }
+
+    #[tokio::test]
+    async fn fs_index_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = FsIndexStore::new(dir.path().join("index"));
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
+        let mut want = vec![];
+        for i in 0..25 {
+            let path = format!("d{}/f{i:02}", i % 3);
+            let record = PointerRecord::new_signed("a.near", &path, &near_drive_core::cid(b"m"), 1, 2, 1, "a.near", &sk, 1);
+            idx.cas_put(&IndexEntry { record, class: None }).await.unwrap();
+            want.push(path);
+        }
+        want.sort();
+        let got: Vec<String> = list_all(&idx, "a.near", "").await.unwrap().into_iter().map(|e| e.record.path).collect();
+        assert_eq!(got, want);
+        let p = idx.list_page("a.near", "d1", None, None, 4).await.unwrap();
+        assert_eq!(p.entries.len(), 4);
+        assert_eq!(p.next_cursor.as_deref(), Some(p.entries[3].path.as_str()));
+        let p = idx.list_page("a.near", "", Some("/"), None, 1000).await.unwrap();
+        assert_eq!((p.entries.len(), p.common_prefixes), (0, vec!["d0/".to_string(), "d1/".into(), "d2/".into()]));
+        assert!(idx.list_page("b.near", "", None, None, 10).await.unwrap().entries.is_empty());
     }
 
     #[tokio::test]

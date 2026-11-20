@@ -76,6 +76,38 @@ impl FunctionCallTx<'_> {
     }
 }
 
+/// Per-call timeout for view calls and `tx` polls.
+const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// The first `send_tx` waits for execution; the RPC itself gives up after
+/// ~10 s with TIMEOUT_ERROR while the MPC network works (then we poll).
+const SEND_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long to wait for the CKD response (usually 5-10 s).
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(120);
+pub const DEFAULT_POLL: Duration = Duration::from_secs(2);
+
+/// A JSON-RPC error answer (as opposed to a transport failure).
+#[derive(Debug)]
+pub struct RpcError {
+    pub method: String,
+    /// `error.cause.name` (e.g. `UNKNOWN_TRANSACTION`, `INVALID_TRANSACTION`,
+    /// `TIMEOUT_ERROR`), else `error.name`.
+    pub cause: Option<String>,
+    pub error: Value,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rpc {}: {}", self.method, self.error)
+    }
+}
+
+impl std::error::Error for RpcError {}
+
+/// The RPC error cause of `e`, if it is an [`RpcError`].
+pub fn rpc_cause(e: &anyhow::Error) -> Option<&str> {
+    e.downcast_ref::<RpcError>().and_then(|r| r.cause.as_deref())
+}
+
 pub struct Rpc {
     url: String,
     http: reqwest::Client,
@@ -86,24 +118,35 @@ impl Rpc {
         Self {
             url: url.into(),
             http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10))
                 .build()
                 .expect("reqwest client"),
         }
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        self.call_within(method, params, CALL_TIMEOUT).await
+    }
+
+    async fn call_within(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let v: Value = self
             .http
             .post(&self.url)
+            .timeout(timeout)
             .json(&json!({"jsonrpc": "2.0", "id": "near-drive-ckd", "method": method, "params": params}))
             .send()
             .await
-            .with_context(|| format!("rpc {method}"))?
+            .with_context(|| format!("rpc {method} to {} (no answer within {timeout:?})", self.url))?
             .json()
-            .await?;
+            .await
+            .with_context(|| format!("rpc {method}: decoding response"))?;
         if let Some(e) = v.get("error") {
-            bail!("rpc {method}: {e}");
+            let cause = e
+                .pointer("/cause/name")
+                .or_else(|| e.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            return Err(RpcError { method: method.into(), cause, error: e.clone() }.into());
         }
         v.get("result")
             .cloned()
@@ -161,37 +204,76 @@ impl Rpc {
             .map_err(|_| anyhow!("bad block hash"))
     }
 
-    /// Sends a signed tx and waits for the final outcome (CKD is yield/resume:
-    /// the value arrives a few blocks later, so poll `tx` after a timeout).
-    async fn send_and_wait(
+    /// Sends a signed tx and waits for its final outcome. CKD is
+    /// yield/resume: the value arrives a few blocks after inclusion, so the
+    /// first `send_tx` often times out and we poll `tx`.
+    ///
+    /// Prints the tx hash first. Stops at once on INVALID_TRANSACTION. If the
+    /// node forgot the tx (UNKNOWN_TRANSACTION: dropped before inclusion), the
+    /// same signed bytes are sent again (same hash, so it cannot run twice).
+    /// On timeout the error names the hash and the first `send_tx` error.
+    pub async fn send_and_wait(
         &self,
         signed: &[u8],
         hash: &[u8; 32],
         sender: &str,
         deadline: Duration,
+        poll: Duration,
     ) -> Result<Value> {
         let hash58 = bs58::encode(hash).into_string();
+        eprintln!("CKD transaction {hash58}: sent, waiting for the MPC network (usually 5-10 s)");
         let started = std::time::Instant::now();
-        let first = self
-            .call("send_tx", json!({"signed_tx_base64": B64.encode(signed), "wait_until": "EXECUTED_OPTIMISTIC"}))
-            .await;
-        let mut last_err = match first {
+        let signed_b64 = B64.encode(signed);
+        let first_err = match self
+            .call_within("send_tx", json!({"signed_tx_base64": signed_b64, "wait_until": "EXECUTED_OPTIMISTIC"}), SEND_TIMEOUT)
+            .await
+        {
             Ok(v) if v.get("status").is_some() => return Ok(v),
             Ok(v) => anyhow!("send_tx: unexpected result {v}"),
-            Err(e) => e, // usually a timeout while the MPC network works
+            Err(e) if rpc_cause(&e) == Some("INVALID_TRANSACTION") => {
+                return Err(e.context(format!("transaction {hash58} rejected")))
+            }
+            Err(e) => e, // usually TIMEOUT_ERROR while the MPC network works
         };
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut resent = 0u32;
         while started.elapsed() < deadline {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(poll).await;
             match self
                 .call("tx", json!({"tx_hash": hash58, "sender_account_id": sender, "wait_until": "EXECUTED_OPTIMISTIC"}))
                 .await
             {
                 Ok(v) if v.get("status").is_some() => return Ok(v),
-                Ok(v) => last_err = anyhow!("tx {hash58}: no status yet: {v}"),
-                Err(e) => last_err = e,
+                Ok(v) => last_err = Some(anyhow!("no status yet: {v}")),
+                Err(e) if rpc_cause(&e) == Some("INVALID_TRANSACTION") => {
+                    return Err(e.context(format!("transaction {hash58} rejected")))
+                }
+                Err(e) if rpc_cause(&e) == Some("UNKNOWN_TRANSACTION") => {
+                    resent += 1;
+                    // Not seen by the node: re-broadcast the identical bytes.
+                    if let Err(se) = self
+                        .call("send_tx", json!({"signed_tx_base64": signed_b64, "wait_until": "NONE"}))
+                        .await
+                    {
+                        last_err = Some(se.context("re-sending"));
+                    } else {
+                        last_err = Some(e);
+                    }
+                }
+                Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.context(format!("tx {hash58} did not finish within {deadline:?}")))
+        let mut msg = format!(
+            "CKD transaction {hash58} did not finish within {deadline:?}; first send_tx error: {first_err:#}"
+        );
+        if let Some(l) = last_err {
+            msg.push_str(&format!("; last status check: {l:#}"));
+        }
+        if resent > 0 {
+            msg.push_str(&format!(" (the node did not know the tx; re-sent {resent}x)"));
+        }
+        msg.push_str(". Look the hash up in an explorer before retrying: if it succeeded, a retry just costs another request");
+        bail!(msg)
     }
 }
 
@@ -204,7 +286,7 @@ fn success_value(outcome: &Value) -> Result<Vec<u8>> {
 }
 
 /// Sends `request_app_private_key` as `signer` and returns the resulting
-/// verified root key. Costs gas (~a few TGas burnt) plus 1 yoctoNEAR.
+/// verified root key. Burns ~16.6 TGas (~0.0017 NEAR) plus 1 yoctoNEAR.
 pub async fn request_root_key(
     net: &CkdNetwork,
     signer: &Signer,
@@ -231,7 +313,7 @@ pub async fn request_root_key(
     };
     let (hash, signed) = tx.sign(&signer.key);
     let outcome = rpc
-        .send_and_wait(&signed, &hash, &signer.account_id, Duration::from_secs(120))
+        .send_and_wait(&signed, &hash, &signer.account_id, DEFAULT_DEADLINE, DEFAULT_POLL)
         .await?;
     let resp: CkdResponse =
         serde_json::from_slice(&success_value(&outcome)?).context("parsing CKDResponse")?;

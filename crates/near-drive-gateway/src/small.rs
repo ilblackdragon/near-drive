@@ -13,7 +13,7 @@
 //!   index, a read can be up to the TTL stale, so it is off by default;
 //! - lets `?mode=locate` inline the chunks of objects up to
 //!   `inline_max_bytes`, so a small read is a single request.
-use crate::store::{CasError, IndexEntry, IndexStore};
+use crate::store::{CasError, IndexEntry, IndexStore, ListPage};
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -185,8 +185,8 @@ impl IndexStore for CachedIndex {
         r
     }
 
-    async fn list(&self, ns: &str, prefix: &str) -> Result<Vec<IndexEntry>> {
-        self.inner.list(ns, prefix).await
+    async fn list_page(&self, ns: &str, prefix: &str, delimiter: Option<&str>, start_after: Option<&str>, limit: usize) -> Result<ListPage> {
+        self.inner.list_page(ns, prefix, delimiter, start_after, limit).await
     }
 
     async fn namespaces(&self) -> Result<Vec<String>> {

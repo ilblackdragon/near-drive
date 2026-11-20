@@ -3,11 +3,16 @@
 //! - namespace policy (`set_rules` / `get_rules`), same JSON shape as
 //!   `near_drive_core::policy::Rule`;
 //! - X25519 encryption keys for sharing (`set_enc_key` / `get_enc_key`);
+//! - ed25519 record-signing keys with history (`set_sign_key` / `get_sign_keys`);
 //! - gateway registry with a NEAR stake (`register_gateway` …);
 //! - per-account credential epochs for hosted-S3 revocation;
 //! - rollback-detection anchors (`anchor` / `get_anchor`);
 //! - stablecoin escrow funded by NEP-141 `ft_transfer_call` or NEP-245
-//!   `mt_transfer_call` (NEAR Intents), spent by approved settlers.
+//!   `mt_transfer_call` (NEAR Intents), spent by approved settlers;
+//! - payer opt-in for namespaces that name it in a rule (`set_sponsorship`).
+//!
+//! State is versioned (`STATE_VERSION`, the first field of the state) and
+//! upgraded with `migrate` after deploying new code (docs/contract.md).
 //!
 //! Storage staking: every method that grows state charges the caller for the
 //! bytes it added (attach NEAR; the excess is refunded) and refunds bytes it
@@ -30,7 +35,10 @@ pub mod validate;
 #[cfg(test)]
 mod tests;
 
-pub use escrow::{AssetConfig, PayerAccount, SettleEntry, SettleResult, SettleStatus};
+pub use escrow::{
+    AssetConfig, PayerAccount, PendingSpendCap, SettleEntry, SettleResult, SettleStatus,
+    SettleWindow, SettlerAuth, SettlerAuthView,
+};
 pub use gateway::{Gateway, GatewayInfo, GatewayView};
 
 /// Native USDC on NEAR mainnet (6 decimals).
@@ -38,6 +46,19 @@ pub const MAINNET_USDC: &str = "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31b
 pub const MAINNET_INTENTS: &str = "intents.near";
 
 pub(crate) const SEC: u64 = 1_000_000_000;
+
+/// Layout version of [`Contract`]. Bump it whenever the borsh layout of the
+/// state changes, and teach `migrate` to read the previous layout.
+pub const STATE_VERSION: u32 = 1;
+
+/// One published record-signing key and when it was published (block time,
+/// ms). `get_sign_keys` returns the history oldest first.
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignKeyEntry {
+    pub key: String,
+    pub since_ms: U64,
+}
 
 /// One namespace policy rule. JSON-identical to `near_drive_core::policy::Rule`.
 #[near(serializers = [json, borsh])]
@@ -116,16 +137,23 @@ enum Key {
     Settled,
     Settlers,
     SettlerAuths,
+    SignKeys,
+    Sponsorships,
 }
 
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct Contract {
+    /// Always [`STATE_VERSION`] for the code that wrote it. Kept first so
+    /// `migrate` can read it before knowing the rest of the layout.
+    pub(crate) version: u32,
     pub(crate) owner: AccountId,
     pub(crate) pending_owner: Option<AccountId>,
     pub(crate) config: Config,
     pub(crate) rules: LookupMap<AccountId, Vec<Rule>>,
     pub(crate) enc_keys: LookupMap<AccountId, String>,
+    /// account -> signing-key history, oldest first, at most `MAX_SIGN_KEYS`.
+    pub(crate) sign_keys: LookupMap<AccountId, Vec<SignKeyEntry>>,
     pub(crate) gateways: IterableMap<AccountId, Gateway>,
     pub(crate) cred_epochs: LookupMap<AccountId, u64>,
     pub(crate) anchors: LookupMap<AccountId, Anchor>,
@@ -136,12 +164,15 @@ pub struct Contract {
     pub(crate) payers: LookupMap<AccountId, PayerAccount>,
     /// gateway operator -> [(asset, amount)]
     pub(crate) earnings: LookupMap<AccountId, Vec<(String, u128)>>,
-    /// sha256(settler \0 payer \0 period_id)
-    pub(crate) settled: LookupSet<[u8; 32]>,
+    /// (payer, gateway) -> anti-replay window over settled periods.
+    pub(crate) settled: LookupMap<(AccountId, AccountId), SettleWindow>,
     /// settler -> may credit any gateway (true) or only itself (false).
     pub(crate) settlers: IterableMap<AccountId, bool>,
     /// payer -> settlers the payer allows to charge it (self-settlers only).
-    pub(crate) settler_auths: LookupMap<AccountId, Vec<AccountId>>,
+    pub(crate) settler_auths: LookupMap<AccountId, Vec<SettlerAuth>>,
+    /// (payer, namespace): the payer agrees to pay for rules of `namespace`
+    /// that name it as `payer`.
+    pub(crate) sponsorships: LookupSet<(AccountId, AccountId)>,
 }
 
 #[near]
@@ -172,11 +203,13 @@ impl Contract {
             a.validate().unwrap_or_else(|e| env::panic_str(&e));
         }
         Self {
+            version: STATE_VERSION,
             owner: owner_id,
             pending_owner: None,
             config: config.unwrap_or_default(),
             rules: LookupMap::new(Key::Rules),
             enc_keys: LookupMap::new(Key::EncKeys),
+            sign_keys: LookupMap::new(Key::SignKeys),
             gateways: IterableMap::new(Key::Gateways),
             cred_epochs: LookupMap::new(Key::CredEpochs),
             anchors: LookupMap::new(Key::Anchors),
@@ -184,10 +217,35 @@ impl Contract {
             assets,
             payers: LookupMap::new(Key::Payers),
             earnings: LookupMap::new(Key::Earnings),
-            settled: LookupSet::new(Key::Settled),
+            settled: LookupMap::new(Key::Settled),
             settlers: IterableMap::new(Key::Settlers),
             settler_auths: LookupMap::new(Key::SettlerAuths),
+            sponsorships: LookupSet::new(Key::Sponsorships),
         }
+    }
+
+    /// Upgrade the stored state to this code's layout. Call it (as the
+    /// contract account) in the same transaction as the code deployment.
+    /// Version 1 is the current layout, so this only checks the version.
+    #[private]
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        let raw = env::storage_read(b"STATE").unwrap_or_else(|| env::panic_str("no state"));
+        let version = raw
+            .get(..4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or_else(|| env::panic_str("state too short"));
+        match version {
+            STATE_VERSION => near_sdk::borsh::from_slice::<Self>(&raw)
+                .unwrap_or_else(|_| env::panic_str("cannot decode state")),
+            v => env::panic_str(&format!(
+                "cannot migrate state version {v} (this code is version {STATE_VERSION})"
+            )),
+        }
+    }
+
+    pub fn get_state_version(&self) -> u32 {
+        self.version
     }
 
     // ---------------------------------------------------------------- policy
@@ -238,6 +296,63 @@ impl Contract {
 
     pub fn get_enc_key(&self, account_id: AccountId) -> Option<String> {
         self.enc_keys.get(&account_id).cloned()
+    }
+
+    // ---------------------------------------------------------- signing keys
+
+    /// Publish the caller's `ed25519:<base58>` record-signing key. Appended to
+    /// the caller's history unless it equals the latest entry; the history
+    /// keeps the newest `MAX_SIGN_KEYS` entries. Attach NEAR for storage.
+    #[payable]
+    pub fn set_sign_key(&mut self, key: String) {
+        validate::validate_sign_key(&key).unwrap_or_else(|e| env::panic_str(&e));
+        let acct = env::predecessor_account_id();
+        let start = env::storage_usage();
+        let mut hist = self.sign_keys.get(&acct).cloned().unwrap_or_default();
+        if hist.last().map(|e| &e.key) != Some(&key) {
+            if hist.len() >= validate::MAX_SIGN_KEYS {
+                hist.drain(..=hist.len() - validate::MAX_SIGN_KEYS);
+            }
+            hist.push(SignKeyEntry {
+                key: key.clone(),
+                since_ms: U64(env::block_timestamp_ms()),
+            });
+            self.sign_keys.insert(acct.clone(), hist);
+            self.sign_keys.flush();
+            env::log_str(&format!("EVENT_JSON:{{\"standard\":\"near-drive\",\"version\":\"1.0.0\",\"event\":\"set_sign_key\",\"data\":[{{\"account_id\":\"{acct}\",\"key\":\"{key}\"}}]}}"));
+        }
+        self.charge_storage(&acct, start);
+    }
+
+    /// The account's signing-key history, oldest first (empty if none).
+    pub fn get_sign_keys(&self, account_id: AccountId) -> Vec<SignKeyEntry> {
+        self.sign_keys.get(&account_id).cloned().unwrap_or_default()
+    }
+
+    // ----------------------------------------------------------- sponsorship
+
+    /// Agree (`allowed = true`) or stop agreeing to pay for `namespace`'s
+    /// rules that name the caller as `payer`. Without it such a rule bills
+    /// the namespace owner instead (enforced by gateways and the billing
+    /// service; see docs/payments.md). Attach NEAR for storage.
+    #[payable]
+    pub fn set_sponsorship(&mut self, namespace: AccountId, allowed: bool) {
+        let payer = env::predecessor_account_id();
+        let start = env::storage_usage();
+        let key = (payer.clone(), namespace.clone());
+        if allowed {
+            self.sponsorships.insert(key);
+        } else {
+            self.sponsorships.remove(&key);
+        }
+        self.charge_storage(&payer, start);
+        env::log_str(&format!("EVENT_JSON:{{\"standard\":\"near-drive\",\"version\":\"1.0.0\",\"event\":\"set_sponsorship\",\"data\":[{{\"payer\":\"{payer}\",\"namespace\":\"{namespace}\",\"allowed\":{allowed}}}]}}"));
+    }
+
+    /// Whether `payer` agreed to pay for `namespace`. A namespace always pays
+    /// for itself.
+    pub fn is_sponsor(&self, payer: AccountId, namespace: AccountId) -> bool {
+        payer == namespace || self.sponsorships.contains(&(payer, namespace))
     }
 
     // ---------------------------------------------------- credential epochs

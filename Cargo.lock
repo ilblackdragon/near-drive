@@ -3050,6 +3050,7 @@ name = "near-drive-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bs58",
  "clap",
  "dirs 5.0.1",
@@ -3068,6 +3069,7 @@ dependencies = [
  "rand 0.8.8",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
@@ -3079,6 +3081,7 @@ name = "near-drive-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "blake3",
  "bytes",

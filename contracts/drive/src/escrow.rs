@@ -21,11 +21,17 @@
 //! registered, so token deposits cannot grow contract-paid state.
 //!
 //! Spending: approved settlers call `settle`. Each entry is applied whole or
-//! not at all, at most once per (settler, payer, period_id), within the
-//! payer's daily cap and balance. `any_gateway = true` is the owner-approved
-//! billing lane; `any_gateway = false` self-settlers must also be authorized
-//! by the payer. Payers withdraw with a notice period, so usage served before
-//! the request can still be settled.
+//! not at all, at most once per (payer, gateway, period), within the payer's
+//! daily cap and balance. Idempotency is a sliding window of
+//! `SETTLE_WINDOW` periods per (payer, gateway), so its storage does not grow
+//! with time. `any_gateway = true` is the owner-approved billing lane;
+//! `any_gateway = false` self-settlers must also be authorized by the payer.
+//!
+//! Notice periods: withdrawing balance, lowering the spend cap and revoking a
+//! self-settler all take effect only after `withdraw_delay_sec`, so usage
+//! served before the payer changed its mind can still be settled. Raising the
+//! cap or authorizing a settler applies at once and cancels a pending
+//! decrease / revocation.
 use crate::{validate, Contract, ContractExt, SEC};
 use near_sdk::{
     assert_one_yocto, env,
@@ -38,6 +44,9 @@ use near_sdk::{
 pub const MAX_ASSETS: usize = 8;
 pub const MAX_SETTLE_ENTRIES: usize = 100;
 pub const MAX_AUTHORIZED_SETTLERS: usize = 32;
+/// Periods per (payer, gateway) remembered for idempotency: a period more
+/// than this far behind the newest settled one is rejected (`PeriodTooOld`).
+pub const SETTLE_WINDOW: u64 = 128;
 const DAY_NS: u64 = 24 * 3600 * SEC;
 const PAYOUT_GAS: Gas = Gas::from_tgas(20);
 const ON_PAYOUT_GAS: Gas = Gas::from_tgas(10);
@@ -98,18 +107,116 @@ pub struct WithdrawRequest {
     pub ready_at_ns: U64,
 }
 
+/// A lowered spend cap waiting out the notice period.
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingSpendCap {
+    /// micro-USD per UTC day; None = settlers cannot charge.
+    pub per_day: Option<U128>,
+    pub effective_at_ns: U64,
+}
+
+/// A self-settler the payer authorized. `expires_at_ns` is set (non-zero)
+/// when the payer revokes it: the authorization stays valid until then.
+/// Fixed size, so revoking needs no storage deposit.
+#[near(serializers = [borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettlerAuth {
+    pub settler: AccountId,
+    /// 0 = no revocation pending.
+    pub expires_at_ns: u64,
+}
+
+impl SettlerAuth {
+    fn active(&self, now: u64) -> bool {
+        self.expires_at_ns == 0 || now < self.expires_at_ns
+    }
+}
+
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettlerAuthView {
+    pub settler: AccountId,
+    /// When a pending revocation takes effect.
+    pub expires_at_ns: Option<U64>,
+}
+
+/// Anti-replay window over settled periods of one (payer, gateway): bit `i`
+/// of `bits` is set when period `latest - i` has been settled.
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettleWindow {
+    pub latest: U64,
+    pub bits: U128,
+}
+
+impl SettleWindow {
+    fn check(&self, period: u64) -> Result<(), SettleStatus> {
+        if period > self.latest.0 {
+            return Ok(());
+        }
+        let back = self.latest.0 - period;
+        if back >= SETTLE_WINDOW {
+            Err(SettleStatus::PeriodTooOld)
+        } else if self.bits.0 & (1 << back) != 0 {
+            Err(SettleStatus::AlreadySettled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn contains(&self, period: u64) -> bool {
+        self.check(period) == Err(SettleStatus::AlreadySettled)
+    }
+
+    fn insert(&mut self, period: u64) {
+        if period > self.latest.0 {
+            let shift = period - self.latest.0;
+            self.bits.0 = if shift >= SETTLE_WINDOW {
+                0
+            } else {
+                self.bits.0 << shift
+            };
+            self.latest = U64(period);
+        }
+        self.bits.0 |= 1 << (self.latest.0 - period);
+    }
+}
+
 #[near(serializers = [borsh])]
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct PayerAccount {
     pub balances: Vec<(String, u128)>,
     /// micro-USD per UTC day; None = settlers cannot charge.
     pub spend_cap_per_day: Option<u128>,
+    /// A decrease of `spend_cap_per_day` that applies at `effective_at_ns`.
+    pub pending_cap: Option<PendingSpendCap>,
     pub day: u64,
     pub spent_today: u128,
     pub withdrawal: Option<WithdrawRequest>,
     /// Whether at least one deposit has been accepted. Used to apply
     /// `min_new_payer_deposit` exactly once, independent of later withdrawals.
     pub funded: bool,
+}
+
+impl PayerAccount {
+    /// Apply a pending cap decrease whose notice period is over.
+    fn apply_pending_cap(&mut self, now: u64) {
+        if let Some(p) = &self.pending_cap {
+            if now >= p.effective_at_ns.0 {
+                self.spend_cap_per_day = p.per_day.map(|v| v.0);
+                self.pending_cap = None;
+            }
+        }
+    }
+
+    /// The cap settle uses at `now`.
+    fn cap_at(&self, now: u64) -> Option<u128> {
+        match &self.pending_cap {
+            Some(p) if now >= p.effective_at_ns.0 => p.per_day.map(|v| v.0),
+            _ => self.spend_cap_per_day,
+        }
+    }
 }
 
 #[near(serializers = [json])]
@@ -125,7 +232,10 @@ pub struct PayerView {
     pub balances: Vec<AssetBalance>,
     /// Spendable value in micro-USD.
     pub available: U128,
+    /// The cap in force now.
     pub spend_cap_per_day: Option<U128>,
+    /// A lowered cap that takes over at `effective_at_ns`.
+    pub pending_spend_cap: Option<PendingSpendCap>,
     pub spent_today: U128,
     pub pending_withdrawal: Option<WithdrawRequest>,
 }
@@ -144,8 +254,9 @@ pub struct SettleEntry {
     /// micro-USD.
     pub amount: U128,
     pub gateway: AccountId,
-    /// Settler-chosen billing period id, e.g. `"2026-11-19/gw1"`.
-    pub period_id: String,
+    /// Billing period number, e.g. the hourly window index since the epoch.
+    /// Each (payer, gateway, period) is charged at most once.
+    pub period: U64,
 }
 
 #[near(serializers = [json])]
@@ -157,6 +268,9 @@ pub enum SettleStatus {
     GatewayNotAllowed,
     UnknownGateway,
     SettlerNotAuthorized,
+    /// More than `SETTLE_WINDOW` periods behind the newest settled period of
+    /// this (payer, gateway): can no longer be checked for replay.
+    PeriodTooOld,
     NoSpendCap,
     CapExceeded,
     InsufficientBalance,
@@ -166,7 +280,8 @@ pub enum SettleStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SettleResult {
     pub payer: AccountId,
-    pub period_id: String,
+    pub gateway: AccountId,
+    pub period: U64,
     pub status: SettleStatus,
     pub charged: U128,
 }
@@ -208,10 +323,6 @@ fn sub_from(v: &mut Vec<(String, u128)>, asset: &str, amount: u128) {
     if v[i].1 == 0 {
         v.remove(i);
     }
-}
-
-fn settle_key(settler: &AccountId, payer: &AccountId, period_id: &str) -> [u8; 32] {
-    env::sha256_array(format!("{settler}\0{payer}\0{period_id}").as_bytes())
 }
 
 #[near]
@@ -299,13 +410,19 @@ impl Contract {
     }
 
     /// Set the caller's daily spend cap in micro-USD (None = no charges).
-    /// Also creates the caller's escrow entry if needed.
+    /// A raise applies at once (and cancels a pending decrease); a decrease
+    /// applies after `withdraw_delay_sec`. Also creates the caller's escrow
+    /// entry if needed.
     #[payable]
     pub fn set_spend_cap(&mut self, per_day: Option<U128>) {
         let payer = env::predecessor_account_id();
         let start = env::storage_usage();
         let mut acct = self.payers.get(&payer).cloned().unwrap_or_default();
-        acct.spend_cap_per_day = per_day.map(|v| v.0);
+        self.change_spend_cap(&mut acct, per_day.map(|v| v.0));
+        emit(
+            "set_spend_cap",
+            json!({"payer": payer, "per_day": per_day, "pending": acct.pending_cap}),
+        );
         self.payers.insert(payer.clone(), acct);
         self.payers.flush();
         self.charge_storage(&payer, start);
@@ -314,7 +431,8 @@ impl Contract {
     /// Authorize (`allowed = true`) or revoke a self-settler that may charge
     /// the caller. Only `any_gateway = false` settlers need this; the
     /// owner-approved billing operator (`any_gateway = true`) remains a fully
-    /// trusted lane.
+    /// trusted lane. Authorizing applies at once (and cancels a pending
+    /// revocation); revoking applies after `withdraw_delay_sec`.
     #[payable]
     pub fn set_settler_authorization(&mut self, settler: AccountId, allowed: bool) {
         let payer = env::predecessor_account_id();
@@ -322,18 +440,33 @@ impl Contract {
             self.payers.get(&payer).is_some(),
             "register payer before authorizing a settler"
         );
+        let now = env::block_timestamp();
+        let delay = self.config.withdraw_delay_sec.saturating_mul(SEC);
         let start = env::storage_usage();
         let mut list = self.settler_auths.get(&payer).cloned().unwrap_or_default();
+        list.retain(|a| a.active(now));
+        let pos = list.iter().position(|a| a.settler == settler);
         if allowed {
-            if !list.contains(&settler) {
-                require!(
-                    list.len() < MAX_AUTHORIZED_SETTLERS,
-                    format!("at most {MAX_AUTHORIZED_SETTLERS} authorized settlers")
-                );
-                list.push(settler.clone());
+            match pos {
+                Some(i) => list[i].expires_at_ns = 0,
+                None => {
+                    require!(
+                        list.len() < MAX_AUTHORIZED_SETTLERS,
+                        format!("at most {MAX_AUTHORIZED_SETTLERS} authorized settlers")
+                    );
+                    list.push(SettlerAuth {
+                        settler: settler.clone(),
+                        expires_at_ns: 0,
+                    });
+                }
             }
-        } else {
-            list.retain(|s| s != &settler);
+        } else if let Some(i) = pos {
+            if delay == 0 {
+                list.remove(i);
+            } else if list[i].expires_at_ns == 0 {
+                // A second revoke does not push the deadline further out.
+                list[i].expires_at_ns = now.saturating_add(delay).max(1);
+            }
         }
         if list.is_empty() {
             self.settler_auths.remove(&payer);
@@ -352,15 +485,30 @@ impl Contract {
         self.authorized_settler(&payer, &settler)
     }
 
-    pub fn get_settler_authorizations(&self, payer: AccountId) -> Vec<AccountId> {
-        self.settler_auths.get(&payer).cloned().unwrap_or_default()
+    /// Settlers that may currently charge `payer`; `expires_at_ns` is set
+    /// for those with a pending revocation.
+    pub fn get_settler_authorizations(&self, payer: AccountId) -> Vec<SettlerAuthView> {
+        let now = env::block_timestamp();
+        self.settler_auths
+            .get(&payer)
+            .map(|v| {
+                v.iter()
+                    .filter(|a| a.active(now))
+                    .map(|a| SettlerAuthView {
+                        settler: a.settler.clone(),
+                        expires_at_ns: (a.expires_at_ns != 0).then_some(U64(a.expires_at_ns)),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     // ------------------------------------------------------------ settlement
 
     /// Charge payers for usage and credit gateways. Only approved settlers.
-    /// Attach NEAR for the storage of new idempotency/earnings entries
-    /// (about 0.001 NEAR per entry); the excess is refunded.
+    /// Attach NEAR for the storage of new idempotency windows (one per new
+    /// (payer, gateway) pair) and earnings rows (about 0.001 NEAR per entry);
+    /// the excess is refunded.
     #[payable]
     pub fn settle(&mut self, entries: Vec<SettleEntry>) -> Vec<SettleResult> {
         let settler = env::predecessor_account_id();
@@ -372,18 +520,19 @@ impl Contract {
             entries.len() <= MAX_SETTLE_ENTRIES,
             format!("at most {MAX_SETTLE_ENTRIES} entries")
         );
-        let today = env::block_timestamp() / DAY_NS;
+        let now = env::block_timestamp();
         let byte_cost = env::storage_byte_cost().as_yoctonear();
         let mut settler_growth: u64 = 0;
         let results = entries
             .into_iter()
             .map(|e| {
                 let before = env::storage_usage();
-                let status = self.settle_one(&settler, any_gateway, today, &e);
+                let status = self.settle_one(&settler, any_gateway, now, &e);
                 // LookupMap writes are cached; flush before measuring so the
                 // payer's freed rows and the settler's new rows are visible.
                 self.payers.flush();
                 self.earnings.flush();
+                self.settled.flush();
                 let after = env::storage_usage();
                 if after > before {
                     settler_growth = settler_growth.saturating_add(after - before);
@@ -399,7 +548,8 @@ impl Contract {
                 };
                 SettleResult {
                     payer: e.payer,
-                    period_id: e.period_id,
+                    gateway: e.gateway,
+                    period: e.period,
                     status,
                     charged,
                 }
@@ -572,7 +722,8 @@ impl Contract {
 
     pub fn get_payer(&self, account_id: AccountId) -> Option<PayerView> {
         let a = self.payers.get(&account_id)?;
-        let today = env::block_timestamp() / DAY_NS;
+        let now = env::block_timestamp();
+        let today = now / DAY_NS;
         Some(PayerView {
             balances: a
                 .balances
@@ -583,7 +734,11 @@ impl Contract {
                 })
                 .collect(),
             available: U128(self.available(a)),
-            spend_cap_per_day: a.spend_cap_per_day.map(U128),
+            spend_cap_per_day: a.cap_at(now).map(U128),
+            pending_spend_cap: a
+                .pending_cap
+                .clone()
+                .filter(|p| now < p.effective_at_ns.0),
             spent_today: U128(if a.day == today { a.spent_today } else { 0 }),
             pending_withdrawal: a.withdrawal.clone(),
         })
@@ -603,9 +758,18 @@ impl Contract {
             .unwrap_or_default()
     }
 
-    pub fn is_settled(&self, settler: AccountId, payer: AccountId, period_id: String) -> bool {
+    /// Whether `period` of (payer, gateway) has been settled. Periods more
+    /// than `SETTLE_WINDOW` behind the newest one are forgotten (false), but
+    /// `settle` rejects them as `PeriodTooOld`.
+    pub fn is_settled(&self, payer: AccountId, gateway: AccountId, period: U64) -> bool {
         self.settled
-            .contains(&settle_key(&settler, &payer, &period_id))
+            .get(&(payer, gateway))
+            .is_some_and(|w| w.contains(period.0))
+    }
+
+    /// The idempotency window of (payer, gateway), if anything was settled.
+    pub fn get_settle_window(&self, payer: AccountId, gateway: AccountId) -> Option<SettleWindow> {
+        self.settled.get(&(payer, gateway)).cloned()
     }
 
     pub fn get_assets(&self) -> Vec<AssetConfig> {
@@ -665,9 +829,27 @@ impl Contract {
     }
 
     fn authorized_settler(&self, payer: &AccountId, settler: &AccountId) -> bool {
+        let now = env::block_timestamp();
         self.settler_auths
             .get(payer)
-            .is_some_and(|v| v.contains(settler))
+            .is_some_and(|v| v.iter().any(|a| &a.settler == settler && a.active(now)))
+    }
+
+    /// Raise at once (cancelling a pending decrease); lower after the notice
+    /// period. `None` (no charges) counts as the lowest cap.
+    fn change_spend_cap(&self, acct: &mut PayerAccount, per_day: Option<u128>) {
+        let now = env::block_timestamp();
+        acct.apply_pending_cap(now);
+        let delay = self.config.withdraw_delay_sec.saturating_mul(SEC);
+        if per_day >= acct.spend_cap_per_day || delay == 0 {
+            acct.spend_cap_per_day = per_day;
+            acct.pending_cap = None;
+        } else {
+            acct.pending_cap = Some(PendingSpendCap {
+                per_day: per_day.map(U128),
+                effective_at_ns: U64(now.saturating_add(delay)),
+            });
+        }
     }
 
     /// Accounts that hold tokens on behalf of others (NEP-245 contracts such
@@ -720,7 +902,7 @@ impl Contract {
         }
         if let Some(cap) = m.spend_cap_per_day {
             if &payer == sender {
-                acct.spend_cap_per_day = Some(cap.0);
+                self.change_spend_cap(&mut acct, Some(cap.0));
             }
         }
         self.payers.insert(payer.clone(), acct);
@@ -736,10 +918,10 @@ impl Contract {
         &mut self,
         settler: &AccountId,
         any_gateway: bool,
-        today: u64,
+        now: u64,
         e: &SettleEntry,
     ) -> SettleStatus {
-        if e.amount.0 == 0 || validate::validate_period_id(&e.period_id).is_err() {
+        if e.amount.0 == 0 {
             return SettleStatus::InvalidEntry;
         }
         if !any_gateway && &e.gateway != settler {
@@ -751,13 +933,16 @@ impl Contract {
         if !any_gateway && !self.authorized_settler(&e.payer, settler) {
             return SettleStatus::SettlerNotAuthorized;
         }
-        let key = settle_key(settler, &e.payer, &e.period_id);
-        if self.settled.contains(&key) {
-            return SettleStatus::AlreadySettled;
+        let key = (e.payer.clone(), e.gateway.clone());
+        let window = self.settled.get(&key).cloned();
+        if let Some(Err(status)) = window.as_ref().map(|w| w.check(e.period.0)) {
+            return status;
         }
-        let Some(acct) = self.payers.get(&e.payer).cloned() else {
+        let Some(mut acct) = self.payers.get(&e.payer).cloned() else {
             return SettleStatus::InsufficientBalance;
         };
+        acct.apply_pending_cap(now);
+        let today = now / DAY_NS;
         let Some(cap) = acct.spend_cap_per_day else {
             return SettleStatus::NoSpendCap;
         };
@@ -773,7 +958,6 @@ impl Contract {
             return SettleStatus::InsufficientBalance;
         }
         // Draw from assets in allow-list order.
-        let mut acct = acct;
         let mut earned = self.earnings.get(&e.gateway).cloned().unwrap_or_default();
         let mut left = e.amount.0;
         for cfg in &self.assets {
@@ -802,10 +986,20 @@ impl Contract {
         acct.spent_today = spent.saturating_add(e.amount.0);
         self.payers.insert(e.payer.clone(), acct);
         self.earnings.insert(e.gateway.clone(), earned);
-        self.settled.insert(key);
+        let window = match window {
+            Some(mut w) => {
+                w.insert(e.period.0);
+                w
+            }
+            None => SettleWindow {
+                latest: e.period,
+                bits: U128(1),
+            },
+        };
+        self.settled.insert(key, window);
         emit(
             "settle",
-            json!({"settler": settler, "payer": e.payer, "gateway": e.gateway, "period_id": e.period_id, "amount": e.amount}),
+            json!({"settler": settler, "payer": e.payer, "gateway": e.gateway, "period": e.period, "amount": e.amount}),
         );
         SettleStatus::Settled
     }

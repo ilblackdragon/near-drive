@@ -146,6 +146,15 @@ near call drive.near set_spend_cap '{"per_day":"1000000"}' --accountId alice.nea
 
 - `per_day: null` blocks all charges. **A payer with no cap cannot be charged
   at all.** A payer must opt in by setting a cap here or in a deposit `msg`.
+- **Raising the cap applies at once; lowering it (including to `null`) applies
+  only after `withdraw_delay_sec`** (the same notice period as withdrawals).
+  Until then `settle` uses the old cap. `get_payer` shows the cap in force
+  (`spend_cap_per_day`) and the scheduled one (`pending_spend_cap: {per_day,
+  effective_at_ns}`). A raise, or setting the current cap again, cancels a
+  pending decrease; a new decrease replaces it and restarts the timer. The
+  same rules apply to `spend_cap_per_day` in a deposit `msg`. Without the
+  delay a payer could use storage, zero the cap, and withdraw after the notice
+  period, leaving the gateway unpaid.
 - `set_spend_cap` also creates the caller's `PayerAccount` if needed (it is
   payable and charges/refunds storage), so it can be used instead of a separate
   `register_payer`.
@@ -163,7 +172,12 @@ Only owner-approved settlers can call `settle`:
   the payer must authorize that settler with
   `set_settler_authorization(settler, true)`. This prevents an approved
   self-settler from charging payers that never chose it. Revoke with
-  `set_settler_authorization(settler, false)`. Example:
+  `set_settler_authorization(settler, false)`: like a cap decrease, **the
+  revocation takes effect after `withdraw_delay_sec`**, so the gateway can
+  still bill usage it already served. `get_settler_authorizations(payer)`
+  returns `[{settler, expires_at_ns}]`, with `expires_at_ns` set while a
+  revocation is pending. Authorizing again cancels it; revoking again does
+  not move the deadline. Revoking needs no deposit. Example:
 
   ```sh
   near call drive.near set_settler_authorization \
@@ -173,8 +187,8 @@ Only owner-approved settlers can call `settle`:
 
 ```sh
 near call drive.near settle '{"entries":[
-  {"payer":"alice.near","amount":"1250","gateway":"gw1.operator.near","period_id":"2026-11-19T10/gw1"},
-  {"payer":"app.near","amount":"98000","gateway":"gw1.operator.near","period_id":"2026-11-19T10/gw1"}
+  {"payer":"alice.near","amount":"1250","gateway":"gw1.operator.near","period":"493978"},
+  {"payer":"app.near","amount":"98000","gateway":"gw1.operator.near","period":"493978"}
 ]}' --accountId billing.near --deposit 0.1 --gas 300000000000000
 ```
 
@@ -182,32 +196,81 @@ Rust: `near_drive_chain::StorageContract::settle(&signer, &[SettleEntry{..}])`.
 
 - **Each entry is applied whole or not at all.** It never charges part of
   an entry, and one bad entry does not fail the batch. The call returns one
-  `{payer, period_id, status, charged}` per entry. `status` is one of:
-  `Settled`, `AlreadySettled`, `InvalidEntry` (zero amount or bad
-  `period_id`), `GatewayNotAllowed`, `UnknownGateway` (not in the registry,
-  where registered and deregistering gateways both count),
-  `SettlerNotAuthorized` (a self-settler the payer did not authorize),
+  `{payer, gateway, period, status, charged}` per entry. `status` is one of:
+  `Settled`, `AlreadySettled`, `InvalidEntry` (zero amount),
+  `GatewayNotAllowed`, `UnknownGateway` (not in the registry, where
+  registered and deregistering gateways both count), `SettlerNotAuthorized`
+  (a self-settler the payer did not authorize), `PeriodTooOld` (see below),
   `NoSpendCap`, `CapExceeded`, `InsufficientBalance`.
-- **Idempotency key** is `(settler, payer, period_id)`. `gateway` and
+- **`period` is a number** (`U64`, a decimal string in JSON), e.g. the
+  gateway meter's hourly window index (`period_start_ms / window_ms`). One
+  entry per (payer, gateway, period): sum all services of a window into it.
+- **Idempotency key** is `(payer, gateway, period)`. The settler and
   `amount` are not part of it. So:
-  - put the gateway in `period_id` when one settler bills several gateways
-    for the same payer and period, for example `"2026-11-19T10/gw1"`;
   - retrying a timed-out transaction is safe, because entries already
     settled come back as `AlreadySettled` and are not charged again;
+  - rotating the billing account (a new settler) does not reset idempotency,
+    and the billing lane and a gateway's self-settle lane cannot both charge
+    the same period of the same gateway;
   - if an entry fails with `CapExceeded` or `InsufficientBalance`, nothing is
-    recorded. The settler can retry the same `period_id` later (for example
-    the next UTC day, when the cap resets) or split the amount across new
-    `period_id`s.
-  - `is_settled(settler, payer, period_id)` checks a key.
-- Limits: at most 100 entries per call, `period_id` 1..=64 printable ASCII.
-  Attach about 0.001 NEAR per entry for storage (idempotency keys and new
-  earnings rows). The excess is refunded.
+    recorded. The settler can retry the same `period` later (for example
+    the next UTC day, when the cap resets), within the window below.
+  - `is_settled(payer, gateway, period)` checks a period;
+    `get_settle_window(payer, gateway)` returns the raw window.
+- **Bounded idempotency state: a sliding window.** For each (payer, gateway)
+  the contract keeps only the newest settled `period` (`latest`) and a
+  128-bit bitmap of which of the 128 periods `latest-127 ..= latest` are
+  settled (`SETTLE_WINDOW = 128`; 24 bytes of value per pair, never growing
+  with time). A period above `latest` moves the window forward; a period
+  inside it is accepted once, in any order; a period more than 127 behind
+  `latest` is refused as `PeriodTooOld`, because the contract can no longer
+  tell whether it was settled. With hourly periods that leaves 5 days to
+  retry a failed period, more than the default 3-day notice period, after
+  which the payer's funds may be gone anyway. Why not the alternatives: the
+  old per-period set grew forever; a plain "strictly increasing period"
+  counter is as small but makes one failed period (`CapExceeded` today)
+  unsettleable as soon as a later one succeeds, which breaks the "retry
+  tomorrow" flow; and keying by settler instead of gateway resets
+  idempotency whenever the billing account is rotated.
+- Limits: at most 100 entries per call. Attach about 0.001 NEAR per entry
+  for storage (a new idempotency window per new (payer, gateway) pair, new
+  earnings rows); once a pair's window exists, settling more periods for it
+  needs no storage. The excess is refunded.
 - Recommended cadence: settle at least once per `withdraw_delay_sec` (default
   3 days). A payer's withdrawal can only run that long after the request,
-  and **funds stay spendable until it runs**. Usage served before the
-  request can still be settled during the notice period.
+  and **funds stay spendable until it runs**. Cap decreases and settler
+  revocations wait out the same notice period, so usage served before any of
+  these requests can still be settled during it.
 - Phase-1 billing (cloud credits) can use the same metering output. Settling
   onchain only replaces the "debit credits" step.
+
+## Sponsorship: who may be named as payer
+
+A namespace's rules can name a `payer` for a prefix (DESIGN.md §4.2), e.g.
+`app.near` paying for `users/{account}/`. Naming someone else as payer would
+bill them without consent, so **a payer other than the namespace owner only
+counts if it opted in** for that namespace:
+
+```sh
+near call drive.near set_sponsorship '{"namespace":"app.near","allowed":true}' --accountId alice.near --deposit 0.01
+near view drive.near is_sponsor '{"payer":"alice.near","namespace":"app.near"}'   # true
+```
+
+- Keyed by (payer, namespace); storage is charged to the payer and refunded
+  when it sets `allowed: false`. A namespace is always its own sponsor.
+- For an `{account}` payer the bound account (e.g. `bob.near` for
+  `users/bob.near/...`) must sponsor the namespace too.
+- When the payer has not opted in, usage under that rule is billed to the
+  **namespace owner**. Gateways apply this when they resolve the payer for a
+  request (`near-drive-gateway` `policies.rs`: concrete payers when the rules
+  are loaded, `{account}` payers per request; answers cached 60 s). Gateway
+  config `policies` overrides are trusted as written.
+- **The contract does not check sponsorship in `settle`.** A settle entry
+  carries (payer, gateway, period, amount), not the namespace or path the
+  usage came from, so the contract cannot tell which namespace's rule made
+  this payer liable. Consent is enforced off-chain by the gateway / billing
+  service when usage is attributed; onchain the payer's protection is the
+  spend cap and, for self-settlers, `set_settler_authorization`.
 
 ## Withdrawals
 

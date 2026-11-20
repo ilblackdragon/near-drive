@@ -17,14 +17,23 @@ import {
   publicKeyOf,
   recordSigningBytes,
   RootKey,
+  resolvePolicy,
   sign,
+  signKeyInForce,
   verify,
   verifyRecordSignature,
+  WriterCheck,
   type PointerRecord,
+  type SignKeyEntry,
 } from "../src/index.js";
 import { bytesToHex, hexToBytes, utf8ToBytes } from "../src/bytes.js";
 
 const V = JSON.parse(readFileSync(fileURLToPath(new URL("../../../testvectors/vectors.json", import.meta.url)), "utf8"));
+/**
+ * Record-signing-key vectors. Interim file generated independently of the SDKs by
+ * testvectors/gen_sdk_sign_vectors.py; switch to the Rust-generated vectors here once they exist.
+ */
+const SIGN_VECTORS = JSON.parse(readFileSync(fileURLToPath(new URL("../../../testvectors/sdk_sign_vectors.json", import.meta.url)), "utf8"));
 const roots: Record<string, RootKey> = Object.fromEntries(Object.entries(V.roots).map(([k, r]: [string, any]) => [k, RootKey.fromHex(r.root_key)]));
 
 describe("vectors", () => {
@@ -116,6 +125,56 @@ describe("vectors", () => {
         expect(bytesToHex(pt), `${o.name} by ${who}`).toBe(o.plaintext_hex);
       }
       for (const who of o.not_readable_by) expect(() => decryptObject(roots[who]!, m.enc!, chunks)).toThrow();
+    }
+  });
+
+  it("record signing key derivation", () => {
+    for (const r of Object.values(SIGN_VECTORS.roots) as any[]) {
+      const k = RootKey.fromHex(r.root_key);
+      expect(bytesToHex(k.signSeed())).toBe(r.sign_seed);
+      expect(k.signPublicKey()).toBe(r.sign_public_key);
+    }
+  });
+
+  it("records signed with the derived key", async () => {
+    for (const v of SIGN_VECTORS.records) {
+      const rec = v.record as PointerRecord;
+      const k = RootKey.fromHex(SIGN_VECTORS.roots[v.signed_by].root_key);
+      expect(new TextDecoder().decode(recordSigningBytes(rec))).toBe(v.signing_string);
+      expect(sign(k.signSeed(), recordSigningBytes(rec))).toBe(rec.sig);
+      expect(rec.writer_pk).toBe(k.signPublicKey());
+      verifyRecordSignature(rec);
+      await WriterCheck.trusted({ [rec.writer]: [k.signPublicKey()] }, { "app.near": [{ prefix: "users/", write: ["alice.near"] }] }).verify(rec);
+    }
+  });
+
+  it("sign key in force", () => {
+    for (const c of SIGN_VECTORS.sign_key_in_force) {
+      const entries: SignKeyEntry[] = c.entries.map((e: any) => ({ key: e.key, since_ms: Number(e.since_ms) }));
+      expect(signKeyInForce(entries, c.key, c.ts_ms), JSON.stringify(c)).toBe(c.ok);
+    }
+  });
+
+  it("namespace policy", () => {
+    for (const c of SIGN_VECTORS.policy) {
+      expect(resolvePolicy(c.namespace, c.rules, c.path, c.signer), JSON.stringify(c)).toEqual({ read: c.read, write: c.write, payer: c.payer });
+    }
+  });
+  it("Rust-generated signing vectors", () => {
+    for (const r of Object.values(V.roots) as any[]) {
+      const k = RootKey.fromHex(r.root_key);
+      expect(bytesToHex(k.signSeed())).toBe(r.sign_seed);
+      expect(k.signPublicKey()).toBe(r.sign_public_key);
+    }
+    for (const v of V.signed_records) {
+      const rec = v.record as PointerRecord;
+      verifyRecordSignature(rec);
+      expect(sign(roots[v.root]!.signSeed(), recordSigningBytes(rec))).toBe(rec.sig);
+    }
+    for (const c of V.writer_checks) {
+      const entries: SignKeyEntry[] = c.sign_keys.map((e: any) => ({ key: e.key, since_ms: Number(e.since_ms) }));
+      const ok = signKeyInForce(entries, c.writer_pk, c.ts_ms) && (c.writer === c.namespace || resolvePolicy(c.namespace, c.rules, c.path, c.writer).write);
+      expect(ok, c.name).toBe(c.accept);
     }
   });
 });

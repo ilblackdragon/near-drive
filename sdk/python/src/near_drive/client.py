@@ -1,6 +1,8 @@
 """Synchronous NEAR Drive client: chunking, client-side encryption, request signing.
 
-Verifies everything it reads: record signature, manifest cid, chunk cids, AEAD.
+Verifies everything it reads: record signature, the writer's authorization against ``drive.near``
+(signing key + namespace rules, see :class:`~near_drive.chain.WriterCheck`), manifest cid, chunk
+cids, AEAD.
 Every request is retried on transient failures (see :mod:`near_drive.net`); large files
 stream with bounded memory and resume after interruptions (``put_file``, ``get_to_file``).
 """
@@ -24,6 +26,7 @@ import httpx
 
 from . import resume
 from .auth import H_ACCOUNT, H_PUBKEY, H_SIG, H_TS, canonical_request
+from .chain import NO_WRITER_CHECK, StorageContract, WriterCheck
 from .crypto import ChunkOpener, ChunkSealer, Recipient, RootKey, add_recipient, chunk_count, chunk_plain_len
 from .keys import b58encode, parse_public_key, parse_secret_key, parse_x25519, public_key_of, sign
 from .manifest import MAX_CHUNK_BYTES, ChunkRef, Manifest, PointerRecord, cid
@@ -32,6 +35,8 @@ from .uri import NearUri, encode_path, validate_account_id
 
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
 DEFAULT_PARALLELISM = 8
+#: Default NEAR Drive contract account.
+DEFAULT_CONTRACT = "drive.near"
 #: Request header choosing the storage class of uploaded chunks (and recorded with the object).
 CLASS_HEADER = "x-near-drive-class"
 #: Don't use a direct URL that expires sooner than this.
@@ -108,6 +113,16 @@ class ListEntry:
 
 
 @dataclass
+class ListPage:
+    """One page of ``GET /v1/list`` (:meth:`Client.list_page`)."""
+    entries: list[ListEntry]
+    #: Rolled-up prefixes (with a delimiter), each ending with it.
+    common_prefixes: list[str]
+    #: Pass back as ``cursor`` for the next page; None at the end.
+    next_cursor: Optional[str] = None
+
+
+@dataclass
 class LocatedChunk:
     cid: str
     len: int
@@ -169,8 +184,17 @@ def _opt(v: Any, t: type) -> Any:
     return v if isinstance(v, t) and not isinstance(v, bool) else None
 
 
-def verify_head(uri: NearUri, head: ObjectHead) -> None:
-    """Client-side checks on what a (possibly untrusted) gateway returned."""
+def verify_head(uri: NearUri, head: ObjectHead, writer_check: Optional[WriterCheck]) -> None:
+    """Client-side checks on what a (possibly untrusted) gateway returned: record signature,
+    manifest, and (via ``writer_check``) that the writer was allowed to write it with that key."""
+    _check_head(uri, head)
+    if writer_check is None:
+        raise ValueError(NO_WRITER_CHECK)
+    writer_check.verify(head.record)
+
+
+def _check_head(uri: NearUri, head: ObjectHead) -> None:
+    """Everything but the writer check."""
     r = head.record
     if r.namespace != uri.namespace or r.path != uri.path:
         raise ValueError("gateway returned a record for a different object")
@@ -230,8 +254,18 @@ class Client:
         *,
         net: Optional[NetConfig] = None,
         parallelism: int = DEFAULT_PARALLELISM,
+        writer_check: Optional[WriterCheck] = None,
+        rpc_url: Optional[str] = None,
+        contract_id: str = DEFAULT_CONTRACT,
     ):
-        """``net``: timeouts and retry policy (see :class:`NetConfig`); ``timeout`` (legacy)
+        """``root_key``: required for writing (records are signed with a key derived from it;
+        publish that key with ``near drive publish-key``); also decrypts this account's objects.
+
+        ``writer_check``: how reads check that a record's writer was allowed to write it (see
+        :class:`WriterCheck`). Default: ``WriterCheck.chain(rpc_url, contract_id)`` when ``rpc_url``
+        is set; otherwise none, and every read fails until one is configured.
+
+        ``net``: timeouts and retry policy (see :class:`NetConfig`); ``timeout`` (legacy)
         sets its idle timeout. ``parallelism``: concurrent chunk transfers."""
         validate_account_id(account_id)
         self.gateway = gateway.rstrip("/")
@@ -249,6 +283,11 @@ class Client:
         self._own_http = http is None
         self._http = http or self.net.http_client()
         self._sleep: Callable[[float], None] = time.sleep
+        self._own_contract: Optional[StorageContract] = None
+        if writer_check is None and rpc_url is not None:
+            self._own_contract = StorageContract(rpc_url, contract_id)
+            writer_check = WriterCheck.chain(self._own_contract)
+        self.writer_check: Optional[WriterCheck] = writer_check
 
     def set_net(self, net: NetConfig) -> None:
         """Replace the timeout/retry policy (rebuilds the HTTP client if this client owns it)."""
@@ -259,6 +298,8 @@ class Client:
 
     def close(self) -> None:
         self._http.close()
+        if self._own_contract is not None:
+            self._own_contract.close()
 
     def __enter__(self) -> "Client":
         return self
@@ -269,6 +310,21 @@ class Client:
     @property
     def public_key(self) -> str:
         return self._signer.public_key
+
+    def sign_public_key(self) -> Optional[str]:
+        """``ed25519:<base58>`` key this client signs records with (derived from the root key).
+        Publish it with ``near drive publish-key``."""
+        return self._root.sign_public_key() if self._root else None
+
+    def _record_seed(self) -> bytes:
+        if self._root is None:
+            raise ValueError("writing requires the root key: records are signed with a key derived from it (pass root_key)")
+        return self._root.sign_seed()
+
+    def _check_writer(self, r: PointerRecord) -> None:
+        if self.writer_check is None:
+            raise ValueError(NO_WRITER_CHECK)
+        self.writer_check.verify(r)
 
     def x25519_public(self) -> Optional[str]:
         """This account's ``x25519:<base58>`` key for receiving shared objects (needs the root key)."""
@@ -389,13 +445,21 @@ class Client:
     # ---------------------------------------------------------------- metadata
 
     def head(self, uri: Union[str, NearUri]) -> Optional[ObjectHead]:
-        """Record + manifest of ``uri``, verified; ``None`` if absent."""
-        u = NearUri.coerce(uri)
+        """Record + manifest of ``uri``, verified (including the writer, see :class:`WriterCheck`);
+        ``None`` if absent."""
+        head = self._head_unchecked(NearUri.coerce(uri))
+        if head is not None:
+            self._check_writer(head.record)
+        return head
+
+    def _head_unchecked(self, u: NearUri) -> Optional[ObjectHead]:
+        """Head with signature/manifest checks but no writer check: only for the current seq
+        when writing (the gateway enforces the CAS)."""
         raw = self._get_json("head", _obj_path(u))
         if raw is None:
             return None
         head = self._parse_head(raw)
-        verify_head(u, head)
+        _check_head(u, head)
         return head
 
     @staticmethod
@@ -422,12 +486,13 @@ class Client:
                 raise ValueError("bad locate chunk")
             chunks.append(LocatedChunk(c["cid"], c["len"], _opt(c.get("url"), str), _opt(c.get("expires_ms"), int), _opt(c.get("data"), str)))
         loc = Located(h.record, h.manifest, h.manifest_raw, h.storage_class, chunks)
-        verify_head(u, h)
+        _check_head(u, h)
         m = loc.manifest
         if chunks and (len(chunks) != len(m.chunks) or any(a.cid != b.cid for a, b in zip(chunks, m.chunks))):
             raise ValueError("gateway locate chunks do not match the manifest")
         if len(m.chunks) != chunk_count(m.size, m.chunk_size):
             raise ValueError("manifest chunk count does not match size / chunk_size")
+        self._check_writer(loc.record)
         return loc
 
     def _locate_or_404(self, u: NearUri) -> Located:
@@ -437,22 +502,53 @@ class Client:
         return loc
 
     def list(self, prefix: Union[str, NearUri]) -> list[ListEntry]:
-        """List objects under a prefix URI (e.g. ``near://alice.near/memory/``)."""
+        """Every readable object whose path starts with the prefix URI's path (a raw
+        string prefix, e.g. ``near://alice.near/memory/``), sorted by path:
+        :meth:`list_page` until the end."""
+        out: list[ListEntry] = []
+        cursor: Optional[str] = None
+        while True:
+            page = self.list_page(prefix, cursor=cursor)
+            out.extend(page.entries)
+            if page.next_cursor is None:
+                return out
+            if page.next_cursor == cursor:
+                raise RuntimeError(f"gateway listing of {prefix} did not advance")
+            cursor = page.next_cursor
+
+    def list_page(self, prefix: Union[str, NearUri], delimiter: Optional[str] = None, cursor: Optional[str] = None,
+                  limit: Optional[int] = None) -> ListPage:
+        """One page of the listing. With ``delimiter`` (normally ``/``) deeper paths are
+        rolled up into ``common_prefixes``. Pass the previous page's ``next_cursor`` as
+        ``cursor``; ``limit`` defaults to (and is capped at) 1000 by the gateway. Pages may
+        hold fewer items than the limit; continue while ``next_cursor`` is set."""
         u = NearUri.coerce(prefix)
-        raw = self._get_json("list", f"/v1/list/{u.namespace}", f"prefix={encode_path(u.path)}") or []
-        return [ListEntry(e["path"], e["size"], e["seq"], e["writer"], e["ts_ms"], _opt(e.get("manifest_cid"), str)) for e in raw]
+        q = f"prefix={encode_path(u.path)}"
+        if delimiter:
+            q += f"&delimiter={encode_path(delimiter)}"
+        if cursor:
+            q += f"&cursor={encode_path(cursor)}"
+        if limit is not None:
+            q += f"&limit={int(limit)}"
+        raw = self._get_json("list", f"/v1/list/{u.namespace}", q) or {}
+        return ListPage(
+            [ListEntry(e["path"], e["size"], e["seq"], e["writer"], e["ts_ms"], _opt(e.get("manifest_cid"), str)) for e in raw.get("entries", [])],
+            list(raw.get("common_prefixes") or []),
+            _opt(raw.get("next_cursor"), str),
+        )
 
     # ---------------------------------------------------------------- writes
 
-    def _new_sealer(self, public: bool, share_with: Iterable[str]) -> Optional[ChunkSealer]:
+    def _new_sealer(self, public: bool, share_with: Iterable[str], skip_owner_key: bool = False) -> Optional[ChunkSealer]:
+        self._record_seed()
         if public:
             return None
-        rs: list[Recipient] = [self._root] if self._root else []
+        rs: list[Recipient] = [self._root] if self._root and not skip_owner_key else []
         for k in share_with:
             parse_x25519(k)
             rs.append(k)
         if not rs:
-            raise ValueError("no root key and no share_with recipients; pass root_key or use public=True")
+            raise ValueError("no recipients: pass root_key, share_with recipients, or use public=True")
         return ChunkSealer.new(rs)
 
     def put(
@@ -465,9 +561,13 @@ class Client:
         share_with: Iterable[str] = (),
         storage_class: Optional[str] = None,
         expect_seq: Optional[int] = None,
+        skip_owner_key: bool = False,
     ) -> PointerRecord:
-        """Upload ``data`` to ``uri``.
+        """Upload ``data`` to ``uri``. Requires the root key (it signs the record).
 
+        ``share_with``: extra ``x25519:<base58>`` recipients. ``skip_owner_key=True``: do not
+        also wrap the object key to this account's root key (an app writing data only the user
+        can read).
         ``storage_class``: e.g. ``hot`` / ``bulk`` (None = gateway default).
         ``expect_seq``: write only if the object is currently at this seq (0 = must not
         exist), else raise :class:`Conflict`. Without it, a concurrent write is retried once.
@@ -475,7 +575,7 @@ class Client:
         u = NearUri.coerce(uri)
         NearUri.object(u.namespace, u.path)
         b = data.encode("utf-8") if isinstance(data, str) else bytes(data)
-        sealer = self._new_sealer(public, list(share_with))
+        sealer = self._new_sealer(public, list(share_with), skip_owner_key)
         return self._put_stream(io.BytesIO(b), u, sealer, content_type, storage_class, expect_seq)
 
     def put_file(
@@ -489,6 +589,7 @@ class Client:
         storage_class: Optional[str] = None,
         expect_seq: Optional[int] = None,
         resume_dir: Union[str, os.PathLike, None] = None,
+        skip_owner_key: bool = False,
     ) -> PointerRecord:
         """Upload a file with bounded memory (about ``(parallelism + 2) * chunk_size``) and
         ``parallelism`` concurrent chunk uploads.
@@ -501,9 +602,10 @@ class Client:
         u = NearUri.coerce(uri)
         NearUri.object(u.namespace, u.path)
         share_with = list(share_with)
+        self._record_seed()
         with open(path, "rb") as f:
-            if resume_dir is None or (not public and self._root is None):
-                return self._put_stream(f, u, self._new_sealer(public, share_with), content_type, storage_class, expect_seq)
+            if resume_dir is None or (not public and skip_owner_key):
+                return self._put_stream(f, u, self._new_sealer(public, share_with, skip_owner_key), content_type, storage_class, expect_seq)
             key = resume.journal_key(self.account_id, str(u), os.fspath(path), self.chunk_size, public, storage_class, share_with, content_type)
             jpath = resume.journal_path(Path(resume_dir).expanduser(), key)
             r = resume.load(jpath, key)
@@ -516,7 +618,7 @@ class Client:
                     debug(f"resuming upload of {u}: {len(r.done)} chunks already stored")
                 journal, done = resume.Journal.append(jpath), r.done
             else:
-                sealer = self._new_sealer(public, share_with)
+                sealer = self._new_sealer(public, share_with, skip_owner_key)
                 journal, done = resume.Journal.create(jpath, key, sealer.enc_info if sealer else None), {}
             try:
                 rec = self._put_stream(f, u, sealer, content_type, storage_class, expect_seq, journal, done)
@@ -592,21 +694,22 @@ class Client:
         this key, the write succeeded. A conflict with someone else's write is retried once
         with the new seq (unless ``expect_seq`` is set: then it is a :class:`Conflict`).
         """
+        seed = self._record_seed()
+        my_pk = public_key_of(seed)
         mbytes = manifest.to_bytes()
         stored = manifest.stored_size() + len(mbytes)
         mref = self._upload_chunk(u.namespace, cid(mbytes), mbytes, storage_class)
         if expect_seq is not None:
             prev = expect_seq
         else:
-            h = self.head(u)
+            h = self._head_unchecked(u)
             prev = h.record.seq if h else 0
-        my_pk = self._signer.public_key
         maybe_landed = False
         conflicts = 0
         attempt = 0
         while True:
             rec = PointerRecord(u.namespace, u.path, mref.cid, manifest.size, stored, prev + 1, self.account_id, my_pk, int(time.time() * 1000))
-            rec.sig = self._sign(rec.signing_bytes())
+            rec.sig = sign(seed, rec.signing_bytes())
             body = json.dumps(rec.to_dict(), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
             wait: Optional[float] = None
             try:
@@ -618,7 +721,7 @@ class Client:
                 if r.is_success:
                     return rec
                 if r.status_code == 409:
-                    cur = self.head(u)
+                    cur = self._head_unchecked(u)
                     if cur is not None and maybe_landed and cur.record.manifest_cid == mref.cid and cur.record.writer_pk == my_pk and cur.record.seq == prev + 1:
                         return cur.record
                     current = cur.record.seq if cur else 0

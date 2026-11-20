@@ -47,6 +47,8 @@ ok() { PASS=$((PASS + 1)); printf '  ok   %s\n' "$*"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$*"; }
 
 export NEAR_DRIVE_HOME="$WORK/home"
+# Dev gateway, no chain: nothing to check record-signing keys against.
+export NEAR_DRIVE_INSECURE_SKIP_WRITER_CHECK=1
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
 export NEAR_DRIVE_GATEWAY="http://127.0.0.1:$PORT"
 

@@ -1,6 +1,7 @@
 /**
  * NEAR Drive client: chunking, client-side encryption, request signing. Verifies
- * everything it reads (record signature, manifest cid, chunk cids, AEAD).
+ * everything it reads (record signature, writer authorization against `drive.near`,
+ * manifest cid, chunk cids, AEAD).
  * Uses only `fetch` + Web APIs, so it runs in Node >= 20 and browsers.
  */
 import { b64N, base58, bytesToHex, cid as cidOf, toBytes } from "./bytes.js";
@@ -27,6 +28,7 @@ import {
   type Resp,
 } from "./net.js";
 import { normalizeRecord, recordSigningBytes, recordToJson, verifyRecordSignature, type PointerRecord } from "./record.js";
+import { NO_WRITER_CHECK, StorageContract, WriterCheck } from "./chain.js";
 import { encodePath, NearUri, validateAccountId } from "./uri.js";
 
 export { ConflictError, GatewayError };
@@ -63,8 +65,21 @@ export interface ClientOptions {
   accountId: string;
   /** NEAR secret key string or a custom {@link Signer}. */
   signer: string | Signer;
-  /** Encryption root key (32 bytes / hex). Without it you can only write public objects or for `shareWith` recipients. */
+  /**
+   * Root key (32 bytes / hex). Required for writing: records are signed with a key derived
+   * from it (publish that key with `near drive publish-key`). Also decrypts objects for this account.
+   */
   rootKey?: RootKey | Uint8Array | string;
+  /**
+   * How reads check that a record's writer was allowed to write it (see {@link WriterCheck}).
+   * Default: `WriterCheck.chain({ rpcUrl, contractId })` when `rpcUrl` is set; otherwise none,
+   * and every read fails until one is configured.
+   */
+  writerCheck?: WriterCheck;
+  /** NEAR RPC endpoint for the default chain writer check, e.g. `https://rpc.mainnet.near.org`. */
+  rpcUrl?: string;
+  /** The NEAR Drive contract (default `drive.near`). */
+  contractId?: string;
   chunkSize?: number;
   /** Concurrent chunk transfers (default 8). */
   parallelism?: number;
@@ -78,8 +93,10 @@ export interface PutOptions {
   /** Store plaintext (for public data such as open model weights). */
   public?: boolean;
   contentType?: string;
-  /** Extra recipients (`x25519:<base58>`). With no root key this lets an app write data only the user can read. */
+  /** Extra recipients (`x25519:<base58>`). With `skipOwnerKey: true` this lets an app write data only the user can read. */
   shareWith?: string[];
+  /** Also wrap the object key to this account's own root key (default true; false needs `shareWith`). */
+  skipOwnerKey?: boolean;
   /** Storage class for the chunks (`hot`, `bulk`, ...); unset = gateway default. */
   class?: string;
   /**
@@ -122,6 +139,21 @@ export interface ListEntry {
   ts_ms: number;
   /** Present on gateways that report it. */
   manifest_cid?: string;
+}
+
+/** One page of `GET /v1/list` ({@link Client.listPage}). */
+export interface ListPage {
+  entries: ListEntry[];
+  /** Rolled-up prefixes (with a delimiter), each ending with it. */
+  common_prefixes: string[];
+  /** Pass back as `cursor` for the next page; null at the end. */
+  next_cursor: string | null;
+}
+
+export interface ListPageOptions {
+  delimiter?: string;
+  cursor?: string;
+  limit?: number;
 }
 
 const objPath = (u: NearUri) => `/v1/o/${u.namespace}/${encodePath(u.path)}`;
@@ -170,6 +202,9 @@ function concat(parts: Uint8Array[]): Uint8Array {
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+/** Default NEAR Drive contract account. */
+export const DEFAULT_CONTRACT = "drive.near";
+
 export class Client {
   readonly gateway: string;
   readonly accountId: string;
@@ -178,6 +213,7 @@ export class Client {
   readonly #signer: Signer;
   readonly #root?: RootKey;
   readonly #fetch: typeof fetch;
+  readonly #writerCheck?: WriterCheck;
   #net: NetConfig;
   #lastTs = 0;
 
@@ -193,6 +229,35 @@ export class Client {
     this.parallelism = o.parallelism ?? DEFAULT_PARALLELISM;
     this.#net = { ...DEFAULT_NET, ...o.net };
     this.#fetch = o.fetch ?? globalThis.fetch.bind(globalThis);
+    this.#writerCheck = o.writerCheck ?? (o.rpcUrl !== undefined ? WriterCheck.chain(new StorageContract(o.rpcUrl, o.contractId ?? DEFAULT_CONTRACT, { fetch: o.fetch })) : undefined);
+  }
+
+  /** The configured writer check (undefined: reads fail). */
+  get writerCheck(): WriterCheck | undefined {
+    return this.#writerCheck;
+  }
+
+  /** `ed25519:<base58>` key this client signs records with (derived from the root key). Publish it with `near drive publish-key`. */
+  signPublicKey(): string | undefined {
+    return this.#root?.signPublicKey();
+  }
+
+  /** The record-signing seed; writing requires the root key. */
+  #recordSeed(): Uint8Array {
+    if (!this.#root) throw new Error("writing requires the root key: records are signed with a key derived from it (pass rootKey)");
+    return this.#root.signSeed();
+  }
+
+  /** Wrap-key recipients for a new encrypted object. */
+  #recipients(opts: PutOptions): Recipient[] {
+    const rs: Recipient[] = [];
+    if (this.#root && !opts.skipOwnerKey) rs.push(this.#root);
+    for (const k of opts.shareWith ?? []) {
+      parseX25519(k);
+      rs.push(k);
+    }
+    if (rs.length === 0) throw new Error("no recipients: pass rootKey, shareWith recipients, or use {public: true}");
+    return rs;
   }
 
   /** Timeouts and retry policy. */
@@ -282,14 +347,26 @@ export class Client {
     return { cid, len: bytes.length };
   }
 
-  /** Record + manifest of `uri`, verified; `null` if absent. */
+  /** Record + manifest of `uri`, verified (including the writer, see {@link WriterCheck}); `null` if absent. */
   async head(uri: string | NearUri): Promise<ObjectHead | null> {
     const u = NearUri.from(uri);
+    const head = await this.#headUnchecked(u);
+    if (head) await this.#checkWriter(head.record);
+    return head;
+  }
+
+  /** Head with signature/manifest checks but no writer check: only for the current seq when writing (the gateway enforces CAS). */
+  async #headUnchecked(u: NearUri): Promise<ObjectHead | null> {
     const raw = await this.#getJson("head", objPath(u), "");
     if (raw === null) return null;
     const head = parseHead(raw);
-    verifyHead(u, head);
+    checkHead(u, head);
     return head;
+  }
+
+  async #checkWriter(r: PointerRecord): Promise<void> {
+    if (!this.#writerCheck) throw new Error(NO_WRITER_CHECK);
+    await this.#writerCheck.verify(r);
   }
 
   /** Record + manifest + per-chunk locations (inlined bytes or direct URLs), verified; `null` if absent. */
@@ -310,26 +387,21 @@ export class Client {
         return lc;
       });
     }
-    verifyHead(u, loc);
+    checkHead(u, loc);
     const m = loc.manifest;
     if (loc.chunks.length > 0 && (loc.chunks.length !== m.chunks.length || loc.chunks.some((c, i) => c.cid !== m.chunks[i]!.cid))) {
       throw new Error("gateway locate chunks do not match the manifest");
     }
     if (m.chunks.length !== chunkCount(m.size, m.chunk_size)) throw new Error("manifest chunk count does not match size / chunk_size");
+    await this.#checkWriter(loc.record);
     return loc;
   }
 
   /** A sealer for a new object per `opts` (null for public objects). */
   newSealer(opts: PutOptions = {}): ChunkSealer | null {
+    this.#recordSeed();
     if (opts.public) return null;
-    const rs: Recipient[] = [];
-    if (this.#root) rs.push(this.#root);
-    for (const k of opts.shareWith ?? []) {
-      parseX25519(k);
-      rs.push(k);
-    }
-    if (rs.length === 0) throw new Error("no root key and no shareWith recipients; pass rootKey or use {public: true}");
-    return ChunkSealer.create(rs);
+    return ChunkSealer.create(this.#recipients(opts));
   }
 
   /** The sealer of an object started earlier (resumed upload); needs the owner's root key. */
@@ -350,19 +422,13 @@ export class Client {
     const u = NearUri.from(uri);
     NearUri.object(u.namespace, u.path);
     const bytes = toBytes(data);
+    this.#recordSeed();
     let chunks: Uint8Array[];
     let enc: EncInfo | undefined;
     if (opts.public) {
       chunks = plaintextChunks(bytes, this.chunkSize);
     } else {
-      const rs: Recipient[] = [];
-      if (this.#root) rs.push(this.#root);
-      for (const k of opts.shareWith ?? []) {
-        parseX25519(k);
-        rs.push(k);
-      }
-      if (rs.length === 0) throw new Error("no root key and no shareWith recipients; pass rootKey or use {public: true}");
-      ({ chunks, enc } = encryptFor(rs, bytes, this.chunkSize));
+      ({ chunks, enc } = encryptFor(this.#recipients(opts), bytes, this.chunkSize));
     }
     // Repeated content (public data) yields repeated cids: upload each once.
     const seen = new Set<string>();
@@ -390,6 +456,8 @@ export class Client {
    */
   async commitManifest(uri: string | NearUri, manifest: Manifest, o: { class?: string; expectSeq?: number } = {}): Promise<PointerRecord> {
     const u = NearUri.from(uri);
+    const seed = this.#recordSeed();
+    const myPk = publicKeyOf(seed);
     const mbytes = manifestToBytes(manifest);
     const stored = storedSize(manifest) + mbytes.length;
     let mref: ChunkRef;
@@ -400,11 +468,10 @@ export class Client {
       prev = o.expectSeq;
     } else {
       // Independent: upload the manifest chunk while reading the current seq.
-      const [m, h] = await Promise.all([this.uploadChunk(u.namespace, mbytes, o.class), this.head(u)]);
+      const [m, h] = await Promise.all([this.uploadChunk(u.namespace, mbytes, o.class), this.#headUnchecked(u)]);
       mref = m;
       prev = h?.record.seq ?? 0;
     }
-    const myPk = this.#signer.publicKey;
     let maybeLanded = false;
     let conflicts = 0;
     let attempt = 0;
@@ -420,7 +487,7 @@ export class Client {
         writer_pk: myPk,
         ts_ms: this.#nowMs(),
       };
-      const rec: PointerRecord = { ...unsigned, sig: await this.#sign(recordSigningBytes(unsigned)) };
+      const rec: PointerRecord = { ...unsigned, sig: sign(seed, recordSigningBytes(unsigned)) };
       // Same class header as the chunks: the gateway records it in the index.
       let r: Resp | undefined;
       let a: Attempt<never> | undefined;
@@ -432,7 +499,7 @@ export class Client {
       if (r) {
         if (r.ok) return rec;
         if (r.status === 409) {
-          const cur = await this.head(u);
+          const cur = await this.#headUnchecked(u);
           if (cur && maybeLanded && cur.record.manifest_cid === mref.cid && cur.record.writer_pk === myPk && cur.record.seq === prev + 1) {
             return cur.record;
           }
@@ -536,10 +603,37 @@ export class Client {
     return new TextDecoder().decode(await this.get(uri));
   }
 
-  /** List objects under a prefix URI (e.g. `near://alice.near/memory/`). */
+  /**
+   * Every readable object whose path starts with the prefix URI's path (a raw
+   * string prefix, e.g. `near://alice.near/memory/`), sorted by path:
+   * {@link listPage} until the end.
+   */
   async list(prefix: string | NearUri): Promise<ListEntry[]> {
+    const out: ListEntry[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this.listPage(prefix, { cursor });
+      out.push(...page.entries);
+      if (page.next_cursor == null) return out;
+      if (page.next_cursor === cursor) throw new Error(`gateway listing of ${String(prefix)} did not advance`);
+      cursor = page.next_cursor;
+    }
+  }
+
+  /**
+   * One page of the listing. With `delimiter` (normally `/`) deeper paths are
+   * rolled up into `common_prefixes`. Pass the previous page's `next_cursor` as
+   * `cursor`; `limit` defaults to (and is capped at) 1000 by the gateway. Pages
+   * may hold fewer items than the limit; continue while `next_cursor` is set.
+   */
+  async listPage(prefix: string | NearUri, opts: ListPageOptions = {}): Promise<ListPage> {
     const u = NearUri.from(prefix);
-    return ((await this.#getJson("list", `/v1/list/${u.namespace}`, `prefix=${encodePath(u.path)}`)) as ListEntry[] | null) ?? [];
+    let q = `prefix=${encodePath(u.path)}`;
+    if (opts.delimiter) q += `&delimiter=${encodePath(opts.delimiter)}`;
+    if (opts.cursor) q += `&cursor=${encodePath(opts.cursor)}`;
+    if (opts.limit !== undefined) q += `&limit=${opts.limit}`;
+    const raw = (await this.#getJson("list", `/v1/list/${u.namespace}`, q)) as Partial<ListPage> | null;
+    return { entries: raw?.entries ?? [], common_prefixes: raw?.common_prefixes ?? [], next_cursor: raw?.next_cursor ?? null };
   }
 
   /** Delete `uri`. Retried; a 404 after a failed attempt means that attempt already deleted it. */
@@ -588,8 +682,18 @@ export class Client {
   }
 }
 
-/** Client-side checks on what a (possibly untrusted) gateway returned. */
-export function verifyHead(uri: NearUri, head: ObjectHead): void {
+/**
+ * Client-side checks on what a (possibly untrusted) gateway returned: record signature,
+ * manifest, and (via `check`) that the writer was allowed to write it with that key.
+ */
+export async function verifyHead(uri: NearUri, head: ObjectHead, check: WriterCheck | undefined): Promise<void> {
+  checkHead(uri, head);
+  if (!check) throw new Error(NO_WRITER_CHECK);
+  await check.verify(head.record);
+}
+
+/** Everything but the writer check. */
+function checkHead(uri: NearUri, head: ObjectHead): void {
   const r = head.record;
   if (!r || r.namespace !== uri.namespace || r.path !== uri.path) throw new Error("gateway returned a record for a different object");
   verifyRecordSignature(r);

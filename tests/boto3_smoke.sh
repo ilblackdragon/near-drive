@@ -23,7 +23,8 @@ JSON
 wait_port "$GWP"
 
 export NEAR_DRIVE_ACCOUNT=alice.near NEAR_DRIVE_CREDENTIALS="$T/alice.json" NEAR_DRIVE_HOME="$T/home" NEAR_DRIVE_GATEWAY="http://127.0.0.1:$GWP"
-"$BIN/near-drive" keygen 2>/dev/null
+export NEAR_DRIVE_INSECURE_SKIP_WRITER_CHECK=1 # dev gateway, no chain to check signing keys against
+"$BIN/near-drive" keygen --random 2>/dev/null
 NO_COLOR=1 RUST_LOG=warn,near_drive_s3=debug "$BIN/near-drive" s3-proxy --listen "127.0.0.1:$PXP" --public-prefix public/ > "$T/proxy.log" 2>&1 & PIDS+=($!)
 wait_port "$PXP"
 head -3 "$T/proxy.log"

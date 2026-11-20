@@ -7,11 +7,12 @@ import { mkdtempSync, readdirSync, readFileSync, existsSync, writeFileSync, utim
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { Client, ConflictError, GatewayError, generateSecretKey, RootKey, type NetConfig } from "../src/index.js";
+import { Client, ConflictError, GatewayError, generateSecretKey, RootKey, WriterCheck, type NetConfig } from "../src/index.js";
 import { getFile, putFile } from "../src/node.js";
 import { fakeGateway, faulty, haveGatewayBin, pattern, realGateway, sha, type Faulty, type RealGateway } from "./harness.js";
 
 const FAST: Partial<NetConfig> = { baseDelayMs: 1, maxDelayMs: 5 };
+const EMPTY_LIST = JSON.stringify({ entries: [], common_prefixes: [], next_cursor: null });
 
 interface Env {
   proxy: Faulty;
@@ -29,7 +30,17 @@ function envFor(url: string, inner: typeof fetch, secretKey: string): Env {
     proxy,
     tmp,
     client: (attempts, parallelism) =>
-      new Client({ gateway: url, accountId: "alice.near", signer: secretKey, rootKey: root, chunkSize: 64 * 1024, parallelism, net: { ...FAST, attempts }, fetch: proxy.fetch }),
+      new Client({
+        gateway: url,
+        accountId: "alice.near",
+        signer: secretKey,
+        rootKey: root,
+        writerCheck: WriterCheck.trusted({ "alice.near": [root.signPublicKey()] }),
+        chunkSize: 64 * 1024,
+        parallelism,
+        net: { ...FAST, attempts },
+        fetch: proxy.fetch,
+      }),
   };
 }
 
@@ -95,6 +106,29 @@ for (const b of backends) {
       await c.delete(small);
       expect(await c.head(small)).toBeNull();
       expect(env.proxy.k).toBeGreaterThan(40);
+    });
+
+    it("lists page by page, with and without a delimiter", async () => {
+      const c = env.client(8, 4);
+      env.proxy.set({ kind: "pass" });
+      const dir = fresh("");
+      const names = ["a", "b", "c", "d/1", "d/2", "e/1", "f"];
+      for (const n of names) await c.put(dir + n, n);
+      expect((await c.list(dir)).map((e) => e.path.slice(dir.length - "near://alice.near/".length))).toEqual(names);
+      let cursor: string | undefined;
+      const seen: string[] = [];
+      let pages = 0;
+      for (;;) {
+        const pg = await c.listPage(dir, { delimiter: "/", cursor, limit: 2 });
+        pages++;
+        expect(pg.entries.length + pg.common_prefixes.length).toBeLessThanOrEqual(2);
+        seen.push(...pg.entries.map((e) => e.path), ...pg.common_prefixes);
+        if (pg.next_cursor === null) break;
+        cursor = pg.next_cursor;
+      }
+      const base = dir.slice("near://alice.near/".length);
+      expect(seen.sort()).toEqual(["a", "b", "c", "d/", "e/", "f"].map((n) => base + n));
+      expect(pages).toBe(3);
     });
 
     it("interrupted upload resumes without resending chunks", async () => {
@@ -249,7 +283,7 @@ describe("retry policy (mocked fetch)", () => {
   it("honours Retry-After", async () => {
     let n = 0;
     const t0 = Date.now();
-    const f = (async () => (n++ === 0 ? new Response("slow down", { status: 429, headers: { "retry-after": "1" } }) : new Response("[]", { status: 200 }))) as typeof fetch;
+    const f = (async () => (n++ === 0 ? new Response("slow down", { status: 429, headers: { "retry-after": "1" } }) : new Response(EMPTY_LIST, { status: 200 }))) as typeof fetch;
     expect(await mk(f, { maxDelayMs: 1000 }).list("near://alice.near/")).toEqual([]); // floor capped at 4 * maxDelayMs
     expect(Date.now() - t0).toBeGreaterThanOrEqual(950);
   });
@@ -259,7 +293,7 @@ describe("retry policy (mocked fetch)", () => {
     const f = ((_u: unknown, init?: RequestInit) => {
       n++;
       if (n === 1) return new Promise((_, rej) => init!.signal!.addEventListener("abort", () => rej(init!.signal!.reason)));
-      return Promise.resolve(new Response("[]", { status: 200 }));
+      return Promise.resolve(new Response(EMPTY_LIST, { status: 200 }));
     }) as typeof fetch;
     expect(await mk(f, { baseTimeoutMs: 50 }).list("near://alice.near/")).toEqual([]);
     expect(n).toBe(2);
@@ -270,7 +304,7 @@ describe("retry policy (mocked fetch)", () => {
     const f = (async () => {
       n++;
       if (n === 1) return new Response(new ReadableStream({ start: (c) => c.enqueue(new TextEncoder().encode("[")) }), { status: 200 });
-      return new Response("[]", { status: 200 });
+      return new Response(EMPTY_LIST, { status: 200 });
     }) as typeof fetch;
     expect(await mk(f, { idleTimeoutMs: 50 }).list("near://alice.near/")).toEqual([]);
     expect(n).toBe(2);
@@ -278,14 +312,16 @@ describe("retry policy (mocked fetch)", () => {
 
   it("retries a body shorter than its content-length", async () => {
     let n = 0;
-    const f = (async () => (n++ === 0 ? new Response("[", { status: 200, headers: { "content-length": "2" } }) : new Response("[]", { status: 200 }))) as typeof fetch;
+    const f = (async () => (n++ === 0 ? new Response("[", { status: 200, headers: { "content-length": "2" } }) : new Response(EMPTY_LIST, { status: 200 }))) as typeof fetch;
     expect(await mk(f).list("near://alice.near/")).toEqual([]);
     expect(n).toBe(2);
   });
 
   it("refetches a chunk whose bytes do not match its id; rejects a bad inlined chunk", async () => {
     const g = fakeGateway();
-    const c = new Client({ gateway: g.url, accountId: "alice.near", signer: sk, rootKey: RootKey.generate(), net: FAST, fetch: g.fetch });
+    const root = RootKey.generate();
+    const writerCheck = WriterCheck.trusted({ "alice.near": [root.signPublicKey()] });
+    const c = new Client({ gateway: g.url, accountId: "alice.near", signer: sk, rootKey: root, writerCheck, net: FAST, fetch: g.fetch });
     // corrupt the inlined copy: client must fall back to a verified fetch
     let corruptOnce = true;
     const f = (async (u: RequestInfo | URL, init?: RequestInit) => {
@@ -302,7 +338,7 @@ describe("retry policy (mocked fetch)", () => {
       }
       return r;
     }) as typeof fetch;
-    const reader = new Client({ gateway: g.url, accountId: "alice.near", signer: sk, net: FAST, fetch: f });
+    const reader = new Client({ gateway: g.url, accountId: "alice.near", signer: sk, writerCheck, net: FAST, fetch: f });
     await c.put("near://alice.near/pub", "public bytes", { public: true });
     expect(new TextDecoder().decode(await reader.get("near://alice.near/pub"))).toBe("public bytes");
     expect(corruptOnce).toBe(false);

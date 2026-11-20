@@ -164,3 +164,99 @@ async fn request_root_key_end_to_end_with_mock_rpc() {
         k1.as_bytes()
     );
 }
+
+/// Scripted RPC for `send_and_wait`: answers come from per-method queues
+/// (the last answer repeats); every call is recorded.
+#[derive(Default)]
+struct Script {
+    send_tx: Mutex<Vec<Value>>,
+    tx: Mutex<Vec<Value>>,
+    calls: Mutex<Vec<(String, Value)>>,
+}
+
+fn rpc_err(cause: &str) -> Value {
+    json!({"error": {"name": "HANDLER_ERROR", "cause": {"name": cause, "info": {}}}})
+}
+
+async fn scripted(State(s): State<Arc<Script>>, Json(req): Json<Value>) -> Json<Value> {
+    let method = req["method"].as_str().unwrap().to_string();
+    s.calls.lock().unwrap().push((method.clone(), req["params"].clone()));
+    let q = match method.as_str() {
+        "send_tx" => &s.send_tx,
+        "tx" => &s.tx,
+        m => panic!("unexpected {m}"),
+    };
+    let mut q = q.lock().unwrap();
+    let a = if q.len() > 1 { q.remove(0) } else { q[0].clone() };
+    let mut out = json!({"jsonrpc": "2.0", "id": req["id"]});
+    match a.get("error") {
+        Some(e) => out["error"] = e.clone(),
+        None => out["result"] = a,
+    }
+    Json(out)
+}
+
+async fn serve_script(s: Arc<Script>) -> near::Rpc {
+    let app = Router::new().route("/", post(scripted)).with_state(s);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    near::Rpc::new(&format!("http://{addr}/"))
+}
+
+const POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+#[tokio::test]
+async fn unknown_transaction_is_resent_with_the_same_bytes() {
+    let ok = json!({"status": {"SuccessValue": ""}});
+    let s = Arc::new(Script {
+        send_tx: Mutex::new(vec![rpc_err("TIMEOUT_ERROR"), json!({"final_execution_status": "NONE"})]),
+        tx: Mutex::new(vec![rpc_err("UNKNOWN_TRANSACTION"), ok.clone()]),
+        ..Default::default()
+    });
+    let rpc = serve_script(s.clone()).await;
+    let v = rpc
+        .send_and_wait(b"signed-bytes", &[5; 32], "alice.testnet", std::time::Duration::from_secs(5), POLL)
+        .await
+        .unwrap();
+    assert_eq!(v, ok);
+    let calls = s.calls.lock().unwrap();
+    let names: Vec<&str> = calls.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(names, ["send_tx", "tx", "send_tx", "tx"]);
+    assert_eq!(calls[0].1["signed_tx_base64"], calls[2].1["signed_tx_base64"], "re-sent the identical tx");
+    assert_eq!(calls[1].1["tx_hash"], bs58::encode([5u8; 32]).into_string());
+}
+
+#[tokio::test]
+async fn invalid_transaction_stops_at_once() {
+    let s = Arc::new(Script {
+        send_tx: Mutex::new(vec![rpc_err("INVALID_TRANSACTION")]),
+        tx: Mutex::new(vec![json!({"status": {"SuccessValue": ""}})]),
+        ..Default::default()
+    });
+    let rpc = serve_script(s.clone()).await;
+    let e = rpc
+        .send_and_wait(b"x", &[6; 32], "alice.testnet", std::time::Duration::from_secs(5), POLL)
+        .await
+        .unwrap_err();
+    let msg = format!("{e:#}");
+    assert!(msg.contains("INVALID_TRANSACTION") && msg.contains(&bs58::encode([6u8; 32]).into_string()), "{msg}");
+    assert_eq!(s.calls.lock().unwrap().len(), 1, "no polling after a rejection");
+}
+
+#[tokio::test]
+async fn timeout_reports_hash_and_first_send_error() {
+    let s = Arc::new(Script {
+        send_tx: Mutex::new(vec![rpc_err("TIMEOUT_ERROR")]),
+        tx: Mutex::new(vec![json!({"final_execution_status": "INCLUDED"})]),
+        ..Default::default()
+    });
+    let rpc = serve_script(s).await;
+    let e = rpc
+        .send_and_wait(b"x", &[7; 32], "alice.testnet", std::time::Duration::from_millis(200), POLL)
+        .await
+        .unwrap_err();
+    let msg = format!("{e:#}");
+    assert!(msg.contains(&bs58::encode([7u8; 32]).into_string()), "{msg}");
+    assert!(msg.contains("first send_tx error") && msg.contains("TIMEOUT_ERROR"), "{msg}");
+}

@@ -68,6 +68,13 @@ impl Signer {
         let (account_id, sk) = near_drive_core::keys::NearCredentials::load(path)?;
         Ok(Self { account_id, sk })
     }
+
+    /// Like [`from_credentials_file`](Self::from_credentials_file) for files
+    /// without `account_id` (near-cli-rs per-key files): `account` fills it in.
+    pub fn from_credentials_file_for(path: &std::path::Path, account: &str) -> Result<Self> {
+        let (account_id, sk) = near_drive_core::keys::NearCredentials::load_for(path, Some(account))?;
+        Ok(Self { account_id, sk })
+    }
 }
 
 /// Outcome of a successful transaction.

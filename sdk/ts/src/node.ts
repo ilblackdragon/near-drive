@@ -58,11 +58,23 @@ export async function generateRootKeyFile(path: string): Promise<RootKey> {
 
 /** Client from a credentials file plus the account's local root key (if any), like `near-drive`. */
 export async function clientFromFiles(
-  o: { gateway: string; credentials: string; rootKey?: string } & Pick<ClientOptions, "chunkSize" | "parallelism" | "net" | "fetch">,
+  o: { gateway: string; credentials: string; rootKey?: string } & Pick<ClientOptions, "chunkSize" | "parallelism" | "net" | "fetch" | "writerCheck" | "rpcUrl" | "contractId">,
 ): Promise<Client> {
   const c = await loadCredentials(o.credentials);
   const root = await loadRootKey(o.rootKey ?? defaultRootKeyPath(c.account_id));
-  const opts: ClientOptions = { gateway: o.gateway, accountId: c.account_id, signer: c.private_key, rootKey: root, chunkSize: o.chunkSize, parallelism: o.parallelism, net: o.net, fetch: o.fetch };
+  const opts: ClientOptions = {
+    gateway: o.gateway,
+    accountId: c.account_id,
+    signer: c.private_key,
+    rootKey: root,
+    chunkSize: o.chunkSize,
+    parallelism: o.parallelism,
+    net: o.net,
+    fetch: o.fetch,
+    writerCheck: o.writerCheck,
+    rpcUrl: o.rpcUrl,
+    contractId: o.contractId,
+  };
   return new Client(opts);
 }
 
@@ -71,7 +83,7 @@ export interface PutFileOptions extends PutOptions {
   /**
    * Keep an upload journal in this directory so an interrupted upload of the
    * same file to the same URI resumes instead of starting over (unset = off).
-   * Encrypted uploads resume only when the client has the owner's root key.
+   * Encrypted uploads resume only when encrypted to the client's own root key (not with `skipOwnerKey: true`).
    */
   resumeDir?: string;
 }
@@ -277,7 +289,7 @@ export async function putFile(client: Client, src: string, uri: string | NearUri
   const fh = await open(src, "r");
   try {
     // Resuming an encrypted upload needs the owner's key to recover the object key.
-    if (!opts.resumeDir || (!opts.public && !client.hasRootKey)) {
+    if (!opts.resumeDir || (!opts.public && opts.skipOwnerKey)) {
       return await putStream(client, fh, u, opts, client.newSealer(opts), null, new Map());
     }
     const key = await journalKey(client.accountId, u.toString(), src, client.chunkSize, opts);

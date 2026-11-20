@@ -33,12 +33,14 @@ async fn start() -> Env {
     start_cfg(|_| {}).await
 }
 
+const SHARED_RULES: &str = r#"[{"prefix":"inbox/","read":["*"],"write":["*"]}]"#;
+
 async fn start_cfg(f: impl FnOnce(&mut ProxyConfig)) -> Env {
     let gw_dir = tempfile::tempdir().unwrap();
     let alice = SigningKey::generate(&mut rand::rngs::OsRng);
     let mut dev_keys = HashMap::new();
     dev_keys.insert("alice.near".to_string(), vec![keys::format_public_key(&alice.verifying_key())]);
-    let policies = serde_json::from_str(r#"{"shared.near": [{"prefix":"inbox/","read":["*"],"write":["*"]}]}"#).unwrap();
+    let policies = HashMap::from([("shared.near".to_string(), serde_json::from_str(SHARED_RULES).unwrap())]);
     let cfg = Config {
         listen: "127.0.0.1:0".into(),
         data_dir: gw_dir.path().to_path_buf(),
@@ -54,7 +56,8 @@ async fn start_cfg(f: impl FnOnce(&mut ProxyConfig)) -> Env {
     tokio::spawn(async move { axum::serve(gl, gw_router(state)).await.unwrap() });
 
     let home = tempfile::tempdir().unwrap();
-    let mut client = Client::new(&gw_url, "alice.near", alice.clone(), Some(RootKey::from_bytes([9; 32])));
+    // Trusts alice's two signing keys (the test also writes with a second root).
+    let mut client = Client::new(&gw_url, "alice.near", alice.clone(), Some(RootKey::from_bytes([9; 32]))).with_writer_check(near_drive_client::WriterCheck::Trusted(near_drive_client::TrustedWriters::new().key("alice.near", RootKey::from_bytes([9; 32]).sign_public_key()).key("alice.near", RootKey::from_bytes([1; 32]).sign_public_key()).rules("shared.near", serde_json::from_str(SHARED_RULES).unwrap())));
     client.chunk_size = 64 * 1024; // multi-chunk objects in tests
     let mut pcfg = ProxyConfig::new(sigv4::Credentials { access_key: AK.into(), secret_key: SK.into() }, home.path().join("s3-staging"));
     pcfg.public_prefixes = vec!["public/".into()];
@@ -255,6 +258,72 @@ async fn list_v2_v1_delimiter_pagination_and_delete() {
     // sidecars of deleted objects are gone too
     let bk = s3.list_objects_v2().bucket(B).prefix("a/").send().await.unwrap();
     assert_eq!(bk.key_count(), Some(0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn list_pages_2500_keys() {
+    use futures_util::StreamExt;
+    let env = start().await;
+    let s3 = &env.s3;
+    // 2000 top-level keys + 500 under 10 folders; every 7th has metadata (a hidden sidecar)
+    let keys: Vec<String> = (0..2500).map(|i| if i < 2000 { format!("f{i:04}") } else { format!("d{}/x{i}", i % 10) }).collect();
+    futures_util::stream::iter(keys.iter().enumerate())
+        .for_each_concurrent(32, |(i, k)| async move {
+            let mut put = s3.put_object().bucket(B).key(k).body(ByteStream::from(k.as_bytes().to_vec()));
+            if i % 7 == 0 {
+                put = put.metadata("n", i.to_string());
+            }
+            put.send().await.unwrap();
+        })
+        .await;
+    let mut sorted = keys.clone();
+    sorted.sort();
+
+    // v2, no delimiter: 1000 + 1000 + 500
+    let mut pages = s3.list_objects_v2().bucket(B).max_keys(1000).into_paginator().send();
+    let (mut seen, mut sizes) = (vec![], vec![]);
+    while let Some(p) = pages.next().await {
+        let p = p.unwrap();
+        sizes.push(p.contents().len());
+        seen.extend(p.contents().iter().map(|o| o.key().unwrap().to_string()));
+    }
+    assert_eq!(sizes, [1000, 1000, 500]);
+    assert_eq!(seen, sorted);
+
+    // v2 with delimiter: 2000 files + 10 folders
+    let mut pages = s3.list_objects_v2().bucket(B).delimiter("/").max_keys(1000).into_paginator().send();
+    let (mut files, mut dirs, mut sizes) = (vec![], vec![], vec![]);
+    while let Some(p) = pages.next().await {
+        let p = p.unwrap();
+        sizes.push(p.contents().len() + p.common_prefixes().len());
+        files.extend(p.contents().iter().map(|o| o.key().unwrap().to_string()));
+        dirs.extend(p.common_prefixes().iter().map(|o| o.prefix().unwrap().to_string()));
+    }
+    assert_eq!(sizes, [1000, 1000, 10]);
+    assert_eq!(files, keys[..2000]);
+    assert_eq!(dirs, (0..10).map(|d| format!("d{d}/")).collect::<Vec<_>>());
+
+    // continuation from the middle of a folder, and start-after a common prefix
+    let p = s3.list_objects_v2().bucket(B).prefix("d3/").max_keys(20).send().await.unwrap();
+    assert_eq!((p.contents().len(), p.is_truncated()), (20, Some(true)));
+    let p2 = s3.list_objects_v2().bucket(B).prefix("d3/").continuation_token(p.next_continuation_token().unwrap()).send().await.unwrap();
+    assert_eq!((p2.contents().len(), p2.is_truncated()), (30, Some(false)));
+    let p = s3.list_objects_v2().bucket(B).delimiter("/").start_after("d4/").send().await.unwrap();
+    assert_eq!(p.common_prefixes().iter().map(|o| o.prefix().unwrap()).collect::<Vec<_>>(), ["d5/", "d6/", "d7/", "d8/", "d9/"]);
+    assert_eq!(p.contents().len(), 995, "max-keys defaults to 1000");
+
+    // v1 with marker / NextMarker and a delimiter
+    let (mut marker, mut n, mut total) = (None::<String>, 0, 0);
+    loop {
+        let r = s3.list_objects().bucket(B).delimiter("/").max_keys(700).set_marker(marker.clone()).send().await.unwrap();
+        n += 1;
+        total += r.contents().len() + r.common_prefixes().len();
+        if r.is_truncated() != Some(true) {
+            break;
+        }
+        marker = Some(r.next_marker().unwrap().to_string());
+    }
+    assert_eq!((n, total), (3, 2010));
 }
 
 #[tokio::test]
@@ -559,7 +628,7 @@ async fn large_objects_stream_and_foreign_keys() {
     assert_eq!(body(g).await, big);
 
     // objects encrypted to a different root key -> AccessDenied (small and streamed paths)
-    let mut other = Client::new(&env.gw_url, "alice.near", env.alice.clone(), Some(RootKey::from_bytes([1; 32])));
+    let mut other = Client::new(&env.gw_url, "alice.near", env.alice.clone(), Some(RootKey::from_bytes([1; 32]))).with_writer_check(near_drive_client::WriterCheck::Trusted(near_drive_client::TrustedWriters::new().key("alice.near", RootKey::from_bytes([9; 32]).sign_public_key()).key("alice.near", RootKey::from_bytes([1; 32]).sign_public_key()).rules("shared.near", serde_json::from_str(SHARED_RULES).unwrap())));
     other.chunk_size = 64 * 1024;
     let opts = near_drive_client::PutOptions::default();
     other.put(&near_drive_client::near_drive_core::NearUri::parse("near://alice.near/foreign/small").unwrap(), b"x", &opts).await.unwrap();
@@ -683,7 +752,7 @@ async fn bucket_aliases_presigned_urls_cors_and_vhost() {
     // Existing bucket names work, and land in the NEAR Drive folders.
     s3.put_object().bucket("delta-artifacts").key("verified/abc").body(ByteStream::from_static(b"model bytes")).send().await.unwrap();
     s3.put_object().bucket("delta-private").key("jobs/1/input.jsonl").body(ByteStream::from_static(b"prompts")).send().await.unwrap();
-    let mut c = Client::new(&env.gw_url, "alice.near", env.alice.clone(), Some(RootKey::from_bytes([9; 32])));
+    let mut c = Client::new(&env.gw_url, "alice.near", env.alice.clone(), Some(RootKey::from_bytes([9; 32]))).with_writer_check(near_drive_client::WriterCheck::Trusted(near_drive_client::TrustedWriters::new().key("alice.near", RootKey::from_bytes([9; 32]).sign_public_key()).key("alice.near", RootKey::from_bytes([1; 32]).sign_public_key()).rules("shared.near", serde_json::from_str(SHARED_RULES).unwrap())));
     c.chunk_size = 64 * 1024;
     let u = |s: &str| near_drive_client::near_drive_core::NearUri::parse(s).unwrap();
     assert_eq!(c.get(&u("near://alice.near/artifacts/verified/abc")).await.unwrap().1, b"model bytes");

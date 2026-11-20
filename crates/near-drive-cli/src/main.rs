@@ -17,7 +17,7 @@ use ed25519_dalek::SigningKey;
 use interactive::{basename, choice, split_list, Prompter};
 use near_drive_client::{
     near_drive_core::{crypto::RootKey, keys, policy::Rule, NearUri},
-    Client, PutOptions,
+    Client, PublishedKeys, PutOptions,
 };
 use nearcli::{FunctionCall, KeyKind, NearCli, NearCliConfig};
 use std::io::{IsTerminal, Write};
@@ -71,8 +71,12 @@ struct Cli {
     #[arg(long, env = "NEAR_DRIVE_NEAR_SIGN", global = true)]
     near_sign: Option<String>,
     /// Never prompt; fail on missing arguments.
-    #[arg(long, env = "NEAR_DRIVE_NO_INTERACTIVE", global = true)]
+    #[arg(long, env = "NEAR_DRIVE_NO_INTERACTIVE", value_parser = clap::builder::BoolishValueParser::new(), global = true)]
     no_interactive: bool,
+    /// INSECURE, dev gateways only: accept records without checking that the
+    /// writer published the signing key (a gateway could then forge data).
+    #[arg(long, env = "NEAR_DRIVE_INSECURE_SKIP_WRITER_CHECK", value_parser = clap::builder::BoolishValueParser::new(), global = true)]
+    insecure_skip_writer_check: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -111,7 +115,7 @@ struct ProxyArgs {
     vhost_domains: Vec<String>,
     /// Allow listening on a non-loopback address, so other machines can use
     /// the endpoint (and its presigned URLs). Put it behind TLS.
-    #[arg(long, env = "NEAR_DRIVE_S3_PUBLIC_LISTEN")]
+    #[arg(long, env = "NEAR_DRIVE_S3_PUBLIC_LISTEN", value_parser = clap::builder::BoolishValueParser::new())]
     public_listen: bool,
 }
 
@@ -119,7 +123,13 @@ struct ProxyArgs {
 enum Cmd {
     /// List files under a prefix (default: your whole namespace).
     /// Paths without `near://` are in your own namespace: `docs/` = `near://<you>/docs/`.
-    Ls { uri: Option<String> },
+    Ls {
+        uri: Option<String>,
+        /// One level only: files directly under the prefix plus its subfolders
+        /// (listed with a trailing `/`), instead of everything recursively.
+        #[arg(long)]
+        dir: bool,
+    },
     /// Download a file (to stdout when no destination is given).
     Get {
         uri: Option<String>,
@@ -176,23 +186,40 @@ enum Cmd {
     },
     /// Delete the NEAR Drive session key from your account (transaction via near-cli).
     Logout,
-    /// Create your encryption root key.
+    /// Create your encryption root key (`--ckd` or `--random`; asked for in a terminal).
     Keygen {
         /// Derive it from your NEAR account with MPC Confidential Key
-        /// Derivation (one transaction; the same key on every device).
+        /// Derivation (one transaction; the same key on every device). Recommended.
         #[arg(long, conflicts_with = "random")]
         ckd: bool,
-        /// A random key stored only on this machine (back it up).
+        /// A random key stored only on this machine (back it up with `key export`).
         #[arg(long)]
         random: bool,
-        /// MPC contract (default: the near-cli connection's `mpc_contract_account_id`).
+        /// MPC contract. Pinned on mainnet (`v1.signer`) and testnet
+        /// (`v1.signer-prod.testnet`); required on other networks.
         #[arg(long)]
         ckd_contract: Option<String>,
-        /// CKD domain id (default 2).
+        /// CKD domain id. Pinned to 2 on mainnet/testnet; required on other networks.
         #[arg(long)]
         ckd_domain: Option<u64>,
+        /// Allow an MPC contract or CKD domain other than the pinned ones
+        /// (including the near-cli connection's `mpc_contract_account_id`).
+        /// Each derives a different root key.
+        #[arg(long)]
+        ckd_unpinned: bool,
+        /// Save the key even if it does not match the keys already published
+        /// for the account (then `publish-key` to rotate; data encrypted to the
+        /// old key stays unreadable to the new one).
+        #[arg(long)]
+        force: bool,
     },
-    /// Publish your X25519 key in the contract so others can share to you (transaction via near-cli).
+    /// Back up or restore your encryption root key.
+    Key {
+        #[command(subcommand)]
+        action: Option<KeyCmd>,
+    },
+    /// Publish your X25519 key (so others can share to you) and your record-signing key (so readers
+    /// accept what you write) in the contract (transactions via near-cli).
     PublishKey,
     /// Show the account, the key used to sign requests and your sharing key.
     Whoami,
@@ -256,6 +283,38 @@ enum Cmd {
 }
 
 #[derive(Subcommand, Clone)]
+enum KeyCmd {
+    /// Print your root key (hex), or write it to a file (mode 0600). Anyone
+    /// with it can read your private files and sign records as you.
+    Export {
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Install a root key exported elsewhere (`-` reads it from stdin). It is
+    /// checked against the keys published for your account first.
+    Import {
+        #[arg(conflicts_with = "file")]
+        hex: Option<String>,
+        /// Read the key from this file (e.g. one written by `key export --out`).
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Replace a different existing key, and/or save a key that does not
+        /// match the published ones.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Default)]
+struct KeygenOpts {
+    ckd: bool,
+    ckd_contract: Option<String>,
+    ckd_domain: Option<u64>,
+    ckd_unpinned: bool,
+    force: bool,
+}
+
+#[derive(Subcommand, Clone)]
 enum SyncCmd {
     /// Sync a local folder (created if missing) with a NEAR Drive folder
     /// (default `Drive/` in your namespace). `near drive up` keeps it in sync.
@@ -286,7 +345,7 @@ enum SyncCmd {
 
 fn menu() -> Vec<interactive::Choice<Cmd>> {
     vec![
-        choice(Cmd::Ls { uri: None }, "ls          - List your files"),
+        choice(Cmd::Ls { uri: None, dir: false }, "ls          - List your files"),
         choice(Cmd::Get { uri: None, dst: None, range: None }, "get         - Download a file"),
         choice(Cmd::Put { src: None, uri: None, public: false, content_type: None, share: vec![], class: None, no_resume: false }, "put         - Upload a file"),
         choice(Cmd::Rm { uri: None }, "rm          - Delete a file"),
@@ -295,8 +354,10 @@ fn menu() -> Vec<interactive::Choice<Cmd>> {
         choice(Cmd::Rules { namespace: None }, "rules       - Show a namespace's access rules"),
         choice(Cmd::Whoami, "whoami      - Show account, signing key and sharing key"),
         choice(Cmd::Login { allowance: "0.25 NEAR".into() }, "login       - Add a NEAR Drive session key (via near-cli)"),
-        choice(Cmd::Keygen { ckd: false, random: false, ckd_contract: None, ckd_domain: None }, "keygen      - Create your encryption key"),
-        choice(Cmd::PublishKey, "publish-key - Let others share files with you"),
+        choice(Cmd::Keygen { ckd: false, random: false, ckd_contract: None, ckd_domain: None, ckd_unpinned: false, force: false }, "keygen      - Create your encryption key"),
+        choice(Cmd::Key { action: Some(KeyCmd::Export { out: None }) }, "key export  - Back up your encryption key"),
+        choice(Cmd::Key { action: Some(KeyCmd::Import { hex: None, file: None, force: false }) }, "key import  - Restore your encryption key from a backup"),
+        choice(Cmd::PublishKey, "publish-key - Publish your keys (needed to write; lets others share with you)"),
         choice(Cmd::Gateways, "gateways    - List registered gateways"),
         choice(Cmd::Sync { action: Some(SyncCmd::Add { dir: None, remote: None }) }, "sync add    - Keep a local folder in sync (like Dropbox)"),
         choice(Cmd::Sync { action: Some(SyncCmd::Status { json: false }) }, "sync status - Synced folders and their state"),
@@ -313,6 +374,8 @@ struct Ctx {
     network_prompted: bool,
     account: Option<String>,
     p: Prompter,
+    /// The published-key check ran (once per process).
+    key_checked: bool,
 }
 
 /// `near://ns/path` as is; anything else is a path in `account`'s namespace.
@@ -327,18 +390,51 @@ fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).context("HOME not set")
 }
 
+fn parse_root_hex(s: &str, what: &str) -> Result<RootKey> {
+    let b: [u8; 32] = hex::decode(s.trim())
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .with_context(|| format!("{what} is not a root key (64 hex characters)"))?;
+    Ok(RootKey::from_bytes(b))
+}
+
 fn load_root(path: &PathBuf) -> Result<Option<RootKey>> {
     match std::fs::read_to_string(path) {
-        Ok(s) => {
-            let b: [u8; 32] = hex::decode(s.trim())
-                .ok()
-                .and_then(|v| v.try_into().ok())
-                .with_context(|| format!("{} is not a 32-byte hex key", path.display()))?;
-            Ok(Some(RootKey::from_bytes(b)))
-        }
+        Ok(s) => Ok(Some(parse_root_hex(&s, &path.display().to_string())?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Like [`write_private`] but replaces an existing file (atomically).
+fn replace_private(path: &PathBuf, contents: &str) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    write_private(&tmp, contents)?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
+}
+
+const BACKUP_BANNER: &str = "\
+==========================================================================
+ BACK UP THIS KEY NOW. It exists only on this machine. If it is lost,
+ your private files are unreadable and your published keys useless:
+     near drive key export --out <file on a USB stick / password manager>
+==========================================================================";
+
+/// What to tell the user when a root key and the published keys disagree.
+fn mismatch_text(account: &str, contract: &str, source: &str, m: &PublishedKeys) -> String {
+    let PublishedKeys::Mismatch { published_enc, published_sign, enc, sign } = m else {
+        return String::new();
+    };
+    let show = |p: &Option<String>| p.clone().unwrap_or_else(|| "(none)".into());
+    format!(
+        "the root key {source} does not match the keys {account} published in {contract}:\n  \
+         encryption key: published {}, this key {enc}\n  \
+         signing key:    published {}, this key {sign}\n\
+         The published keys belong to a different root key; your existing data and records were made with it.",
+        show(published_enc),
+        show(published_sign),
+    )
 }
 
 fn write_private(path: &PathBuf, contents: &str) -> Result<()> {
@@ -421,10 +517,7 @@ impl Ctx {
             return Ok((account, keys::parse_secret_key(sk.trim()).context("NEAR_DRIVE_SECRET_KEY")?, None));
         }
         if let Some(path) = &self.cli.credentials {
-            let (cred_account, sk) = keys::NearCredentials::load(path)?;
-            if cred_account != account {
-                bail!("credentials are for {cred_account}, not {account}");
-            }
+            let (_, sk) = keys::NearCredentials::load_for(path, Some(&account))?;
             return Ok((account, sk, None));
         }
         let conn = self.conn()?.clone();
@@ -434,14 +527,7 @@ impl Ctx {
 
     async fn client(&mut self) -> Result<Client> {
         let (account, sk, _) = self.request_key().await?;
-        let root = match std::env::var("NEAR_DRIVE_ROOT_KEY") {
-            // Services / containers: the root key from a secret instead of a file.
-            Ok(hex_key) => {
-                let b: [u8; 32] = hex::decode(hex_key.trim()).ok().and_then(|v| v.try_into().ok()).context("NEAR_DRIVE_ROOT_KEY must be 64 hex characters")?;
-                Some(RootKey::from_bytes(b))
-            }
-            Err(_) => load_root(&self.root_key_path(&account)?)?,
-        };
+        let root = self.load_root_key(&account)?.map(|(r, _)| r);
         if !(1..=64).contains(&self.cli.chunk_mib) {
             bail!("--chunk-mib must be in 1..=64");
         }
@@ -452,6 +538,10 @@ impl Ctx {
             (g, _) => g.to_string(),
         };
         let mut c = Client::new(gateway, account, sk, root);
+        if self.cli.insecure_skip_writer_check {
+            eprintln!("WARNING: --insecure-skip-writer-check: records are not checked against published signing keys");
+            c = c.insecure_skip_writer_check();
+        }
         if let Some(rpc) = &rpc {
             c = c.with_chain(rpc, &self.cli.contract);
         }
@@ -459,6 +549,98 @@ impl Ctx {
         c.set_net(near_drive_client::NetConfig { attempts: self.cli.retries.max(1), ..Default::default() });
         c.chunk_size = self.cli.chunk_mib * 1024 * 1024;
         Ok(c)
+    }
+
+    /// [`client`](Self::client) for commands that write: first checks the
+    /// root key against the keys published for the account.
+    async fn write_client(&mut self) -> Result<Client> {
+        let c = self.client().await?;
+        self.check_before_write(c.account()).await?;
+        Ok(c)
+    }
+
+    /// The root key commands use: `NEAR_DRIVE_ROOT_KEY` (services,
+    /// containers), else `<home>/keys/<account>.root`; with where it came from.
+    fn load_root_key(&self, account: &str) -> Result<Option<(RootKey, String)>> {
+        if let Ok(hex_key) = std::env::var("NEAR_DRIVE_ROOT_KEY") {
+            return Ok(Some((parse_root_hex(&hex_key, "NEAR_DRIVE_ROOT_KEY")?, "from NEAR_DRIVE_ROOT_KEY".into())));
+        }
+        let path = self.root_key_path(account)?;
+        Ok(load_root(&path)?.map(|r| (r, format!("in {}", path.display()))))
+    }
+
+    /// The contract to compare root keys with; `None` in dev setups (no
+    /// usable RPC, or `--insecure-skip-writer-check`), where the check is skipped.
+    fn key_check_contract(&self) -> Option<near_drive_chain::StorageContract> {
+        if self.cli.insecure_skip_writer_check {
+            return None;
+        }
+        self.contract().ok()
+    }
+
+    /// Before saving a new root key (keygen, key import): refuse one that does
+    /// not match what the account already published, unless `force`.
+    async fn check_before_save(&mut self, account: &str, root: &RootKey, source: &str, force: bool) -> Result<Option<PublishedKeys>> {
+        let Some(contract) = self.key_check_contract() else { return Ok(None) };
+        self.key_checked = true;
+        let r = match near_drive_client::check_published_keys(&contract, account, root).await {
+            Ok(r) => r,
+            Err(e) if force => {
+                eprintln!("warning: could not compare with the keys published for {account} ({e:#}); saving anyway (--force)");
+                return Ok(None);
+            }
+            Err(e) => bail!("could not compare the key with the keys published for {account} in {}: {e:#}\nRetry, or pass --force to save it unchecked", contract.contract_id),
+        };
+        if matches!(r, PublishedKeys::Mismatch { .. }) {
+            let text = mismatch_text(account, &contract.contract_id, source, &r);
+            if !force {
+                bail!(
+                    "{text}\nRefusing to save it. Use `near drive key import` with the right key (`near drive key export` prints it on a device that has it; \
+                     a key from `keygen --ckd` can be derived again with `keygen --ckd`).\n\
+                     Or pass --force and then run `near drive publish-key` to rotate to this key: data encrypted to the old key stays unreadable to this one."
+                );
+            }
+            eprintln!("warning: {text}\nSaving anyway (--force). Run `near drive publish-key` to rotate the published keys to this one.");
+        }
+        Ok(Some(r))
+    }
+
+    /// Before a command writes with the cached / env root key: a key that does
+    /// not match the published ones is an error (its records would be rejected
+    /// and nobody could share to it); unpublished keys are a warning. One
+    /// view-call pair per process; skipped in dev setups.
+    async fn check_before_write(&mut self, account: &str) -> Result<()> {
+        if self.key_checked {
+            return Ok(());
+        }
+        self.key_checked = true;
+        let Some(contract) = self.key_check_contract() else { return Ok(()) };
+        let Some((root, source)) = self.load_root_key(account)? else { return Ok(()) };
+        match near_drive_client::check_published_keys(&contract, account, &root).await {
+            Ok(PublishedKeys::Match | PublishedKeys::NoContract) => Ok(()),
+            Ok(PublishedKeys::Missing { enc, sign }) => {
+                let what = match (enc, sign) {
+                    (true, true) => "its keys",
+                    (false, true) => "its record-signing key",
+                    _ => "its encryption key",
+                };
+                eprintln!(
+                    "warning: {account} has not published {what} in {}; run `near drive publish-key`{}",
+                    contract.contract_id,
+                    if sign { " (until then others reject the records you write)" } else { " (until then nobody can share files with you)" }
+                );
+                Ok(())
+            }
+            Ok(m) => bail!(
+                "{}\nRefusing to write. Use the matching key (`near drive key import`, or NEAR_DRIVE_ROOT_KEY), \
+                 or run `near drive publish-key` to rotate the published keys to this one (data encrypted to the old key stays unreadable to this one).",
+                mismatch_text(account, &contract.contract_id, &source, &m)
+            ),
+            Err(e) => {
+                eprintln!("warning: could not check the keys published for {account} ({e:#})");
+                Ok(())
+            }
+        }
     }
 
     /// After prompting, show the command that does the same without prompts.
@@ -507,63 +689,69 @@ impl Ctx {
         Ok(NearUri::parse(&s)?)
     }
 
-    async fn keygen(&mut self, ckd: bool, ckd_contract: Option<String>, ckd_domain: Option<u64>) -> Result<()> {
+    async fn keygen(&mut self, o: KeygenOpts) -> Result<()> {
         let account = self.account()?;
         let path = self.root_key_path(&account)?;
         if path.exists() {
-            bail!("{} already exists; refusing to overwrite", path.display());
+            bail!("{} already exists; refusing to overwrite (`near drive key export` shows it; `key import --force` replaces it)", path.display());
         }
-        if !ckd {
-            write_private(&path, &hex::encode(RootKey::generate().as_bytes()))?;
-            eprintln!("root key written to {} — back it up; losing it loses your encrypted data", path.display());
-            return Ok(());
+        let root = if o.ckd { self.ckd_root(&account, &o).await? } else { RootKey::generate() };
+        let source = if o.ckd { "derived with CKD" } else { "just generated" };
+        let published = self.check_before_save(&account, &root, source, o.force).await?;
+        write_private(&path, &hex::encode(root.as_bytes()))?;
+        if o.ckd {
+            eprintln!("CKD root key cached at {}; `near drive keygen --ckd` recovers it on any device", path.display());
+        } else {
+            eprintln!("root key written to {}\n{BACKUP_BANNER}", path.display());
         }
+        match published {
+            Some(PublishedKeys::Match) => eprintln!("it matches the keys {account} published"),
+            Some(PublishedKeys::Missing { .. }) => eprintln!("next: `near drive publish-key` (others reject your records until your keys are published)"),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Requests the account's root key from the MPC network (CKD).
+    async fn ckd_root(&mut self, account: &str, o: &KeygenOpts) -> Result<RootKey> {
         use near_drive_ckd::{near as ckdnear, CkdRequestArgs, CkdResponse, EphemeralKey, DERIVATION_PATH};
         let conn = self.conn()?.clone();
         let rpc = self.rpc_url()?;
-        let contract = ckd_contract
-            .or(conn.mpc_contract_account_id.clone())
-            .with_context(|| format!("near-cli connection {:?} has no mpc_contract_account_id; pass --ckd-contract", self.network))?;
-        let domain = ckd_domain.unwrap_or(2);
+        let target = near_drive_ckd::resolve_target(&conn.network_name, conn.mpc_contract_account_id.as_deref(), o.ckd_contract.as_deref(), o.ckd_domain, o.ckd_unpinned)?;
+        let (contract, domain) = (target.contract.clone(), target.domain_id);
+        if !target.pinned && near_drive_ckd::pinned_contract(&conn.network_name).is_some() {
+            eprintln!("warning: CKD from {contract} domain {domain} is not NEAR Drive's pinned target; it derives a different root key than `keygen --ckd`");
+        }
         let mpc_pk = ckdnear::Rpc::new(&rpc).mpc_public_key(&contract, domain).await?;
         let eph = EphemeralKey::generate();
-        let root = if let Some(cred) = &self.cli.credentials {
+        if let Some(cred) = &self.cli.credentials {
             // Explicit key file: sign here, without near-cli.
-            let (cred_account, key) = keys::NearCredentials::load(cred)?;
-            if cred_account != account {
-                bail!("credentials are for {cred_account}, not {account}");
-            }
-            let net = near_drive_ckd::CkdNetwork { network: conn.network_name.clone(), rpc_url: rpc, contract: contract.clone(), domain_id: domain };
-            ckdnear::request_root_key(&net, &ckdnear::Signer { account_id: account.clone(), key }, DERIVATION_PATH).await?
-        } else {
-            let args: serde_json::Value = serde_json::from_slice(&CkdRequestArgs::new(&eph, DERIVATION_PATH, domain).to_call_args())?;
-            eprintln!("requesting your CKD root key from {contract} (domain {domain}); costs gas + 1 yoctoNEAR and needs a full-access key");
-            let out = self.near().call_capture(&FunctionCall {
-                signer: &account,
-                network: &self.network,
-                contract: &contract,
-                method: ckdnear::METHOD,
-                args: &args,
-                gas_tgas: ckdnear::DEFAULT_GAS / 1_000_000_000_000,
-                deposit_yocto: ckdnear::DEPOSIT_YOCTO,
-            })?;
-            let resp: CkdResponse = serde_json::from_slice(out.trim_ascii()).with_context(|| format!("parsing CKD response from near: {:?}", String::from_utf8_lossy(&out)))?;
-            near_drive_ckd::root_key_from_response(&resp, &eph, &account, DERIVATION_PATH, &mpc_pk)?
-        };
-        write_private(&path, &hex::encode(root.as_bytes()))?;
-        eprintln!("CKD root key cached at {}; `near drive keygen --ckd` recovers it on any device", path.display());
-        Ok(())
+            let (_, key) = keys::NearCredentials::load_for(cred, Some(account))?;
+            let net = near_drive_ckd::CkdNetwork { network: conn.network_name.clone(), rpc_url: rpc, contract, domain_id: domain };
+            return ckdnear::request_root_key(&net, &ckdnear::Signer { account_id: account.to_string(), key }, DERIVATION_PATH).await;
+        }
+        let args: serde_json::Value = serde_json::from_slice(&CkdRequestArgs::new(&eph, DERIVATION_PATH, domain).to_call_args())?;
+        eprintln!("requesting your CKD root key from {contract} (domain {domain}); costs ~0.002 NEAR of gas + 1 yoctoNEAR and needs a full-access key");
+        let out = self.near().call_capture(&FunctionCall {
+            signer: account,
+            network: &self.network,
+            contract: &contract,
+            method: ckdnear::METHOD,
+            args: &args,
+            gas_tgas: ckdnear::DEFAULT_GAS / 1_000_000_000_000,
+            deposit_yocto: ckdnear::DEPOSIT_YOCTO,
+        })?;
+        let resp: CkdResponse = serde_json::from_slice(nearcli::json_value(&out)).with_context(|| format!("parsing CKD response from near: {:?}", String::from_utf8_lossy(&out)))?;
+        near_drive_ckd::root_key_from_response(&resp, &eph, account, DERIVATION_PATH, &mpc_pk)
     }
 
     /// A contract call: near-cli signs, unless `--credentials` was given.
     async fn transact(&mut self, method: &str, args: serde_json::Value, deposit: u128) -> Result<()> {
         let account = self.account()?;
         if let Some(path) = &self.cli.credentials {
-            let signer = near_drive_chain::Signer::from_credentials_file(path)?;
-            if signer.account_id != account {
-                bail!("credentials are for {}, not {account}", signer.account_id);
-            }
-            self.contract()?.rpc.call(&signer, &self.cli.contract, method, &args, CALL_TGAS * near_drive_chain::TGAS, deposit).await?;
+            let signer = near_drive_chain::Signer::from_credentials_file_for(path, &account)?;
+            let out = self.contract()?.rpc.call(&signer, &self.cli.contract, method, &args, CALL_TGAS * near_drive_chain::TGAS, deposit).await?;
+            eprintln!("{method}: transaction {}", out.tx_hash);
             return Ok(());
         }
         self.near().call(&FunctionCall {
@@ -617,21 +805,37 @@ async fn main() -> Result<()> {
         }
         None => ("mainnet".to_string(), false),
     };
-    let mut ctx = Ctx { account: None, cli, cfg, network, network_prompted, p };
+    let mut ctx = Ctx { account: None, cli, cfg, network, network_prompted, p, key_checked: false };
     run(&mut ctx, cmd).await
 }
 
 async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
     match cmd {
-        Cmd::Ls { uri } => {
+        Cmd::Ls { uri, dir } => {
             let c = ctx.client().await?;
             let uri = match uri {
                 Some(u) => resolve_uri(&u, c.account())?,
                 None => resolve_uri("", c.account())?,
             };
-            ctx.echo(&["ls".into(), uri.to_string()]);
-            for e in c.list(&uri).await? {
-                println!("{:>12}  seq={:<4} {:<24} {}", e.size, e.seq, e.writer, e.path);
+            let mut echo = vec!["ls".to_string(), uri.to_string()];
+            if dir {
+                echo.push("--dir".into());
+            }
+            ctx.echo(&echo);
+            // Page by page, so huge listings start printing at once.
+            let mut cursor: Option<String> = None;
+            loop {
+                let page = c.list_page(&uri, dir.then_some("/"), cursor.as_deref(), None).await?;
+                let mut lines: Vec<(String, String)> = page.entries.iter().map(|e| (e.path.clone(), format!("{:>12}  seq={:<4} {:<24} {}", e.size, e.seq, e.writer, e.path))).collect();
+                lines.extend(page.common_prefixes.iter().map(|p| (p.clone(), format!("{:>12}  {:<33} {p}", "-", "(folder)"))));
+                lines.sort();
+                for (_, l) in lines {
+                    println!("{l}");
+                }
+                match page.next_cursor {
+                    Some(n) if Some(&n) != cursor.as_ref() => cursor = Some(n),
+                    _ => break,
+                }
             }
         }
         Cmd::Get { uri, dst, range } => {
@@ -670,7 +874,7 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             }
         }
         Cmd::Put { src, uri, public, content_type, share, class, no_resume } => {
-            let c = ctx.client().await?;
+            let c = ctx.write_client().await?;
             let src = ctx.p.text(src, "File to upload:", "SRC", None, Some("path, or - for stdin"))?;
             if src != "-" && !std::path::Path::new(&src).is_file() {
                 bail!("{src} is not a file");
@@ -705,7 +909,7 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             eprintln!("{uri} seq={} size={} stored={}", rec.seq, rec.size, rec.stored_size);
         }
         Cmd::Rm { uri } => {
-            let c = ctx.client().await?;
+            let c = ctx.write_client().await?;
             let asked = uri.is_none();
             let uri = ctx.object_uri(uri, "File to delete:", &c).await?;
             if asked && !ctx.p.confirm(&format!("Delete {uri}?"), false)? {
@@ -715,7 +919,7 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             c.delete(&uri).await?;
         }
         Cmd::Share { uri, recipient } => {
-            let c = ctx.client().await?;
+            let c = ctx.write_client().await?;
             let uri = ctx.object_uri(uri, "File to share:", &c).await?;
             let recipient = ctx.p.text(recipient, "Share with:", "RECIPIENT", None, Some("an account (bob.near) or an x25519:<base58> key"))?;
             ctx.echo(&["share".into(), uri.to_string(), recipient.clone()]);
@@ -800,15 +1004,45 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             ctx.near().delete_key(&account, &ctx.network, &found.public_key)?;
             eprintln!("deleted {} from {account} (the local copy in {} is now unused)", found.public_key, found.source);
         }
-        Cmd::Keygen { ckd, random, ckd_contract, ckd_domain } => {
+        Cmd::Keygen { ckd, random, ckd_contract, ckd_domain, ckd_unpinned, force } => {
+            if !(ckd || random || ctx.p.enabled) {
+                bail!(
+                    "keygen needs --ckd or --random when not run in a terminal.\n  \
+                     --ckd (recommended): derived from your NEAR account by NEAR's MPC network; the same key on every device, recoverable with one transaction.\n  \
+                     --random: a key that exists only on this machine; back it up with `near drive key export`."
+                );
+            }
             ctx.account()?; // ask for the account before the key type
-            let ckd = if ckd || random { ckd } else if ctx.p.enabled { choose_ckd(ctx)? } else { false };
+            let ckd = if ckd || random { ckd } else { choose_ckd(ctx)? };
             let mut words = vec!["keygen".to_string(), if ckd { "--ckd" } else { "--random" }.into()];
             if let Some(c) = &ckd_contract {
                 words.extend(["--ckd-contract".into(), c.clone()]);
             }
+            if let Some(d) = ckd_domain {
+                words.extend(["--ckd-domain".into(), d.to_string()]);
+            }
+            if ckd_unpinned {
+                words.push("--ckd-unpinned".into());
+            }
+            if force {
+                words.push("--force".into());
+            }
             ctx.echo(&words);
-            ctx.keygen(ckd, ckd_contract, ckd_domain).await?;
+            ctx.keygen(KeygenOpts { ckd, ckd_contract, ckd_domain, ckd_unpinned, force }).await?;
+        }
+        Cmd::Key { action } => {
+            let action = match action {
+                Some(a) => a,
+                None => ctx.p.select(
+                    "Key:",
+                    "SUBCOMMAND",
+                    vec![
+                        choice(KeyCmd::Export { out: None }, "export - Back up your encryption key"),
+                        choice(KeyCmd::Import { hex: None, file: None, force: false }, "import - Restore your encryption key from a backup"),
+                    ],
+                )?,
+            };
+            key_cmd(ctx, action).await?;
         }
         Cmd::PublishKey => {
             let account = ctx.account()?;
@@ -816,7 +1050,9 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             let root = load_root(&ctx.root_key_path(&account)?)?.context("no root key; run `near drive keygen` first")?;
             let key = root.x25519_public();
             ctx.transact("set_enc_key", serde_json::json!({ "key": key }), near_drive_chain::storage_deposit_for(key.len())).await?;
-            println!("{key}");
+            let sign = root.sign_public_key();
+            ctx.transact("set_sign_key", serde_json::json!({ "key": sign }), near_drive_chain::storage_deposit_for(sign.len() + 32)).await?;
+            println!("{key}\n{sign}");
         }
         Cmd::Whoami => {
             let (account, sk, found) = ctx.request_key().await?;
@@ -841,7 +1077,7 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
             }
             let root_path = ctx.root_key_path(&account)?;
             match load_root(&root_path)? {
-                Some(r) => println!("x25519:   {}\nroot key: {}", r.x25519_public(), root_path.display()),
+                Some(r) => println!("x25519:   {}\nrecords:  {} (record-signing key)\nroot key: {}", r.x25519_public(), r.sign_public_key(), root_path.display()),
                 None => println!("x25519:   (no root key; run `near drive keygen`)"),
             }
         }
@@ -869,7 +1105,7 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
         }
         Cmd::Daemon { proxy, no_s3, file_provider } => {
             syncs::init_tracing();
-            let c = std::sync::Arc::new(ctx.client().await?);
+            let c = std::sync::Arc::new(ctx.write_client().await?);
             let (home, account, network) = (ctx.drive_home()?, c.account().to_string(), ctx.network.clone());
             // Kept alive for the life of the service.
             let _provider = match file_provider {
@@ -948,7 +1184,7 @@ async fn run(ctx: &mut Ctx, cmd: Cmd) -> Result<()> {
                 bail!("{} is not empty", mp.display());
             }
             syncs::init_tracing();
-            let c = std::sync::Arc::new(ctx.client().await?);
+            let c = std::sync::Arc::new(if read_only { ctx.client().await? } else { ctx.write_client().await? });
             let mut opts = near_drive_mount::MountOptions::new(ctx.drive_home()?.join("cache").join(&account));
             opts.read_only = read_only;
             opts.cache_max_bytes = cache_mib << 20;
@@ -994,7 +1230,7 @@ async fn run_s3(ctx: &mut Ctx, proxy: ProxyArgs) -> Result<()> {
         let (name, target) = a.split_once('=').with_context(|| format!("--bucket-alias {a}: expected NAME=near://ACCOUNT/PREFIX/"))?;
         aliases.insert(name.to_string(), near_drive_s3::backend::Alias::parse(target).map_err(|e| anyhow::anyhow!("--bucket-alias {a}: {e}"))?);
     }
-    let c = ctx.client().await?;
+    let c = ctx.write_client().await?;
     let creds = s3_credentials(ctx, &proxy)?;
     if c.x25519_public().is_none() && public_prefixes.is_empty() {
         eprintln!("warning: no root key loaded (run `near drive keygen`); private writes will fail");
@@ -1052,6 +1288,79 @@ fn choose_ckd(ctx: &mut Ctx) -> Result<bool> {
     )
 }
 
+/// `key export` / `key import`.
+async fn key_cmd(ctx: &mut Ctx, action: KeyCmd) -> Result<()> {
+    let account = ctx.account()?;
+    match action {
+        KeyCmd::Export { out } => {
+            let mut words = vec!["key".to_string(), "export".into()];
+            words.extend(out.iter().flat_map(|o| ["--out".into(), o.display().to_string()]));
+            ctx.echo(&words);
+            let (root, source) = ctx
+                .load_root_key(&account)?
+                .with_context(|| format!("no root key for {account} (run `near drive keygen`, or `near drive key import`)"))?;
+            eprintln!(
+                "WARNING: this is the NEAR Drive root key of {account} ({source}). Anyone with it can read your private files \
+                 and sign records as you. Keep it offline (password manager, USB stick); never paste it into chats or tickets."
+            );
+            let hex_key = hex::encode(root.as_bytes());
+            match out {
+                Some(p) => {
+                    write_private(&p, &format!("{hex_key}\n"))?;
+                    eprintln!("written to {} (mode 0600). Restore with `near drive key import --file {}`", p.display(), p.display());
+                }
+                None => println!("{hex_key}"),
+            }
+        }
+        KeyCmd::Import { hex, file, force } => {
+            let text = match (hex, &file) {
+                (_, Some(f)) => std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?,
+                (Some(h), None) if h == "-" => std::io::read_to_string(std::io::stdin())?,
+                (Some(h), None) => h,
+                (None, None) => ctx.p.text(None, "Root key (64 hex characters):", "HEX or --file", None, Some("from `near drive key export`"))?,
+            };
+            let root = parse_root_hex(&text, "the key to import")?;
+            let mut words = vec!["key".to_string(), "import".into()];
+            words.extend(file.iter().flat_map(|f| ["--file".into(), f.display().to_string()]));
+            if force {
+                words.push("--force".into());
+            }
+            ctx.echo(&words);
+            let path = ctx.root_key_path(&account)?;
+            let existing = load_root(&path)?;
+            if let Some(e) = &existing {
+                if e.as_bytes() == root.as_bytes() {
+                    eprintln!("{} already holds this key", path.display());
+                    return Ok(());
+                }
+                if !force {
+                    bail!(
+                        "{} holds a different root key; refusing to overwrite it. Data made with it would become unreadable here: \
+                         `near drive key export` it first, then pass --force",
+                        path.display()
+                    );
+                }
+            }
+            let published = ctx.check_before_save(&account, &root, "being imported", force).await?;
+            if existing.is_some() {
+                replace_private(&path, &hex::encode(root.as_bytes()))?;
+            } else {
+                write_private(&path, &hex::encode(root.as_bytes()))?;
+            }
+            eprintln!("root key for {account} saved to {}", path.display());
+            match published {
+                Some(PublishedKeys::Match) => eprintln!("it matches the keys {account} published"),
+                Some(PublishedKeys::Missing { .. }) => eprintln!("next: `near drive publish-key` (others reject your records until your keys are published)"),
+                _ => {}
+            }
+            if std::env::var_os("NEAR_DRIVE_ROOT_KEY").is_some() {
+                eprintln!("note: NEAR_DRIVE_ROOT_KEY is set and takes precedence over this file");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// After login: offer to create the root key when there is none.
 async fn offer_keygen(ctx: &mut Ctx, account: &str) -> Result<()> {
     if ctx.root_key_path(account)?.exists() || !ctx.p.enabled {
@@ -1059,7 +1368,7 @@ async fn offer_keygen(ctx: &mut Ctx, account: &str) -> Result<()> {
     }
     if ctx.p.confirm("No encryption key on this machine yet. Create it now?", true)? {
         let ckd = choose_ckd(ctx)?;
-        ctx.keygen(ckd, None, None).await?;
+        ctx.keygen(KeygenOpts { ckd, ..Default::default() }).await?;
     }
     Ok(())
 }
@@ -1073,4 +1382,148 @@ fn parse_range(s: &str) -> Result<std::ops::Range<u64>> {
         bail!("empty range");
     }
     Ok(start..end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    /// Mock NEAR RPC: `get_enc_key` / `get_sign_keys` of `root` (or nothing published).
+    async fn mock_rpc(root: Option<RootKey>) -> String {
+        use axum::{routing::post, Json, Router};
+        let (enc, sign) = match &root {
+            Some(r) => (json!(r.x25519_public()), json!([{"key": r.sign_public_key(), "since_ms": "1"}])),
+            None => (Value::Null, json!([])),
+        };
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| {
+                let v = match req["params"]["method_name"].as_str() {
+                    Some("get_enc_key") => enc.clone(),
+                    Some("get_sign_keys") => sign.clone(),
+                    m => panic!("unexpected rpc {m:?}"),
+                };
+                async move { Json(json!({"jsonrpc": "2.0", "id": req["id"], "result": {"result": serde_json::to_vec(&v).unwrap(), "logs": []}})) }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        url
+    }
+
+    /// A non-interactive context (as without a terminal) for alice.near.
+    fn ctx(home: &std::path::Path, rpc: &str, args: &[&str]) -> (Ctx, Cmd) {
+        let mut argv = vec!["near-drive", "--no-interactive", "--account", "alice.near", "--contract", "drive.test", "--rpc-url", rpc];
+        let h = home.display().to_string();
+        argv.extend(["--home", &h]);
+        argv.extend(args);
+        let mut cli = Cli::try_parse_from(argv).unwrap();
+        let cmd = cli.cmd.take().unwrap();
+        let conn = nearcli::Connection { network_name: "mainnet".into(), rpc_url: rpc.into(), mpc_contract_account_id: Some("v1.signer".into()) };
+        let cfg = NearCliConfig { path: None, credentials_home: home.join("creds"), connections: [("mainnet".to_string(), conn)].into() };
+        (Ctx { cli, cfg, network: "mainnet".into(), network_prompted: false, account: None, p: Prompter::new(false), key_checked: false }, cmd)
+    }
+
+    async fn exec(home: &std::path::Path, rpc: &str, args: &[&str]) -> Result<()> {
+        let (mut c, cmd) = ctx(home, rpc, args);
+        run(&mut c, cmd).await
+    }
+
+    fn key_file(home: &std::path::Path) -> PathBuf {
+        home.join("keys").join("alice.near.root")
+    }
+
+    #[tokio::test]
+    async fn keygen_without_terminal_needs_ckd_or_random() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = exec(dir.path(), "http://127.0.0.1:1", &["keygen"]).await.unwrap_err().to_string();
+        assert!(e.contains("--ckd") && e.contains("--random") && e.contains("recommended"), "{e}");
+        assert!(!key_file(dir.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn keygen_random_refuses_when_other_keys_are_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = mock_rpc(Some(RootKey::generate())).await;
+        let e = exec(dir.path(), &rpc, &["keygen", "--random"]).await.unwrap_err().to_string();
+        assert!(e.contains("different root key") && e.contains("key import") && e.contains("--force"), "{e}");
+        assert!(!key_file(dir.path()).exists());
+        // Nothing published: saved; --force overrides a mismatch.
+        exec(dir.path(), &mock_rpc(None).await, &["keygen", "--random"]).await.unwrap();
+        assert!(key_file(dir.path()).exists());
+        let other = tempfile::tempdir().unwrap();
+        exec(other.path(), &rpc, &["keygen", "--random", "--force"]).await.unwrap();
+        assert!(key_file(other.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn export_import_roundtrip_and_refuse_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = mock_rpc(None).await;
+        let k1 = hex::encode([0x11u8; 32]);
+        let k2 = hex::encode([0x22u8; 32]);
+        exec(dir.path(), &rpc, &["key", "import", &k1]).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(key_file(dir.path())).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let out = dir.path().join("backup.hex");
+        exec(dir.path(), &rpc, &["key", "export", "--out", out.to_str().unwrap()]).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), k1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // Export never overwrites a file.
+        assert!(exec(dir.path(), &rpc, &["key", "export", "--out", out.to_str().unwrap()]).await.is_err());
+        // Import into a fresh home from the backup file.
+        let other = tempfile::tempdir().unwrap();
+        exec(other.path(), &rpc, &["key", "import", "--file", out.to_str().unwrap()]).await.unwrap();
+        assert_eq!(std::fs::read_to_string(key_file(other.path())).unwrap(), k1);
+        // Same key again: fine. A different key: refused without --force.
+        exec(dir.path(), &rpc, &["key", "import", &k1]).await.unwrap();
+        let e = exec(dir.path(), &rpc, &["key", "import", &k2]).await.unwrap_err().to_string();
+        assert!(e.contains("different root key") && e.contains("--force"), "{e}");
+        assert_eq!(std::fs::read_to_string(key_file(dir.path())).unwrap(), k1);
+        exec(dir.path(), &rpc, &["key", "import", &k2, "--force"]).await.unwrap();
+        assert_eq!(std::fs::read_to_string(key_file(dir.path())).unwrap(), k2);
+        // Garbage is rejected.
+        assert!(exec(other.path(), &rpc, &["key", "import", "abcd", "--force"]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn import_checks_published_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let published = RootKey::from_bytes([0x33; 32]);
+        let rpc = mock_rpc(Some(RootKey::from_bytes([0x33; 32]))).await;
+        let e = exec(dir.path(), &rpc, &["key", "import", &hex::encode([0x44u8; 32])]).await.unwrap_err().to_string();
+        assert!(e.contains(&published.sign_public_key()) && e.contains("Refusing to save"), "{e}");
+        assert!(!key_file(dir.path()).exists());
+        exec(dir.path(), &rpc, &["key", "import", &hex::encode(published.as_bytes())]).await.unwrap();
+        // Dev mode (--insecure-skip-writer-check): no check, no RPC needed.
+        let dev = tempfile::tempdir().unwrap();
+        exec(dev.path(), "http://127.0.0.1:1", &["--insecure-skip-writer-check", "key", "import", &hex::encode([0x44u8; 32])]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_commands_check_the_cached_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("keys")).unwrap();
+        std::fs::write(key_file(dir.path()), hex::encode([0x55u8; 32])).unwrap();
+        // Mismatch: error before writing.
+        let (mut c, _) = ctx(dir.path(), &mock_rpc(Some(RootKey::from_bytes([0x66; 32]))).await, &["whoami"]);
+        let e = c.check_before_write("alice.near").await.unwrap_err().to_string();
+        assert!(e.contains("Refusing to write") && e.contains("publish-key"), "{e}");
+        // Once per process.
+        c.check_before_write("alice.near").await.unwrap();
+        // Match, nothing published (warning only), unreachable RPC (warning only).
+        for rpc in [mock_rpc(Some(RootKey::from_bytes([0x55; 32]))).await, mock_rpc(None).await, "http://127.0.0.1:1".into()] {
+            let (mut c, _) = ctx(dir.path(), &rpc, &["whoami"]);
+            c.check_before_write("alice.near").await.unwrap();
+        }
+    }
 }

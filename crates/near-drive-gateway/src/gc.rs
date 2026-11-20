@@ -21,7 +21,7 @@
 //! skipped and reported.
 use crate::{
     placement::Placement,
-    store::{ChunkInfo, IndexEntry, IndexStore},
+    store::{ChunkInfo, IndexEntry, IndexStore, MAX_LIST_LIMIT},
     AppState, Config,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -139,33 +139,48 @@ pub async fn mark(blobs: &Placement, index: &dyn IndexStore, concurrency: usize)
     let namespaces = index.namespaces().await.context("listing index namespaces")?;
     let mut m = Marked { chunks: HashSet::new(), namespaces: 0, entries: 0 };
     for ns in &namespaces {
-        let entries = index.list(ns, "").await.with_context(|| format!("listing namespace {ns}"))?;
-        if entries.is_empty() {
-            continue;
-        }
-        m.namespaces += 1;
-        m.entries += entries.len() as u64;
-        // A manifest's content is fixed by its cid: read each one once.
-        let mut todo: Vec<IndexEntry> = vec![];
-        for e in entries {
-            if !m.chunks.contains(&e.manifest_cid) && !todo.iter().any(|t| t.manifest_cid == e.manifest_cid) {
-                todo.push(e);
+        let mut cursor: Option<String> = None;
+        let mut any = false;
+        loop {
+            let page = index.list_page(ns, "", None, cursor.as_deref(), MAX_LIST_LIMIT).await.with_context(|| format!("listing namespace {ns}"))?;
+            any |= !page.entries.is_empty();
+            m.entries += page.entries.len() as u64;
+            mark_entries(blobs, &mut m, page.entries, concurrency).await?;
+            match page.next_cursor {
+                Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
+                Some(_) => return Err(anyhow!("listing namespace {ns} did not advance")),
+                None => break,
             }
         }
-        let mut loads = futures_util::stream::iter(todo)
-            .map(|e| async move {
-                let what = || format!("manifest {} of {}/{}", e.manifest_cid, e.namespace, e.path);
-                let bytes = blobs.get(e.class.as_deref(), &e.manifest_cid).await.with_context(what)?.ok_or_else(|| anyhow!("{} is missing from every backend", what()))?;
-                let manifest = Manifest::from_bytes(&bytes).with_context(what)?;
-                Ok::<_, anyhow::Error>((e.record.manifest_cid, manifest))
-            })
-            .buffer_unordered(concurrency.max(1));
-        while let Some((mcid, manifest)) = loads.try_next().await.context("GC aborted: cannot read a live manifest")? {
-            m.chunks.insert(mcid);
-            m.chunks.extend(manifest.chunks.into_iter().map(|c| c.cid));
+        if any {
+            m.namespaces += 1;
         }
     }
     Ok(m)
+}
+
+/// Add the manifests and chunks of `entries` to the live set.
+async fn mark_entries(blobs: &Placement, m: &mut Marked, entries: Vec<IndexEntry>, concurrency: usize) -> Result<()> {
+    // A manifest's content is fixed by its cid: read each one once.
+    let mut todo: Vec<IndexEntry> = vec![];
+    for e in entries {
+        if !m.chunks.contains(&e.manifest_cid) && !todo.iter().any(|t| t.manifest_cid == e.manifest_cid) {
+            todo.push(e);
+        }
+    }
+    let mut loads = futures_util::stream::iter(todo)
+        .map(|e| async move {
+            let what = || format!("manifest {} of {}/{}", e.manifest_cid, e.namespace, e.path);
+            let bytes = blobs.get(e.class.as_deref(), &e.manifest_cid).await.with_context(what)?.ok_or_else(|| anyhow!("{} is missing from every backend", what()))?;
+            let manifest = Manifest::from_bytes(&bytes).with_context(what)?;
+            Ok::<_, anyhow::Error>((e.record.manifest_cid, manifest))
+        })
+        .buffer_unordered(concurrency.max(1));
+    while let Some((mcid, manifest)) = loads.try_next().await.context("GC aborted: cannot read a live manifest")? {
+        m.chunks.insert(mcid);
+        m.chunks.extend(manifest.chunks.into_iter().map(|c| c.cid));
+    }
+    Ok(())
 }
 
 /// One full mark-and-sweep run over `blobs`' backends.

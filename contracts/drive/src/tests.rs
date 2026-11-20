@@ -723,12 +723,12 @@ fn funded() -> Contract {
     c
 }
 
-fn entry(payer: &str, amount: u128, gw: &str, period: &str) -> SettleEntry {
+fn entry(payer: &str, amount: u128, gw: &str, period: u64) -> SettleEntry {
     SettleEntry {
         payer: acc(payer),
         amount: U128(amount),
         gateway: acc(gw),
-        period_id: period.into(),
+        period: U64(period),
     }
 }
 
@@ -753,13 +753,13 @@ fn settle_rules() {
         "billing.near",
         t,
         vec![
-            entry("alice.near", 400_000, "gw.near", "p1"),
-            entry("alice.near", 400_000, "gw.near", "p1"), // duplicate period
-            entry("alice.near", 300_000, "gw.near", "p2"), // 700k > 600k cap
-            entry("nocap.near", 1, "gw.near", "p1"),       // no cap set
-            entry("alice.near", 1, "nobody.near", "p3"),   // not a gateway
-            entry("alice.near", 0, "gw.near", "p4"),       // zero
-            entry("ghost.near", 1, "gw.near", "p5"),       // no balance
+            entry("alice.near", 400_000, "gw.near", 1),
+            entry("alice.near", 400_000, "gw.near", 1), // duplicate period
+            entry("alice.near", 300_000, "gw.near", 2), // 700k > 600k cap
+            entry("nocap.near", 1, "gw.near", 1),       // no cap set
+            entry("alice.near", 1, "nobody.near", 3),   // not a gateway
+            entry("alice.near", 0, "gw.near", 4),       // zero
+            entry("ghost.near", 1, "gw.near", 5),       // no balance
         ],
     );
     use SettleStatus::*;
@@ -775,8 +775,9 @@ fn settle_rules() {
             InsufficientBalance
         ]
     );
-    assert!(c.is_settled(acc("billing.near"), acc("alice.near"), "p1".into()));
-    assert!(!c.is_settled(acc("gw.near"), acc("alice.near"), "p1".into()));
+    assert!(c.is_settled(acc("alice.near"), acc("gw.near"), U64(1)));
+    assert!(!c.is_settled(acc("alice.near"), acc("gw2.near"), U64(1)));
+    assert!(!c.is_settled(acc("alice.near"), acc("gw.near"), U64(2)));
     assert_eq!(c.get_payer(acc("alice.near")).unwrap().available.0, 600_000);
     assert_eq!(
         c.get_payer(acc("alice.near")).unwrap().spent_today.0,
@@ -791,14 +792,14 @@ fn settle_rules() {
         &mut c,
         "billing.near",
         t + DAY,
-        vec![entry("alice.near", 600_001, "gw2.near", "p2")],
+        vec![entry("alice.near", 600_001, "gw2.near", 2)],
     );
     assert_eq!(s, vec![InsufficientBalance]);
     let s = settle_as(
         &mut c,
         "billing.near",
         t + DAY,
-        vec![entry("alice.near", 600_000, "gw2.near", "p2")],
+        vec![entry("alice.near", 600_000, "gw2.near", 2)],
     );
     assert_eq!(s, vec![Settled]);
     assert_eq!(c.get_payer(acc("alice.near")).unwrap().available.0, 0);
@@ -814,8 +815,8 @@ fn settle_self_only_settler() {
         "gw.near",
         1_000 * DAY,
         vec![
-            entry("alice.near", 1, "gw2.near", "a"),
-            entry("alice.near", 1, "gw.near", "a"),
+            entry("alice.near", 1, "gw2.near", 1),
+            entry("alice.near", 1, "gw.near", 1),
         ],
     );
     assert_eq!(
@@ -831,7 +832,7 @@ fn settle_self_only_requires_payer_authorization() {
         &mut c,
         "gw.near",
         1_000 * DAY,
-        vec![entry("alice.near", 1, "gw.near", "a")],
+        vec![entry("alice.near", 1, "gw.near", 1)],
     );
     assert_eq!(s, vec![SettleStatus::SettlerNotAuthorized]);
 
@@ -842,17 +843,25 @@ fn settle_self_only_requires_payer_authorization() {
         &mut c,
         "gw.near",
         1_000 * DAY,
-        vec![entry("alice.near", 1, "gw.near", "b")],
+        vec![entry("alice.near", 1, "gw.near", 2)],
     );
     assert_eq!(s, vec![SettleStatus::Settled]);
 
+    // Revoking (no deposit needed) only applies after the notice period.
     ctx("alice.near", 0);
     c.set_settler_authorization(acc("gw.near"), false);
     let s = settle_as(
         &mut c,
         "gw.near",
-        1_000 * DAY,
-        vec![entry("alice.near", 1, "gw.near", "c")],
+        1_000 * DAY + DAY,
+        vec![entry("alice.near", 1, "gw.near", 3)],
+    );
+    assert_eq!(s, vec![SettleStatus::Settled]);
+    let s = settle_as(
+        &mut c,
+        "gw.near",
+        1_000 * DAY + 3 * DAY,
+        vec![entry("alice.near", 1, "gw.near", 4)],
     );
     assert_eq!(s, vec![SettleStatus::SettlerNotAuthorized]);
 }
@@ -865,7 +874,7 @@ fn settle_unapproved() {
         &mut c,
         "eve.near",
         1_000 * DAY,
-        vec![entry("alice.near", 1, "gw.near", "a")],
+        vec![entry("alice.near", 1, "gw.near", 1)],
     );
 }
 
@@ -888,7 +897,7 @@ fn settle_draws_assets_in_order() {
         &mut c,
         "billing.near",
         1_000 * DAY,
-        vec![entry("alice.near", 2_000_000, "gw.near", "x")],
+        vec![entry("alice.near", 2_000_000, "gw.near", 1)],
     );
     assert_eq!(s, vec![SettleStatus::Settled]);
     let p = c.get_payer(acc("alice.near")).unwrap();
@@ -913,7 +922,7 @@ fn withdraw_balance_with_notice() {
         &mut c,
         "billing.near",
         1_000 * DAY + DAY,
-        vec![entry("alice.near", 300_000, "gw.near", "d1")],
+        vec![entry("alice.near", 300_000, "gw.near", 1)],
     );
     assert_eq!(s, vec![SettleStatus::Settled]);
     ctx_at("alice.near", 1, 1_000 * DAY + 3 * DAY);
@@ -954,7 +963,7 @@ fn settle_cap_max_does_not_overflow() {
         &mut c,
         "billing.near",
         1_000 * DAY,
-        vec![entry("alice.near", u128::MAX, "gw.near", "max1")],
+        vec![entry("alice.near", u128::MAX, "gw.near", 1)],
     );
     assert_eq!(s, vec![SettleStatus::Settled]);
 
@@ -963,7 +972,7 @@ fn settle_cap_max_does_not_overflow() {
         &mut c,
         "billing.near",
         1_000 * DAY,
-        vec![entry("alice.near", u128::MAX, "gw2.near", "max2")],
+        vec![entry("alice.near", u128::MAX, "gw2.near", 1)],
     );
     assert_eq!(s, vec![SettleStatus::Settled]);
     assert_eq!(
@@ -1069,7 +1078,7 @@ fn withdraw_earnings_pays_each_asset() {
         &mut c,
         "billing.near",
         1_000 * DAY,
-        vec![entry("alice.near", 1_200_000, "gw.near", "e")],
+        vec![entry("alice.near", 1_200_000, "gw.near", 1)],
     );
     ctx("gw.near", 1);
     c.withdraw_earnings();
@@ -1206,4 +1215,413 @@ fn default_assets_are_mainnet_usdc() {
             format!("nep245:intents.near:nep141:{MAINNET_USDC}")
         ]
     );
+}
+
+// ------------------------------------------------------------ sign keys
+
+fn ed(b: u8) -> String {
+    format!("ed25519:{}", bs58::encode([b; 32]).into_string())
+}
+
+#[test]
+fn sign_key_history() {
+    let mut c = setup();
+    assert!(c.get_sign_keys(acc("alice.near")).is_empty());
+    ctx_at("alice.near", NEAR, 5_000_000);
+    c.set_sign_key(ed(1));
+    // Same key again: no new entry.
+    ctx_at("alice.near", NEAR, 6_000_000);
+    c.set_sign_key(ed(1));
+    ctx_at("alice.near", NEAR, 7_000_000);
+    c.set_sign_key(ed(2));
+    let h = c.get_sign_keys(acc("alice.near"));
+    assert_eq!(
+        h,
+        vec![
+            SignKeyEntry {
+                key: ed(1),
+                since_ms: U64(5)
+            },
+            SignKeyEntry {
+                key: ed(2),
+                since_ms: U64(7)
+            }
+        ]
+    );
+    // Rotating back to an older key appends it again.
+    ctx_at("alice.near", NEAR, 8_000_000);
+    c.set_sign_key(ed(1));
+    assert_eq!(c.get_sign_keys(acc("alice.near")).len(), 3);
+    assert!(c.get_sign_keys(acc("bob.near")).is_empty());
+    let json = near_sdk::serde_json::to_string(&h[0]).unwrap();
+    assert_eq!(json, format!(r#"{{"key":"{}","since_ms":"5"}}"#, ed(1)));
+}
+
+#[test]
+fn sign_key_history_is_bounded() {
+    let mut c = setup();
+    // Bytes >= 16 keep every key at 44 base58 chars, so sizes compare exactly.
+    for i in 0..20u8 {
+        ctx_at("alice.near", NEAR, (u64::from(i) + 1) * 1_000_000);
+        c.set_sign_key(ed(i + 20));
+    }
+    let h = c.get_sign_keys(acc("alice.near"));
+    assert_eq!(h.len(), validate::MAX_SIGN_KEYS);
+    // Oldest dropped, newest last.
+    assert_eq!(h[0].key, ed(24));
+    assert_eq!(h[0].since_ms, U64(5));
+    assert_eq!(h.last().unwrap().key, ed(39));
+    // Storage is bounded too: each rotation frees the oldest entry.
+    ctx_at("alice.near", NEAR, 100_000_000);
+    let before = env::storage_usage();
+    for i in 40..60u8 {
+        c.set_sign_key(ed(i));
+    }
+    assert_eq!(env::storage_usage(), before);
+}
+
+#[test]
+fn sign_key_validated() {
+    let mut c = setup();
+    ctx("alice.near", NEAR);
+    for bad in [
+        format!("x25519:{}", bs58::encode([7u8; 32]).into_string()),
+        format!("ed25519:{}", bs58::encode([7u8; 31]).into_string()),
+        "ed25519:".to_string(),
+    ] {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.set_sign_key(bad)));
+        assert!(r.is_err());
+    }
+}
+
+#[test]
+#[should_panic(expected = "attach at least")]
+fn sign_key_needs_storage_deposit() {
+    let mut c = setup();
+    ctx("alice.near", 0);
+    c.set_sign_key(ed(1));
+}
+
+// ---------------------------------------------------------- sponsorship
+
+#[test]
+fn sponsorship_opt_in() {
+    let mut c = setup();
+    assert!(!c.is_sponsor(acc("bob.near"), acc("app.near")));
+    // A namespace always pays for itself.
+    assert!(c.is_sponsor(acc("app.near"), acc("app.near")));
+    ctx("bob.near", NEAR);
+    c.set_sponsorship(acc("app.near"), true);
+    assert!(c.is_sponsor(acc("bob.near"), acc("app.near")));
+    assert!(!c.is_sponsor(acc("bob.near"), acc("other.near")));
+    assert!(!c.is_sponsor(acc("app.near"), acc("bob.near")));
+    // Withdrawing consent refunds the storage.
+    ctx("bob.near", 0);
+    c.set_sponsorship(acc("app.near"), false);
+    assert!(!c.is_sponsor(acc("bob.near"), acc("app.near")));
+    assert!(transfers()
+        .iter()
+        .any(|(to, amount)| to == "bob.near" && *amount > 0));
+}
+
+#[test]
+#[should_panic(expected = "attach at least")]
+fn sponsorship_needs_storage_deposit() {
+    let mut c = setup();
+    ctx("bob.near", 0);
+    c.set_sponsorship(acc("app.near"), true);
+}
+
+// ------------------------------------------------- delayed cap decreases
+
+#[test]
+fn spend_cap_decrease_is_delayed() {
+    let mut c = funded(); // alice: $1, cap 600k/day
+    let t = 1_000 * DAY;
+    ctx_at("alice.near", NEAR, t);
+    c.set_spend_cap(None);
+    let p = c.get_payer(acc("alice.near")).unwrap();
+    assert_eq!(p.spend_cap_per_day, Some(U128(600_000)));
+    assert_eq!(
+        p.pending_spend_cap,
+        Some(escrow::PendingSpendCap {
+            per_day: None,
+            effective_at_ns: U64(t + 3 * DAY),
+        })
+    );
+    // Usage is still settled under the old cap during the notice period.
+    let s = settle_as(
+        &mut c,
+        "billing.near",
+        t + DAY,
+        vec![entry("alice.near", 500_000, "gw.near", 1)],
+    );
+    assert_eq!(s, vec![SettleStatus::Settled]);
+    // After it, the lower cap applies.
+    let s = settle_as(
+        &mut c,
+        "billing.near",
+        t + 3 * DAY,
+        vec![entry("alice.near", 1, "gw.near", 2)],
+    );
+    assert_eq!(s, vec![SettleStatus::NoSpendCap]);
+    let p = c.get_payer(acc("alice.near")).unwrap();
+    assert_eq!(p.spend_cap_per_day, None);
+    assert_eq!(p.pending_spend_cap, None);
+}
+
+#[test]
+fn spend_cap_lower_value_applies_after_delay() {
+    let mut c = funded();
+    let t = 1_000 * DAY;
+    ctx_at("alice.near", NEAR, t);
+    c.set_spend_cap(Some(U128(100)));
+    let s = settle_as(
+        &mut c,
+        "billing.near",
+        t + 3 * DAY - 1,
+        vec![entry("alice.near", 200, "gw.near", 1)],
+    );
+    assert_eq!(s, vec![SettleStatus::Settled]);
+    let s = settle_as(
+        &mut c,
+        "billing.near",
+        t + 3 * DAY,
+        vec![entry("alice.near", 200, "gw.near", 2)],
+    );
+    assert_eq!(s, vec![SettleStatus::CapExceeded]);
+    assert_eq!(
+        c.get_payer(acc("alice.near")).unwrap().spend_cap_per_day,
+        Some(U128(100))
+    );
+}
+
+#[test]
+fn spend_cap_increase_is_immediate_and_cancels_pending_decrease() {
+    let mut c = funded();
+    let t = 1_000 * DAY;
+    ctx_at("alice.near", NEAR, t);
+    c.set_spend_cap(Some(U128(1)));
+    assert!(c
+        .get_payer(acc("alice.near"))
+        .unwrap()
+        .pending_spend_cap
+        .is_some());
+    ctx_at("alice.near", NEAR, t + DAY);
+    c.set_spend_cap(Some(U128(900_000)));
+    let p = c.get_payer(acc("alice.near")).unwrap();
+    assert_eq!(p.spend_cap_per_day, Some(U128(900_000)));
+    assert_eq!(p.pending_spend_cap, None);
+    // Long after the cancelled decrease would have applied, the raise holds.
+    let s = settle_as(
+        &mut c,
+        "billing.near",
+        t + 10 * DAY,
+        vec![entry("alice.near", 800_000, "gw.near", 1)],
+    );
+    assert_eq!(s, vec![SettleStatus::Settled]);
+}
+
+#[test]
+fn deposit_msg_cap_decrease_is_delayed() {
+    let mut c = funded();
+    deposit_ft(
+        &mut c,
+        USDC,
+        "alice.near",
+        1_000_000,
+        r#"{"spend_cap_per_day":"10"}"#,
+    );
+    let p = c.get_payer(acc("alice.near")).unwrap();
+    assert_eq!(p.spend_cap_per_day, Some(U128(600_000)));
+    assert_eq!(p.pending_spend_cap.unwrap().per_day, Some(U128(10)));
+}
+
+#[test]
+fn spend_cap_decrease_immediate_without_notice_period() {
+    let mut c = funded();
+    ctx("owner.near", 0);
+    c.set_config(ConfigPatch {
+        withdraw_delay_sec: Some(0),
+        ..Default::default()
+    });
+    ctx("alice.near", NEAR);
+    c.set_spend_cap(None);
+    assert_eq!(c.get_payer(acc("alice.near")).unwrap().spend_cap_per_day, None);
+}
+
+#[test]
+fn settler_reauthorization_cancels_pending_revocation() {
+    let mut c = funded();
+    let t = 1_000 * DAY;
+    ctx_at("alice.near", NEAR, t);
+    c.set_settler_authorization(acc("gw.near"), true);
+    ctx_at("alice.near", 0, t);
+    c.set_settler_authorization(acc("gw.near"), false);
+    let v = c.get_settler_authorizations(acc("alice.near"));
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].expires_at_ns, Some(U64(t + 3 * DAY)));
+    // A second revoke does not extend the deadline.
+    ctx_at("alice.near", 0, t + DAY);
+    c.set_settler_authorization(acc("gw.near"), false);
+    assert_eq!(
+        c.get_settler_authorizations(acc("alice.near"))[0].expires_at_ns,
+        Some(U64(t + 3 * DAY))
+    );
+    ctx_at("alice.near", 0, t + 2 * DAY);
+    c.set_settler_authorization(acc("gw.near"), true);
+    assert_eq!(
+        c.get_settler_authorizations(acc("alice.near"))[0].expires_at_ns,
+        None
+    );
+    let s = settle_as(
+        &mut c,
+        "gw.near",
+        t + 5 * DAY,
+        vec![entry("alice.near", 1, "gw.near", 1)],
+    );
+    assert_eq!(s, vec![SettleStatus::Settled]);
+    // Revoked and expired: gone from the view, pruned on the next change.
+    ctx_at("alice.near", 0, t + 5 * DAY);
+    c.set_settler_authorization(acc("gw.near"), false);
+    ctx_at("alice.near", 0, t + 9 * DAY);
+    assert!(c.get_settler_authorizations(acc("alice.near")).is_empty());
+    assert!(!c.is_settler_authorized(acc("alice.near"), acc("gw.near")));
+    c.set_settler_authorization(acc("gw2.near"), false);
+    assert!(c.settler_auths.get(&acc("alice.near")).is_none());
+}
+
+// ------------------------------------------------------ settle idempotency
+
+#[test]
+fn settle_idempotency_window() {
+    let mut c = funded();
+    ctx("alice.near", NEAR);
+    c.set_spend_cap(Some(U128(u128::MAX)));
+    let t = 1_000 * DAY;
+    use SettleStatus::*;
+    // Out of order within the window is fine; replays are rejected.
+    let s = settle_as(
+        &mut c,
+        "billing.near",
+        t,
+        vec![
+            entry("alice.near", 1, "gw.near", 10),
+            entry("alice.near", 1, "gw.near", 8),
+            entry("alice.near", 1, "gw.near", 10),
+            entry("alice.near", 1, "gw.near", 8),
+            entry("alice.near", 1, "gw.near", 9),
+        ],
+    );
+    assert_eq!(s, vec![Settled, Settled, AlreadySettled, AlreadySettled, Settled]);
+    // The key is (payer, gateway), not the settler: another settler billing
+    // the same gateway (e.g. a rotated billing account, or the gateway's
+    // own self-settle lane) cannot charge the same period again.
+    ctx("owner.near", 0);
+    c.add_settler(acc("billing2.near"), true);
+    ctx("alice.near", NEAR);
+    c.set_settler_authorization(acc("gw.near"), true);
+    assert_eq!(
+        settle_as(&mut c, "billing2.near", t, vec![entry("alice.near", 1, "gw.near", 10)]),
+        vec![AlreadySettled]
+    );
+    assert_eq!(
+        settle_as(&mut c, "gw.near", t, vec![entry("alice.near", 1, "gw.near", 9)]),
+        vec![AlreadySettled]
+    );
+    // Another gateway has its own window.
+    assert_eq!(
+        settle_as(&mut c, "billing2.near", t, vec![entry("alice.near", 1, "gw2.near", 10)]),
+        vec![Settled]
+    );
+    // Jump ahead: periods more than SETTLE_WINDOW back are refused, the ones
+    // just inside the window are still accepted once.
+    let hi = 10 + escrow::SETTLE_WINDOW;
+    let s = settle_as(
+        &mut c,
+        "billing.near",
+        t,
+        vec![
+            entry("alice.near", 1, "gw.near", hi),
+            entry("alice.near", 1, "gw.near", 10), // hi - 128: too old
+            entry("alice.near", 1, "gw.near", 11), // hi - 127: new
+            entry("alice.near", 1, "gw.near", 11),
+            entry("alice.near", 1, "gw.near", hi),
+        ],
+    );
+    assert_eq!(s, vec![Settled, PeriodTooOld, Settled, AlreadySettled, AlreadySettled]);
+    assert!(c.is_settled(acc("alice.near"), acc("gw.near"), U64(11)));
+    assert!(!c.is_settled(acc("alice.near"), acc("gw.near"), U64(12)));
+    // A jump wider than the window resets the bitmap.
+    let far = hi + 1_000;
+    let s = settle_as(
+        &mut c,
+        "billing.near",
+        t,
+        vec![
+            entry("alice.near", 1, "gw.near", far),
+            entry("alice.near", 1, "gw.near", far - 1),
+            entry("alice.near", 1, "gw.near", hi),
+        ],
+    );
+    assert_eq!(s, vec![Settled, Settled, PeriodTooOld]);
+    let w = c.get_settle_window(acc("alice.near"), acc("gw.near")).unwrap();
+    assert_eq!(w.latest, U64(far));
+    assert_eq!(w.bits, U128(0b11));
+}
+
+#[test]
+fn settle_storage_does_not_grow_per_period() {
+    let mut c = funded();
+    ctx("alice.near", NEAR);
+    c.set_spend_cap(Some(U128(u128::MAX)));
+    let t = 1_000 * DAY;
+    // First settlement creates the (payer, gateway) window and the earnings row.
+    settle_as(&mut c, "billing.near", t, vec![entry("alice.near", 1, "gw.near", 0)]);
+    // (Each testing_env! resets the storage counter, so stay in one context.)
+    ctx_at("billing.near", NEAR, t);
+    // (Logs are capped per call, so 80 entries rather than the max of 100.)
+    let base = env::storage_usage();
+    let r = c.settle((1..=80u64).map(|p| entry("alice.near", 1, "gw.near", p * 3)).collect());
+    assert!(r.iter().all(|r| r.status == SettleStatus::Settled));
+    assert_eq!(env::storage_usage(), base);
+    // So the settler gets everything it attached back.
+    assert!(transfers()
+        .iter()
+        .all(|(to, amount)| to == "billing.near" && *amount == NEAR));
+}
+
+// ------------------------------------------------------------- migrate
+
+#[test]
+fn migrate_is_identity_for_current_version() {
+    let mut c = funded();
+    ctx("alice.near", NEAR);
+    c.set_sign_key(ed(3));
+    assert_eq!(c.get_state_version(), STATE_VERSION);
+    // The SDK flushes collections at the end of a call; do it by hand here.
+    c.payers.flush();
+    c.settlers.flush();
+    c.gateways.flush();
+    env::state_write(&c);
+    ctx("drive.near", 0);
+    let m = Contract::migrate();
+    assert_eq!(m.get_state_version(), STATE_VERSION);
+    assert_eq!(m.get_owner(), acc("owner.near"));
+    assert_eq!(m.get_sign_keys(acc("alice.near"))[0].key, ed(3));
+    assert_eq!(
+        m.get_payer(acc("alice.near")).unwrap().available,
+        U128(1_000_000)
+    );
+    assert_eq!(m.get_settlers().len(), 2);
+}
+
+#[test]
+#[should_panic(expected = "cannot migrate state version 7")]
+fn migrate_rejects_unknown_version() {
+    let mut c = setup();
+    c.version = 7;
+    env::state_write(&c);
+    ctx("drive.near", 0);
+    Contract::migrate();
 }

@@ -23,7 +23,7 @@ import blake3
 import nacl.bindings as nb
 import nacl.exceptions
 
-from .keys import _b58, b58encode, format_x25519, parse_x25519
+from .keys import _b58, b58encode, format_x25519, parse_x25519, public_key_of
 
 ALG = "xchacha20poly1305-chunked-v1"
 TAG_LEN = 16
@@ -89,6 +89,15 @@ class RootKey:
 
     def kek(self) -> bytes:
         return _derive(self._k, b"near-drive/v1/kek")
+
+    def sign_seed(self) -> bytes:
+        """Ed25519 seed that signs pointer records: HKDF-SHA256(salt="near-drive", ikm=root,
+        info="near-drive/v1/sign"), an RFC 8032 secret key (ed25519-dalek ``SigningKey::from_bytes``)."""
+        return _derive(self._k, b"near-drive/v1/sign")
+
+    def sign_public_key(self) -> str:
+        """``ed25519:<base58>`` record-signing key; publish it with ``set_sign_key`` (``near drive publish-key``)."""
+        return public_key_of(self.sign_seed())
 
     def kek_id(self) -> str:
         return blake3.blake3(_derive(self._k, b"near-drive/v1/kek-id")).digest()[:8].hex()

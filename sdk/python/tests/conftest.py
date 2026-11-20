@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, unquote
 import httpx
 import pytest
 
-from near_drive import Client, NetConfig, RootKey, canonical_request, cid, generate_secret_key, parse_secret_key, public_key_of, verify
+from near_drive import Client, NetConfig, RootKey, WriterCheck, canonical_request, cid, generate_secret_key, parse_secret_key, public_key_of, verify
 
 REPO = Path(__file__).resolve().parents[3]
 GATEWAY_BIN = REPO / "target" / "debug" / "near-drive-gateway"
@@ -64,9 +64,29 @@ class FakeGateway:
             return httpx.Response(201)
         if m := re.fullmatch(r"/v1/list/([^/]+)", path):
             prefix = q.get("prefix", [""])[0]
-            out = [{"path": p, "size": r["size"], "seq": r["seq"], "writer": r["writer"], "ts_ms": r["ts_ms"], "manifest_cid": r["manifest_cid"]}
-                   for (ns, p), (r, _) in sorted(self.index.items()) if ns == m.group(1) and p.startswith(prefix)]
-            return httpx.Response(200, json=out)
+            delim = q.get("delimiter", [""])[0] or None
+            cursor = q.get("cursor", [""])[0] or None
+            limit = min(max(int(q.get("limit", ["1000"])[0]), 1), 1000)
+            entries, prefixes, last, nxt = [], [], None, None
+            for (ns, p), (r, _) in sorted(self.index.items(), key=lambda kv: (kv[0][0], kv[0][1].encode())):
+                if ns != m.group(1) or not p.startswith(prefix):
+                    continue
+                if cursor is not None and (p.encode() <= cursor.encode() or (delim and cursor.endswith(delim) and p.startswith(cursor))):
+                    continue
+                i = p.find(delim, len(prefix)) if delim else -1
+                cp = p[: i + len(delim)] if i >= 0 else None
+                if cp is not None and cp == last:
+                    continue
+                if len(entries) + len(prefixes) == limit:
+                    nxt = last
+                    break
+                if cp is not None:
+                    prefixes.append(cp)
+                    last = cp
+                else:
+                    entries.append({"path": p, "size": r["size"], "seq": r["seq"], "writer": r["writer"], "ts_ms": r["ts_ms"], "manifest_cid": r["manifest_cid"]})
+                    last = p
+            return httpx.Response(200, json={"entries": entries, "common_prefixes": prefixes, "next_cursor": nxt})
         m = re.fullmatch(r"/v1/o/([^/]+)/(.+)", path)
         if not m:
             return self._err(404, "no route")
@@ -191,12 +211,14 @@ class Env:
         self.url, self.sk, self.tmp, self.fake = url, sk, tmp, fake
         self.proxy = FaultTransport(inner)
         self.root = RootKey.generate()
+        # Every client of this env writes as alice.near with this root's derived signing key.
+        self.writer_check = WriterCheck.trusted({"alice.near": [self.root.sign_public_key()]})
         self._clients: list[Client] = []
 
     def client(self, attempts: int = 8, parallelism: int = 4, root: bool = True) -> Client:
         net = NetConfig(attempts=attempts, base_delay=0.001, max_delay=0.005)
         c = Client(self.url, "alice.near", self.sk, self.root if root else None, chunk_size=64 * 1024,
-                   http=httpx.Client(transport=self.proxy), net=net, parallelism=parallelism)
+                   http=httpx.Client(transport=self.proxy), net=net, parallelism=parallelism, writer_check=self.writer_check)
         self._clients.append(c)
         return c
 

@@ -144,10 +144,36 @@ export function fakeGateway(): FakeGateway {
     if ((m = /^\/v1\/list\/([^/]+)$/.exec(u.pathname)) && method === "GET") {
       const ns = m[1]!;
       const prefix = q.get("prefix") ?? "";
-      const out = [...g.index.entries()]
-        .filter(([k]) => k.startsWith(`${ns}/${prefix}`))
-        .map(([k, e]) => ({ path: k.slice(ns.length + 1), size: e.record.size, seq: e.record.seq, writer: e.record.writer, ts_ms: e.record.ts_ms, manifest_cid: e.record.manifest_cid }));
-      return json(out);
+      const delim = q.get("delimiter") || null;
+      const cursor = q.get("cursor") || null;
+      const limit = Math.min(Math.max(Number(q.get("limit") ?? 1000) || 1000, 1), 1000);
+      const paths = [...g.index.keys()]
+        .filter((k) => k.startsWith(`${ns}/${prefix}`))
+        .map((k) => k.slice(ns.length + 1))
+        .sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+      const entries: unknown[] = [];
+      const common_prefixes: string[] = [];
+      let last: string | null = null;
+      let next: string | null = null;
+      for (const p of paths) {
+        if (cursor !== null && (p <= cursor || (delim !== null && cursor.endsWith(delim) && p.startsWith(cursor)))) continue;
+        const i = delim === null ? -1 : p.indexOf(delim, prefix.length);
+        const cp = i < 0 ? null : p.slice(0, i + delim!.length);
+        if (cp !== null && cp === last) continue;
+        if (entries.length + common_prefixes.length === limit) {
+          next = last;
+          break;
+        }
+        if (cp !== null) {
+          common_prefixes.push(cp);
+          last = cp;
+        } else {
+          const e = g.index.get(`${ns}/${p}`)!;
+          entries.push({ path: p, size: e.record.size, seq: e.record.seq, writer: e.record.writer, ts_ms: e.record.ts_ms, manifest_cid: e.record.manifest_cid });
+          last = p;
+        }
+      }
+      return json({ entries, common_prefixes, next_cursor: next });
     }
     if (!(m = /^\/v1\/o\/([^/]+)\/(.+)$/.exec(u.pathname))) return text("no route", 404);
     const key = `${m[1]}/${decodeURIComponent(m[2]!)}`;

@@ -8,6 +8,9 @@ from near_drive import (
     NearUri,
     PointerRecord,
     RootKey,
+    Rule,
+    SignKeyEntry,
+    WriterCheck,
     canonical_request,
     cid,
     decrypt_object,
@@ -15,13 +18,18 @@ from near_drive import (
     format_secret_key,
     parse_secret_key,
     public_key_of,
+    resolve_policy,
     sign,
+    sign_key_in_force,
     verify,
 )
 
 V = json.loads((Path(__file__).resolve().parents[3] / "testvectors" / "vectors.json").read_text())
 ROOTS = {k: RootKey.from_hex(r["root_key"]) for k, r in V["roots"].items()}
 SEED = bytes.fromhex(V["ed25519"]["seed_hex"])
+#: Record-signing-key vectors. Interim file generated independently of the SDKs by
+#: testvectors/gen_sdk_sign_vectors.py; switch to the Rust-generated vectors here once they exist.
+SIGN_VECTORS = json.loads((Path(__file__).resolve().parents[3] / "testvectors" / "sdk_sign_vectors.json").read_text())
 
 
 def test_cid():
@@ -116,3 +124,52 @@ def test_objects(o):
     for who in o["not_readable_by"]:
         with pytest.raises(ValueError):
             decrypt_object(ROOTS[who], m.enc, chunks)
+
+
+def test_sign_key_derivation():
+    for r in SIGN_VECTORS["roots"].values():
+        k = RootKey.from_hex(r["root_key"])
+        assert k.sign_seed().hex() == r["sign_seed"]
+        assert k.sign_public_key() == r["sign_public_key"]
+
+
+def test_records_signed_with_derived_key():
+    for v in SIGN_VECTORS["records"]:
+        rec = PointerRecord.from_dict(v["record"])
+        k = RootKey.from_hex(SIGN_VECTORS["roots"][v["signed_by"]]["root_key"])
+        assert rec.signing_bytes().decode() == v["signing_string"]
+        assert sign(k.sign_seed(), rec.signing_bytes()) == rec.sig
+        assert rec.writer_pk == k.sign_public_key()
+        rec.verify_signature()
+        WriterCheck.trusted({rec.writer: [k.sign_public_key()]}, {"app.near": [{"prefix": "users/", "write": ["alice.near"]}]}).verify(rec)
+
+
+def test_sign_key_in_force():
+    for c in SIGN_VECTORS["sign_key_in_force"]:
+        entries = [SignKeyEntry.from_dict(e) for e in c["entries"]]
+        assert sign_key_in_force(entries, c["key"], c["ts_ms"]) == c["ok"], c
+
+
+def test_policy():
+    for c in SIGN_VECTORS["policy"]:
+        a = resolve_policy(c["namespace"], [Rule.from_dict(r) for r in c["rules"]], c["path"], c["signer"])
+        assert (a.read, a.write, a.payer) == (c["read"], c["write"], c["payer"]), c
+
+
+def test_rust_sign_vectors():
+    """Rust-generated (gen_vectors.rs) signing keys, signed records and writer checks."""
+    for r in V["roots"].values():
+        k = RootKey.from_hex(r["root_key"])
+        assert k.sign_seed().hex() == r["sign_seed"]
+        assert k.sign_public_key() == r["sign_public_key"]
+    for v in V["signed_records"]:
+        rec = PointerRecord.from_dict(v["record"])
+        rec.verify_signature()
+        assert sign(ROOTS[v["root"]].sign_seed(), rec.signing_bytes()) == rec.sig
+    for c in V["writer_checks"]:
+        entries = [SignKeyEntry.from_dict(e) for e in c["sign_keys"]]
+        rules = [Rule.from_dict(r) for r in c["rules"]]
+        ok = sign_key_in_force(entries, c["writer_pk"], c["ts_ms"]) and (
+            c["writer"] == c["namespace"] or resolve_policy(c["namespace"], rules, c["path"], c["writer"]).write
+        )
+        assert ok == c["accept"], c["name"]

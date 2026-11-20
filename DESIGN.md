@@ -58,15 +58,22 @@ Dedup comes for free: two checkpoints that share a base layer share chunks. This
 key:   (namespace, path)
 value: {manifest_cid, size, seq, writer, writer_pk, ts, sig}
 ```
-`sig` is the writer's ed25519 signature over
+`writer_pk` is the writer's **record-signing key**, an ed25519 key derived from its root key (§5.1) and published in `drive.near` with `set_sign_key`. It is not the NEAR access key that signs requests (§4.1). `sig` is the signature with that key over
 `"near-drive-record-v1\n{namespace}\n{path}\n{manifest_cid}\n{size}\n{stored_size}\n{seq}\n{writer}\n{writer_pk}\n{ts_ms}"`.
-Gateways return the manifest's exact stored bytes as `manifest_raw` (base64), and clients hash those bytes rather than a re-serialization, so adding manifest fields later does not break older clients. Readers check it and reject a record whose writer was not authorized for that path (§4). A malicious gateway or index store can therefore *withhold* data or serve *stale* data, but it cannot forge it. Rollback protection comes from periodic onchain anchoring (phase 3).
+Gateways return the manifest's exact stored bytes as `manifest_raw` (base64), and clients hash those bytes rather than a re-serialization, so adding manifest fields later does not break older clients.
+
+Readers accept a record only if (§4.3):
+1. the signature verifies with `writer_pk`, and the manifest matches `manifest_cid`;
+2. `writer_pk` is in `get_sign_keys(writer)` and was the key in force at `ts_ms`;
+3. the namespace policy lets `writer` write `path`.
+
+A gateway can sign records with a key of its own, but it cannot publish keys for other accounts, so it cannot pass check 2. A malicious gateway or index store can therefore *withhold* data or serve *stale* data, but it cannot forge it. Rollback protection comes from periodic onchain anchoring (phase 3).
 
 Why per-path records and not a Merkle tree per account: S3 semantics are per-object last-writer-wins. Per-path records map 1:1 onto that, avoid a write hot-spot on a single root (bad for chat and memory workloads), and keep LIST a plain prefix scan.
 
 ### 3.2 Index store
 
-A strongly consistent KV with compare-and-swap and prefix listing. v0 runs it on S3/R2 with conditional writes (`If-Match`/`If-None-Match`), or on the local filesystem in dev. It is replicated across ≥2 providers once there is more than one operator. It is the one piece that is not yet decentralized. The interface stays narrow (`get`, `cas_put`, `list(prefix)`) so it can later move to a gateway-operator quorum or a DA layer without touching clients.
+A strongly consistent KV with compare-and-swap and prefix listing. v0 runs it on S3/R2 with conditional writes (`If-Match`/`If-None-Match`), or on the local filesystem in dev. It is replicated across ≥2 providers once there is more than one operator. It is the one piece that is not yet decentralized. The interface stays narrow (`get`, `cas_put`, `delete`, and a paginated `list_page(prefix, delimiter, start_after, limit)` with S3 ListObjects semantics; on S3 one page is one native LIST request plus GETs of the page's uncached records) so it can later move to a gateway-operator quorum or a DA layer without touching clients.
 
 ### 3.3 Gateway
 
@@ -138,7 +145,22 @@ Each namespace (account) has an ordered rule list:
 - `payer` decides who is billed for bytes stored under the prefix and for egress.
 - Gateways cache policy per namespace for 30 s. Changes are ordinary transactions.
 
-Gateway-side read ACLs only stop ciphertext from being *served*. Confidentiality comes from encryption (§5). Integrity comes from the pointer signatures (§3.1).
+Gateway-side read ACLs only stop ciphertext from being *served*. Confidentiality comes from encryption (§5). Integrity comes from the pointer signatures (§3.1), checked against the writer's published signing key (§4.3).
+
+### 4.3 Record writers (reader-side checks)
+
+Gateways are not trusted to say who wrote a record, so every client checks it on each read that serves content (head, get, ranged and `?mode=locate` reads, streamed downloads):
+- `writer_pk` must be in the writer's signing-key history from `get_sign_keys(writer)` (`[{key, since_ms}]`, oldest first, at most 16 entries). Entry *i* is in force for `ts_ms` in `[since_i − 5 min, since_{i+1} + 5 min)`; the latest entry has no end. Records written before a key rotation therefore stay readable, and a key that was replaced cannot sign new records.
+- `policy::resolve(namespace, get_rules(namespace), path, writer).write` must hold. The namespace owner always may write. Rules are read at read time, so revoking someone's write access also hides what they wrote earlier.
+- Sign keys and rules are cached per account / namespace for 60 s (bounded size). A rejection based on a cache entry older than a couple of seconds re-reads the chain once, so a just-published key works.
+
+The SDK takes the check as an explicit setting (`WriterCheck` in Rust): `Chain` (the default once an RPC is configured), `Trusted` (fixed keys and rules, for tests and dev setups without a chain), or an explicitly named insecure skip for tests (`--insecure-skip-writer-check` in the CLI). A client with none fails reads instead of silently trusting the gateway.
+
+Gateways check writes the same way: the record's `writer` must be the request signer, and `writer_pk` must be the writer's latest published signing key (or a `dev_sign_keys` entry in dev). This only keeps bad records out of the index; readers do not rely on it.
+
+Writing therefore needs the root key (also for public objects), and an account must run `near drive publish-key` (which publishes both the X25519 and the signing key) before others accept what it writes. An app writing data only a user can read uses its own root key to sign and leaves itself out of the recipients (`skip_owner_key`).
+
+Listings (`/v1/list`) are not signed as a whole, so a gateway can hide entries or report stale ones there. Mount and sync use listings only to decide what to fetch; content is always served from a verified head (the mount reuses its local cache only for a version it verified for that path).
 
 ## 5. Encryption
 
@@ -149,11 +171,14 @@ Gateway-side read ACLs only stop ciphertext from being *served*. Confidentiality
 - it survives access-key rotation (unlike "derive from the signature of a fixed message", which breaks when keys change and does not work for multisig or MPC-controlled accounts);
 - it is never seen by gateways.
 
-The SDK caches the root key locally, encrypted with an OS keychain or a passphrase. **v0 fallback:** a locally generated root key file (`~/.near-drive/<account>.key`) with export/import. CKD replaces only the key-acquisition step; nothing downstream changes.
+The CLI caches the root key in `~/.near-drive/keys/<account>.root` (hex, mode 0600; services pass `NEAR_DRIVE_ROOT_KEY`). Wrapping the cache with an OS keychain or a passphrase is not built yet. **Fallback:** a random root key (`keygen --random`), moved between devices with `near drive key export` / `key import`. CKD replaces only the key-acquisition step; nothing downstream changes. The CKD target is pinned (`v1.signer` / `v1.signer-prod.testnet`, domain 2), since another contract or domain derives a different key.
+
+Because the record-signing key is derived from the root key, a lost or mismatched root key means both unreadable data and records readers reject. So the CLI compares a root key with the published keys (`get_enc_key` and the latest `get_sign_keys` entry): `keygen` and `key import` refuse a key from a different root key unless forced (then `publish-key` rotates), and writing commands stop on a mismatch and warn when nothing is published yet.
 
 Derived keys:
 - `kek = HKDF(root, "kek")` wraps per-object DEKs.
 - `enc_sk = X25519(HKDF(root, "x25519"))`. Its public key is published in `drive.near` so others can share to the account.
+- `sign_sk = Ed25519(HKDF(root, "near-drive/v1/sign"))` signs pointer records. Its public key (`ed25519:<base58>`) is published in `drive.near` (`set_sign_key`) so readers can check who wrote a record (§4.3). All derivations use HKDF-SHA256 with salt `"near-drive"` and info `"near-drive/v1/<name>"`.
 - `path_key = HKDF(root, "paths")` is for optional hidden-path mode.
 
 ### 5.2 Objects
@@ -203,9 +228,12 @@ Implemented in `contracts/drive` (method list in docs/contract.md; payments in d
 - `register_gateway(info)` / `update_gateway` / `deregister_gateway` / `force_deregister_gateway` / `withdraw_gateway_stake` (NEAR stake, snapshotted unstake delay), `list_gateways`
 - `set_rules(rules)`, `get_rules(namespace)`
 - `set_enc_key(x25519_pk)`, `get_enc_key(account)`
+- `set_sign_key(ed25519_pk)`, `get_sign_keys(account)`: record-signing key history, `[{key, since_ms}]` oldest first, at most 16 (§4.3)
 - `bump_cred_epoch()`, `get_cred_epoch(account)`
 - `anchor(namespace, root, seq)` / `clear_anchor` / `set_anchor_authority`: periodic Merkle root of pointer records for rollback detection (phase 3); the owner or an owner-authorized active gateway may anchor
-- escrow: deposits via `ft_on_transfer` / `mt_on_transfer` (after `register_payer`), `set_spend_cap`, `settle`, notice-period `withdraw_balance`, `withdraw_earnings`, `close_payer`. Prepaid reservations (`reserve`) are not implemented yet.
+- escrow: deposits via `ft_on_transfer` / `mt_on_transfer` (after `register_payer`), `set_spend_cap`, `settle`, notice-period `withdraw_balance`, `withdraw_earnings`, `close_payer`. Lowering a spend cap and revoking a self-settler wait out the same notice period as withdrawals. Settlement idempotency is a bounded sliding window per (payer, gateway) over numeric periods. Prepaid reservations (`reserve`) are not implemented yet.
+- payer opt-in: `set_sponsorship(namespace, allowed)` / `is_sponsor(payer, namespace)`; a rule's payer other than the namespace owner only counts if it sponsors that namespace (enforced where gateways resolve the payer; `settle` cannot see namespaces)
+- versioned state (`STATE_VERSION`) and a private `migrate()` run in the same transaction as each code upgrade (docs/contract.md)
 
 ## 8. APIs
 
@@ -217,13 +245,13 @@ Implemented in `contracts/drive` (method list in docs/contract.md; payments in d
 | `GET /v1/o/{namespace}/{path}` | ciphertext stream; supports `Range` |
 | `GET /v1/o/{namespace}/{path}?mode=locate` | manifest plus chunk URLs |
 | `HEAD`, `DELETE` | as usual |
-| `GET /v1/list/{namespace}?prefix=&delimiter=&cursor=` | prefix listing |
+| `GET /v1/list/{namespace}?prefix=&delimiter=&cursor=&limit=` | one page of a prefix listing: `{"entries", "common_prefixes", "next_cursor"}`; raw string prefix, ≤ 1000 per page, repeat with `cursor` until `next_cursor` is null (docs/gateway.md) |
 
 **SDK surface** (same shape in Rust, TS and Python):
 ```
 client = Storage(account="alice.near", signer=..., gateway=auto)
 client.put("near://alice.near/memory/2026-11-18.json", bytes, share_with=[...], cls="hot")
-client.get(uri) -> bytes / stream ; client.list(prefix) ; client.delete(uri)
+client.get(uri) -> bytes / stream ; client.list(prefix) ; client.list_page(prefix, delimiter, cursor, limit) ; client.delete(uri)
 client.share(uri, account) ; client.grant(prefix, rule)   # onchain policy tx
 ```
 
@@ -235,9 +263,9 @@ client.share(uri, account) ; client.grant(prefix, rule)   # onchain policy tx
 |---|---|---|
 | **0** | Core (paths, chunking, encryption, manifests, signed records, policy), gateway native API, NEAR-key auth, fs stores, usage log, `near-drive` CLI | Done |
 | **1** | S3/R2 stores with conditional writes; storage classes and replication; blob-bridge protocol (`docs/blob-bridge.md`); streaming large objects + `?mode=locate` + chunk cache; `near drive s3-proxy`; cloud-credits billing (metering, reporting, 402 gate) + cloud-api endpoints; TS and Python SDKs; sharing (X25519 recipients); CORS | Done. Verified against MinIO, boto3 1.34 and 1.44, aws-cli, and a local cloud-api build. Not verified against real AWS S3/R2 or a deployed cloud-api. The cloud-api change needs a schema change in `nearai/cloud-platform` first (see its `docs/storage-billing.md`) |
-| **2** | `drive.near` contract (rules, enc keys, gateway registry, cred epochs, anchors); gateway reads rules from chain; `near drive grant/rules/publish-key/gateways`, gateway discovery; CKD root keys (`near drive keygen --ckd`); FOC bridge (Synapse) | Done in code. Contract verified in a local sandbox only. CKD verified against the official vectors and live read-only queries, not a real request. FOC bridge type-checked and mock-tested; no funded upload completed |
+| **2** | `drive.near` contract (rules, enc keys, gateway registry, cred epochs, anchors); gateway reads rules from chain; `near drive grant/rules/publish-key/gateways`, gateway discovery; CKD root keys (`near drive keygen --ckd`); FOC bridge (Synapse) | Done in code. Contract verified in a local sandbox only. CKD verified against the official vectors and with real testnet requests (deterministic per account, different per account; docs/ckd.md). FOC bridge type-checked and mock-tested; no funded upload completed |
 | **3** | NEAR Intents / stablecoin escrow (`ft_on_transfer`, `mt_on_transfer`, capped `settle`, delayed withdrawals; `docs/payments.md`); Shelby bridge (S3 mode + experimental SDK mode) | Done in code; sandbox and mock tests only |
-| **CLI** | One `near-drive` binary, also `near drive` as a near-cli-rs extension; NEAR keys and transactions delegated to near-cli (`login` adds a function-call session key via `near account add-key`; `grant`/`publish-key`/`keygen --ckd`/`logout` are near-cli transactions); interactive prompts in a terminal | Done. Verified on a local sandbox with near-cli-rs 0.29 (`tests/near_cli_e2e.sh`, including near-cli's interactive signer menu) and in a pty (`tests/interactive_smoke.py`). OS-keychain lookup is the same entry format near-cli writes but was only exercised through the legacy-file fallback (headless Linux) |
+| **CLI** | One `near-drive` binary, also `near drive` as a near-cli-rs extension; NEAR keys and transactions delegated to near-cli (`login` adds a function-call session key via `near account add-key`; `grant`/`publish-key`/`keygen --ckd`/`logout` are near-cli transactions); interactive prompts in a terminal; root-key backup (`key export` / `key import`) and a check of the root key against the published keys before saving or writing | Done. Verified on a local sandbox with near-cli-rs 0.29 (`tests/near_cli_e2e.sh`, including near-cli's interactive signer menu) and in a pty (`tests/interactive_smoke.py`). OS-keychain lookup is the same entry format near-cli writes but was only exercised through the legacy-file fallback (headless Linux) |
 | **Sync** | `near-drive-sync`: Dropbox-style two-way folder sync (three-way reconcile, conditional writes, conflicted copies, local trash, NFC / Windows-name handling, FS events + polling); `near drive sync add/remove/status/run`, run by `near drive up`; resumable transfers and retries in the client; small-object cache + one-request small reads in the gateway | Done. Tested on Linux (two devices through a real gateway, CLI background service); builds for Windows (cross-checked); CI matrix covers Linux, macOS and Windows |
 | **On demand** | `near drive mount`: FUSE (Linux; macOS via macFUSE / FUSE-T) and Windows Cloud Files placeholders; gateway change push (`/v1/watch` long-poll, in-memory per process); selective sync; `near-drive-tray`; TS / Python SDK retries and resumable transfers | Linux mount tested end to end; Windows provider tested in CI only; macOS: File Provider extension (`macos/`, over the tested provider API) builds in CI, not run (needs signing), FUSE path needs macFUSE and is untested; tray logic unit-tested, not run on a desktop |
 | **Release** | Prebuilt binaries for Linux / macOS / Windows with installers, Homebrew formula, winget manifests; reproducible `drive.near` wasm (pinned cargo-near image, NEP-330 build info) attached to releases, `contracts/verify.sh` to check a deployment | v0.1.0 released; reproducible contract build verified locally (identical hashes across builds, verify.sh on a sandbox chain) |
@@ -247,7 +275,7 @@ client.share(uri, account) ; client.grant(prefix, rule)   # onchain policy tx
 ## 10. Open questions
 
 1. **Index store decentralization.** Is an operator quorum enough, or do we want the pointer records on a DA layer? This determines how "trustless" the claim can be.
-2. **CKD.** Resolved from the near/mpc source (docs/ckd.md): `v1.signer` / `v1.signer-prod.testnet`, 1 yoctoNEAR deposit and ≥15 TGas, about 0.0015 NEAR per call. Plain accounts can call it; function-call (session) keys cannot, because they can't attach the deposit. Still unverified with a real transaction.
+2. **CKD.** Resolved (docs/ckd.md): `v1.signer` / `v1.signer-prod.testnet`, domain 2, 1 yoctoNEAR deposit and ≥15 TGas attached; a request burns ~16.6 TGas (≈0.0017 NEAR) and answers ~6 blocks (~3 s) after inclusion, 5–8 s end to end. Plain accounts can call it; function-call (session) keys cannot, because they can't attach the deposit. Verified with real testnet transactions (signer contract 3.19.0).
 3. **Retention for unpaid data.** Grace period, then delete? Applies when credits run out.
 4. **Dedup vs privacy for weights.** Is convergent encryption acceptable inside a group?
 5. **Hosted S3 endpoint.** Is the TEE requirement acceptable, or do we offer only the sidecar?

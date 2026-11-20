@@ -13,8 +13,9 @@ pub const MAX_TAG_LEN: usize = 32;
 pub const MAX_PRICE_HINT_LEN: usize = 256;
 pub const MAX_ATTESTATION_LEN: usize = 16 * 1024;
 pub const MAX_ROOT_LEN: usize = 128;
-pub const MAX_PERIOD_ID_LEN: usize = 64;
 pub const MAX_TOKEN_ID_LEN: usize = 128;
+/// Signing keys kept per account (the oldest is dropped beyond this).
+pub const MAX_SIGN_KEYS: usize = 16;
 
 pub const ACCOUNT_PLACEHOLDER: &str = "{account}";
 
@@ -123,6 +124,17 @@ pub fn validate_enc_key(k: &str) -> Result<(), String> {
     }
 }
 
+/// `ed25519:<base58 of 32 bytes>`
+pub fn validate_sign_key(k: &str) -> Result<(), String> {
+    let b58 = k
+        .strip_prefix("ed25519:")
+        .ok_or("key must start with ed25519:")?;
+    match bs58::decode(b58).into_vec() {
+        Ok(v) if v.len() == 32 => Ok(()),
+        _ => Err("ed25519 key must be base58 of 32 bytes".into()),
+    }
+}
+
 fn validate_tags(what: &str, tags: &[String]) -> Result<(), String> {
     if tags.len() > MAX_TAGS {
         return Err(format!("at most {MAX_TAGS} {what}"));
@@ -172,15 +184,6 @@ pub fn validate_root(root: &str) -> Result<(), String> {
     if root.is_empty() || root.len() > MAX_ROOT_LEN || !root.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(format!(
             "root must be 1..={MAX_ROOT_LEN} printable ASCII bytes"
-        ));
-    }
-    Ok(())
-}
-
-pub fn validate_period_id(p: &str) -> Result<(), String> {
-    if p.is_empty() || p.len() > MAX_PERIOD_ID_LEN || !p.bytes().all(|b| b.is_ascii_graphic()) {
-        return Err(format!(
-            "period_id must be 1..={MAX_PERIOD_ID_LEN} printable ASCII bytes"
         ));
     }
     Ok(())
@@ -261,5 +264,22 @@ mod tests {
             validate_enc_key(&format!("x25519:{}", bs58::encode([7u8; 31]).into_string())).is_err()
         );
         assert!(validate_enc_key("x25519:0OIl").is_err());
+    }
+
+    #[test]
+    fn sign_keys() {
+        let k = format!("ed25519:{}", bs58::encode([7u8; 32]).into_string());
+        validate_sign_key(&k).unwrap();
+        assert!(validate_sign_key(&format!(
+            "x25519:{}",
+            bs58::encode([7u8; 32]).into_string()
+        ))
+        .is_err());
+        assert!(validate_sign_key(&format!(
+            "ed25519:{}",
+            bs58::encode([7u8; 33]).into_string()
+        ))
+        .is_err());
+        assert!(validate_sign_key("ed25519:0OIl").is_err());
     }
 }

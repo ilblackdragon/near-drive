@@ -53,7 +53,7 @@ def test_manifest_normalization():
         Manifest.from_dict({"version": True, "size": 3, "chunk_size": 4, "chunks": []})
 
 
-from near_drive import ChunkRef, NearUri, ObjectHead, PointerRecord, cid, public_key_of, sign, verify_head  # noqa: E402
+from near_drive import ChunkRef, NearUri, ObjectHead, PointerRecord, WriterCheck, cid, public_key_of, sign, verify_head  # noqa: E402
 
 SEED = bytes([7]) * 32
 URI = NearUri.parse("near://alice.near/a/b")
@@ -69,16 +69,26 @@ def _rec(m, **over):
 
 
 def test_verify_head():
-    verify_head(URI, ObjectHead(_rec(MAN), MAN))
+    wc = WriterCheck.trusted({"alice.near": [public_key_of(SEED)]})
+    verify_head(URI, ObjectHead(_rec(MAN), MAN), wc)
     with pytest.raises(ValueError, match="different object"):
-        verify_head(URI, ObjectHead(_rec(MAN, path="a/c"), MAN))
+        verify_head(URI, ObjectHead(_rec(MAN, path="a/c"), MAN), wc)
     r = _rec(MAN)
     r.seq = 2
     with pytest.raises(ValueError, match="signature"):
-        verify_head(URI, ObjectHead(r, MAN))
+        verify_head(URI, ObjectHead(r, MAN), wc)
     other = Manifest(1, 3, 8, MAN.chunks, None, "x")
     with pytest.raises(ValueError, match="manifest does not match"):
-        verify_head(URI, ObjectHead(_rec(MAN), other))
+        verify_head(URI, ObjectHead(_rec(MAN), other), wc)
     m4 = Manifest(1, 4, 8, MAN.chunks)
     with pytest.raises(ValueError, match="do not add up"):
-        verify_head(URI, ObjectHead(_rec(m4), m4))
+        verify_head(URI, ObjectHead(_rec(m4), m4), wc)
+    # a record self-signed by a key alice never published (a forging gateway)
+    evil = bytes([9]) * 32
+    f = PointerRecord("alice.near", "a/b", MAN.cid(), 3, 100, 1, "alice.near", public_key_of(evil), 1)
+    f.sig = sign(evil, f.signing_bytes())
+    with pytest.raises(ValueError, match="not a signing key of alice.near"):
+        verify_head(URI, ObjectHead(f, MAN), wc)
+    verify_head(URI, ObjectHead(f, MAN), WriterCheck.insecure_skip_writer_check())
+    with pytest.raises(ValueError, match="writer_check"):
+        verify_head(URI, ObjectHead(_rec(MAN), MAN), None)

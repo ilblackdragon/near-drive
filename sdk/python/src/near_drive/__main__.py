@@ -5,7 +5,8 @@ import argparse
 import os
 import sys
 
-from .client import Client
+from .chain import WriterCheck
+from .client import DEFAULT_CONTRACT, Client
 from .files import default_credentials_path, default_root_key_path, generate_root_key_file, load_credentials, load_root_key
 from .uri import NearUri
 
@@ -17,6 +18,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--credentials", default=os.environ.get("NEAR_DRIVE_CREDENTIALS"))
     p.add_argument("--network", default=os.environ.get("NEAR_DRIVE_NETWORK", os.environ.get("NEAR_NETWORK", "mainnet")))
     p.add_argument("--home", default=os.environ.get("NEAR_DRIVE_HOME"))
+    p.add_argument("--rpc-url", default=os.environ.get("NEAR_DRIVE_RPC_URL"), help="NEAR RPC for checking record writers against the contract")
+    p.add_argument("--contract", default=os.environ.get("NEAR_DRIVE_CONTRACT", DEFAULT_CONTRACT))
+    p.add_argument("--insecure-skip-writer-check", action="store_true", default=os.environ.get("NEAR_DRIVE_INSECURE_SKIP_WRITER_CHECK") == "1",
+                   help="do not verify record writers (local dev gateways / tests only)")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("keygen")
     sub.add_parser("whoami")
@@ -49,10 +54,12 @@ def main(argv: list[str] | None = None) -> int:
     account, sk = load_credentials(a.credentials or default_credentials_path(a.account, a.network))
     if account != a.account:
         p.error(f"credentials are for {account}, not {a.account}")
-    with Client(a.gateway, account, sk, load_root_key(root_path)) as c:
+    wc = WriterCheck.insecure_skip_writer_check() if a.insecure_skip_writer_check else None
+    with Client(a.gateway, account, sk, load_root_key(root_path), writer_check=wc, rpc_url=a.rpc_url, contract_id=a.contract) as c:
         if a.cmd == "whoami":
             print(f"account: {account}")
             print(f"x25519:  {c.x25519_public() or '(no root key; run keygen)'}")
+            print(f"sign:    {c.sign_public_key() or '(no root key; run keygen)'}")
         elif a.cmd == "put":
             if a.src == "-":
                 r = c.put(a.uri, sys.stdin.buffer.read(), public=a.public, content_type=a.content_type, share_with=a.share)

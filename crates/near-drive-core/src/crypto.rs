@@ -56,6 +56,16 @@ impl RootKey {
     pub fn x25519_public(&self) -> String {
         format_x25519(&x25519_dalek::PublicKey::from(&self.x25519_secret()))
     }
+    /// Ed25519 key that signs pointer records (`writer_pk` / `sig`). Its
+    /// public half is published in `drive.near` (`set_sign_key`), so readers
+    /// can check that a record was written by the account it names.
+    pub fn signing_key(&self) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&self.derive("near-drive/v1/sign"))
+    }
+    /// Public half of [`RootKey::signing_key`] as `ed25519:<base58>`.
+    pub fn sign_public_key(&self) -> String {
+        crate::keys::format_public_key(&self.signing_key().verifying_key())
+    }
     pub fn kek(&self) -> [u8; 32] {
         self.derive("near-drive/v1/kek")
     }
@@ -275,6 +285,16 @@ pub fn plaintext_chunks(plaintext: &[u8], chunk_size: usize) -> Result<Vec<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sign_key_is_derived_from_root() {
+        let a = RootKey::from_bytes([7; 32]);
+        assert_eq!(a.signing_key().to_bytes(), RootKey::from_bytes([7; 32]).signing_key().to_bytes());
+        assert_ne!(a.signing_key().to_bytes(), RootKey::from_bytes([8; 32]).signing_key().to_bytes());
+        assert_ne!(a.signing_key().to_bytes(), a.kek());
+        assert!(a.sign_public_key().starts_with("ed25519:"));
+        assert_eq!(crate::keys::parse_public_key(&a.sign_public_key()).unwrap(), a.signing_key().verifying_key());
+    }
 
     #[test]
     fn roundtrip_and_tamper() {

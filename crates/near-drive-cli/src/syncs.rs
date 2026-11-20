@@ -224,7 +224,7 @@ fn print_report(f: &Folder, r: &near_drive_sync::Report) {
 
 /// `sync run`: one pass (repeated while something is pending), or `--watch`.
 pub async fn run(ctx: &mut Ctx, dir: PathBuf, remote: Option<String>, watch: bool, exclude: Vec<String>) -> Result<()> {
-    let c = ctx.client().await?;
+    let c = ctx.write_client().await?;
     let remote = remote_prefix(remote.as_deref(), c.account())?;
     let folder = Folder::new(&dir, remote)?.with_exclude(exclude);
     let opts = Options { parallel: 4, ..Default::default() };

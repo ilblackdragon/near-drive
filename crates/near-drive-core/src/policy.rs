@@ -66,9 +66,50 @@ pub fn can_write_somewhere(namespace: &str, rules: &[Rule], signer: &str) -> boo
         || rules.iter().any(|r| r.write.iter().any(|e| e == "*" || e == signer || (e == "{account}" && r.prefix.contains("{account}"))))
 }
 
+/// Whether `signer` may read at least some path under `prefix` according to
+/// the rules (first match wins, as in [`resolve`]). Used to decide which
+/// rolled-up common prefixes a directory listing may show; it does not check
+/// that a readable object actually exists there.
+pub fn subtree_readable(namespace: &str, rules: &[Rule], prefix: &str, signer: &str) -> bool {
+    if signer == namespace {
+        return true;
+    }
+    for r in rules {
+        if let Some(bound) = match_prefix(&r.prefix, prefix) {
+            // Every path under `prefix` not claimed by an earlier rule lands here.
+            return r.read.iter().any(|e| e == "*" || subst(e, &bound) == signer);
+        }
+        let (lit, templated) = match r.prefix.split_once("{account}") {
+            Some((pre, _)) => (pre, true),
+            None => (r.prefix.as_str(), false),
+        };
+        // The rule applies to some paths under `prefix` only.
+        let overlaps = lit.starts_with(prefix) || (templated && prefix.starts_with(lit));
+        if overlaps && r.read.iter().any(|e| e == "*" || e == signer || (templated && e.contains("{account}"))) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtree_visibility() {
+        let rules = rules();
+        assert!(subtree_readable("app.near", &rules, "", "app.near"), "owner sees all");
+        assert!(subtree_readable("app.near", &rules, "", "bob.near"), "public/ and own folder are under the root");
+        assert!(subtree_readable("app.near", &rules, "users/", "bob.near"));
+        assert!(subtree_readable("app.near", &rules, "users/bob.near/", "bob.near"));
+        assert!(!subtree_readable("app.near", &rules, "users/alice.near/", "bob.near"));
+        assert!(subtree_readable("app.near", &rules, "public/x/", "bob.near"));
+        assert!(!subtree_readable("app.near", &rules, "private/", "bob.near"));
+        let shadow: Vec<Rule> = serde_json::from_str(r#"[{"prefix":"a/secret/","read":[]},{"prefix":"a/","read":["*"]}]"#).unwrap();
+        assert!(!subtree_readable("app.near", &shadow, "a/secret/", "bob.near"), "an earlier rule shadows a later one");
+        assert!(subtree_readable("app.near", &shadow, "a/other/", "bob.near"));
+    }
 
     fn rules() -> Vec<Rule> {
         serde_json::from_str(

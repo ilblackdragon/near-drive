@@ -6,6 +6,10 @@
 //!   empty folders that exist until a file is put in them or they are removed.
 //! - Reads: on open, the file's current version is downloaded into
 //!   `cache_dir/<manifest id>` (verified, decrypted) unless already there.
+//!   Listings are not verified, so a cached copy is reused only for a version
+//!   this mount verified for that path (its own download or upload, or a
+//!   verified head): a gateway cannot swap content between paths or roll a
+//!   file back by reporting another manifest id in a listing.
 //! - Writes: an open for writing works on a private copy; on close (flush /
 //!   release) the copy is uploaded with `expect_seq` = the version it was
 //!   based on. If someone else changed the file meanwhile, nothing is
@@ -35,6 +39,8 @@ struct Remote {
     seq: u64,
     manifest_cid: String,
     mtime: SystemTime,
+    /// `manifest_cid` is from a verified record for this path (not only from a listing).
+    verified: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -178,7 +184,7 @@ impl Tree {
         for i in gone {
             self.remove(i);
         }
-        for (path, r) in files {
+        for (path, mut r) in files {
             let size = r.size;
             let ino = self.by_path.get(&path).copied();
             // An open, modified file keeps its local size until it is uploaded.
@@ -186,7 +192,11 @@ impl Tree {
                 continue;
             }
             let was = ino.and_then(|i| match &self.nodes.get(&i)?.kind {
-                Kind::File { remote: Some(old), .. } => Some(old.manifest_cid.clone()),
+                Kind::File { remote: Some(old), .. } => {
+                    // Same version as one we verified: stays verified.
+                    r.verified = old.verified && old.manifest_cid == r.manifest_cid && old.seq == r.seq;
+                    Some(old.manifest_cid.clone())
+                }
                 _ => None,
             });
             let new_cid = r.manifest_cid.clone();
@@ -256,7 +266,7 @@ impl Fs {
                     .filter_map(|e| {
                         let rel = e.path.strip_prefix(&self.remote.path)?.to_string();
                         (!rel.is_empty() && !rel.ends_with('/') && !rel.split('/').any(|s| s.is_empty() || s == "." || s == "..")).then(|| {
-                            let r = Remote { size: e.size, seq: e.seq, manifest_cid: e.manifest_cid.unwrap_or_default(), mtime: UNIX_EPOCH + Duration::from_millis(e.ts_ms) };
+                            let r = Remote { size: e.size, seq: e.seq, manifest_cid: e.manifest_cid.unwrap_or_default(), mtime: UNIX_EPOCH + Duration::from_millis(e.ts_ms), verified: false };
                             (rel, r)
                         })
                     })
@@ -287,23 +297,47 @@ impl Fs {
                 Kind::Dir => return Err(std::io::Error::from_raw_os_error(libc::EISDIR).into()),
             }
         };
-        let cached = self.cache_path(&remote.manifest_cid);
-        if !remote.manifest_cid.is_empty() && cached.exists() {
-            let _ = File::options().write(true).open(&cached).and_then(|f| f.set_modified(SystemTime::now())); // LRU
-            return Ok((cached, remote));
-        }
-        std::fs::create_dir_all(self.opts.cache_dir.join("tmp"))?;
-        let tmp = self.opts.cache_dir.join("tmp").join(format!("dl-{ino}-{}", self.next_fh.fetch_add(1, Ordering::SeqCst)));
-        let head = self.rt.block_on(self.client.get_to_file(&self.uri(&path)?, &tmp))?;
-        let r = Remote { size: head.manifest.size, seq: head.record.seq, manifest_cid: head.record.manifest_cid.clone(), mtime: UNIX_EPOCH + Duration::from_millis(head.record.ts_ms) };
-        let dst = self.cache_path(&r.manifest_cid);
-        std::fs::rename(&tmp, &dst)?;
-        {
+        let uri = self.uri(&path)?;
+        let set = |r: &Remote| {
             let mut t = self.tree.lock().unwrap();
             if let Some(n) = t.nodes.get_mut(&ino) {
                 n.kind = Kind::File { remote: Some(r.clone()), size: r.size };
             }
+        };
+        let touch = |p: &Path| {
+            let _ = File::options().write(true).open(p).and_then(|f| f.set_modified(SystemTime::now())); // LRU
+        };
+        let verified = |rec: &near_drive_client::near_drive_core::record::PointerRecord, size: u64| Remote {
+            size,
+            seq: rec.seq,
+            manifest_cid: rec.manifest_cid.clone(),
+            mtime: UNIX_EPOCH + Duration::from_millis(rec.ts_ms),
+            verified: true,
+        };
+        let cached = self.cache_path(&remote.manifest_cid);
+        if remote.verified && !remote.manifest_cid.is_empty() && cached.exists() {
+            touch(&cached);
+            return Ok((cached, remote));
         }
+        // The version came from a listing: confirm it with a verified head
+        // before serving a cached copy.
+        if !remote.manifest_cid.is_empty() && cached.exists() {
+            let head = self.rt.block_on(self.client.head(&uri))?.ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+            let r = verified(&head.record, head.manifest.size);
+            let cached = self.cache_path(&r.manifest_cid);
+            if cached.exists() {
+                touch(&cached);
+                set(&r);
+                return Ok((cached, r));
+            }
+        }
+        std::fs::create_dir_all(self.opts.cache_dir.join("tmp"))?;
+        let tmp = self.opts.cache_dir.join("tmp").join(format!("dl-{ino}-{}", self.next_fh.fetch_add(1, Ordering::SeqCst)));
+        let head = self.rt.block_on(self.client.get_to_file(&uri, &tmp))?;
+        let r = verified(&head.record, head.manifest.size);
+        let dst = self.cache_path(&r.manifest_cid);
+        std::fs::rename(&tmp, &dst)?;
+        set(&r);
         self.evict();
         Ok((dst, r))
     }
@@ -370,7 +404,7 @@ impl Fs {
                 let rec = self.rt.block_on(self.client.put_file(tmp, &self.uri(&copy)?, &PutOptions { expect_seq: Some(0), ..Default::default() }))?;
                 let size = std::fs::metadata(tmp)?.len();
                 let mut t = self.tree.lock().unwrap();
-                let r = Remote { size, seq: rec.seq, manifest_cid: rec.manifest_cid.clone(), mtime: SystemTime::now() };
+                let r = Remote { size, seq: rec.seq, manifest_cid: rec.manifest_cid.clone(), mtime: SystemTime::now(), verified: true };
                 t.ino_for(&copy, Kind::File { remote: Some(r), size });
                 t.refreshed = None;
                 drop(t);
@@ -383,7 +417,7 @@ impl Fs {
         let _ = std::fs::copy(tmp, self.cache_path(&rec.manifest_cid));
         let mut t = self.tree.lock().unwrap();
         if let Some(n) = t.nodes.get_mut(&ino) {
-            n.kind = Kind::File { remote: Some(Remote { size, seq: rec.seq, manifest_cid: rec.manifest_cid, mtime: SystemTime::now() }), size };
+            n.kind = Kind::File { remote: Some(Remote { size, seq: rec.seq, manifest_cid: rec.manifest_cid, mtime: SystemTime::now(), verified: true }), size };
         }
         t.local_dirs.retain(|d| !path.starts_with(&format!("{d}/")));
         Ok(())
@@ -453,7 +487,7 @@ impl Fs {
                 t.remove(old);
             }
             t.remove(ino);
-            t.ino_for(new_path, Kind::File { remote: Some(Remote { size, seq: rec.seq, manifest_cid: rec.manifest_cid, mtime: SystemTime::now() }), size });
+            t.ino_for(new_path, Kind::File { remote: Some(Remote { size, seq: rec.seq, manifest_cid: rec.manifest_cid, mtime: SystemTime::now(), verified: true }), size });
         } else {
             // Not uploaded yet (open, new): rename locally; the close uploads it under the new name.
             let mut t = self.tree.lock().unwrap();

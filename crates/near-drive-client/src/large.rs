@@ -194,7 +194,7 @@ impl Client {
     /// Record + manifest + per-chunk direct URLs. None if the object does not exist.
     pub async fn locate(&self, uri: &NearUri) -> Result<Option<Located>> {
         let Some(loc): Option<Located> = self.get_json("locate", &Self::obj_path(uri), "mode=locate").await? else { return Ok(None) };
-        verify_head(uri, &loc.head())?;
+        self.verify_read(uri, &loc.head()).await?;
         let m = &loc.manifest;
         ensure!(
             loc.chunks.is_empty() || (loc.chunks.len() == m.chunks.len() && loc.chunks.iter().zip(&m.chunks).all(|(a, b)| a.cid == b.cid)),
@@ -212,7 +212,7 @@ impl Client {
         let f = tokio::fs::File::open(path).await.with_context(|| format!("opening {}", path.display()))?;
         let Some(dir) = &opts.resume_dir else { return self.put_stream(f, uri, opts, None).await };
         // Resuming an encrypted upload needs the owner's key to recover the object key.
-        if !opts.public && self.root.is_none() {
+        if !opts.public && (self.root.is_none() || opts.skip_owner_key) {
             return self.put_stream(f, uri, opts, None).await;
         }
         let key = resume::key_for(&self.account, &uri.to_string(), path, self.chunk_size as u64, opts)?;
@@ -266,20 +266,13 @@ impl Client {
         Ok(if opts.public {
             Sealer::Plain
         } else {
-            let mut rs = Vec::new();
-            if let Some(root) = &self.root {
-                rs.push(crypto::Recipient::Owner(root));
-            }
-            for k in &opts.share_with {
-                rs.push(crypto::Recipient::X25519(crypto::parse_x25519(k)?));
-            }
-            ensure!(!rs.is_empty(), "no root key loaded and no share_with recipients; run `near drive keygen` or use --public");
-            Sealer::Enc(Arc::new(ChunkSealer::new(&rs)?))
+            Sealer::Enc(Arc::new(ChunkSealer::new(&self.recipients(opts)?)?))
         })
     }
 
     async fn put_stream<R: AsyncRead + Unpin + Send>(&self, mut reader: R, uri: &NearUri, opts: &PutOptions, jr: Option<JournalRun<'_>>) -> Result<PointerRecord> {
         NearUri::object(&uri.namespace, &uri.path)?;
+        self.record_key()?;
         let (sealer, journal, done) = match jr {
             Some(j) => (j.sealer, Some(j.journal), Some(j.done)),
             None => (self.new_sealer(opts)?, None, None),
@@ -588,6 +581,7 @@ impl Client {
     /// Start an incremental upload of `uri` (see [`ObjectWriter`]).
     pub fn writer(self: &Arc<Self>, uri: &NearUri, opts: &PutOptions) -> Result<ObjectWriter> {
         NearUri::object(&uri.namespace, &uri.path)?;
+        self.record_key()?;
         let cs = self.chunk_size;
         ensure!(cs > 0 && cs as u64 <= near_drive_core::manifest::MAX_CHUNK_BYTES, "bad chunk_size");
         Ok(ObjectWriter {

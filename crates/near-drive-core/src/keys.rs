@@ -49,24 +49,62 @@ pub fn verify(pk: &VerifyingKey, msg: &[u8], sig_b58: &str) -> Result<()> {
     pk.verify(msg, &Signature::from_bytes(&bytes)).map_err(|_| anyhow!("bad signature"))
 }
 
-/// `~/.near-credentials/<network>/<account>.json`
+/// A NEAR credentials file: `~/.near-credentials/<network>/<account>.json`
+/// (legacy near-cli), or near-cli-rs's per-key
+/// `<network>/<account>/ed25519_<pk>.json`, which has no `account_id` (only
+/// `implicit_account_id`, `public_key`, `private_key`).
 #[derive(Debug, Deserialize)]
 pub struct NearCredentials {
-    pub account_id: String,
-    pub public_key: String,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub public_key: Option<String>,
+    #[serde(alias = "secret_key")]
     pub private_key: String,
 }
 
+/// The account a credentials file at `path` belongs to when the file does
+/// not say: `<account>.json`, or `<account>/ed25519_<pk>.json`.
+fn account_from_path(path: &std::path::Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let name = if stem.starts_with("ed25519_") || stem.starts_with("ed25519:") {
+        path.parent()?.file_name()?.to_str()?
+    } else {
+        stem
+    };
+    crate::uri::validate_account_id(name).ok()?;
+    Some(name.to_string())
+}
+
 impl NearCredentials {
-    pub fn load(path: &std::path::Path) -> Result<(String, SigningKey)> {
+    /// Loads and checks a credentials file. The account is the file's
+    /// `account_id`, else `account` (e.g. `--account`), else taken from the
+    /// file name. A file's `account_id` that differs from `account` is an error.
+    pub fn load_for(path: &std::path::Path, account: Option<&str>) -> Result<(String, SigningKey)> {
         let c: NearCredentials = serde_json::from_slice(
             &std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
-        )?;
+        )
+        .with_context(|| format!("parsing {}", path.display()))?;
         let sk = parse_secret_key(&c.private_key)?;
-        if format_public_key(&sk.verifying_key()) != c.public_key {
-            bail!("credentials file public_key does not match private_key");
+        if let Some(pk) = &c.public_key {
+            if format_public_key(&sk.verifying_key()) != *pk {
+                bail!("credentials file public_key does not match private_key");
+            }
         }
-        Ok((c.account_id, sk))
+        let account_id = match (c.account_id, account) {
+            (Some(f), Some(a)) if f != a => bail!("credentials {} are for {f}, not {a}", path.display()),
+            (Some(f), _) => f,
+            (None, Some(a)) => a.to_string(),
+            (None, None) => account_from_path(path).with_context(|| {
+                format!("{} has no account_id; pass the account (--account)", path.display())
+            })?,
+        };
+        Ok((account_id, sk))
+    }
+
+    /// [`load_for`](Self::load_for) without an account hint.
+    pub fn load(path: &std::path::Path) -> Result<(String, SigningKey)> {
+        Self::load_for(path, None)
     }
 }
 
@@ -83,5 +121,42 @@ mod tests {
         let sig = sign(&sk, b"hi");
         verify(&pk, b"hi", &sig).unwrap();
         assert!(verify(&pk, b"ho", &sig).is_err());
+    }
+
+    #[test]
+    fn credentials_without_account_id() {
+        let dir = std::env::temp_dir().join(format!("nd-creds-{}", std::process::id()));
+        let sk = SigningKey::from_bytes(&[3; 32]);
+        let pk = format_public_key(&sk.verifying_key());
+        // near-cli-rs 0.29 per-key file: no account_id.
+        let keydir = dir.join("testnet").join("alice.testnet");
+        std::fs::create_dir_all(&keydir).unwrap();
+        let file = keydir.join(format!("{}.json", pk.replace(':', "_")));
+        let body = serde_json::json!({
+            "implicit_account_id": hex::encode(sk.verifying_key().as_bytes()),
+            "public_key": pk,
+            "private_key": format_secret_key(&sk),
+        });
+        std::fs::write(&file, body.to_string()).unwrap();
+        let (a, k) = NearCredentials::load_for(&file, Some("bob.testnet")).unwrap();
+        assert_eq!((a.as_str(), k.to_bytes()), ("bob.testnet", sk.to_bytes()));
+        // No hint: the account directory the key file sits in.
+        assert_eq!(NearCredentials::load(&file).unwrap().0, "alice.testnet");
+        // Legacy `<account>.json` without account_id: the file name.
+        let legacy = dir.join("carol.testnet.json");
+        std::fs::write(&legacy, body.to_string()).unwrap();
+        assert_eq!(NearCredentials::load(&legacy).unwrap().0, "carol.testnet");
+        // account_id present and different from the hint: refused.
+        let named = dir.join("named.json");
+        let mut b = body.clone();
+        b["account_id"] = "dave.testnet".into();
+        std::fs::write(&named, b.to_string()).unwrap();
+        assert_eq!(NearCredentials::load_for(&named, Some("dave.testnet")).unwrap().0, "dave.testnet");
+        assert!(NearCredentials::load_for(&named, Some("eve.testnet")).is_err());
+        // Public key that does not match: refused.
+        b["public_key"] = format_public_key(&SigningKey::from_bytes(&[4; 32]).verifying_key()).into();
+        std::fs::write(&named, b.to_string()).unwrap();
+        assert!(NearCredentials::load(&named).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

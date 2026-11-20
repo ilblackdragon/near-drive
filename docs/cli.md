@@ -13,16 +13,18 @@ Run `near drive --help` or `near drive <command> --help` for every flag.
 | command | what it does |
 |---|---|
 | `login` / `logout` | add / delete a NEAR Drive session key (a function-call key for the drive contract) via near-cli |
-| `keygen [--ckd \| --random]` | create your encryption key: derived from the account by MPC (`--ckd`, same key on every device) or random |
+| `keygen --ckd \| --random` | create your encryption key: derived from the account by MPC (`--ckd`, recommended: same key on every device) or random (back it up). Without a terminal one of the two is required. Refuses a key that does not match the keys already published for the account unless `--force` |
+| `key export [--out FILE]` | print your root key (hex), or write it to `FILE` (mode 0600, never overwritten). Anyone with it can read your private files |
+| `key import <HEX \| - \| --file FILE> [--force]` | install a root key from a backup; checked against the published keys first. Refuses to replace a different existing key without `--force` |
 | `whoami` | account, network, which key signs requests, your sharing key |
 | `put <file> [path]` | upload (`-` = stdin); `--public`, `--class bulk`, `--share x25519:...`, `--no-resume` |
 | `get <path> [file]` | download (to stdout without a file); `--range START-END` |
-| `ls [prefix]` | list files |
+| `ls [prefix]` | list files under the prefix, recursively; `--dir` lists one level (files plus subfolders ending in `/`) |
 | `rm <path>` | delete |
 | `share <path> <account \| x25519:key>` | give someone the key to a file |
 | `grant <prefix> --read .. --write .. --payer ..` | set who can read / write / pays for a folder (onchain rule) |
 | `rules [account]` | show an account's rules |
-| `publish-key` | publish your sharing key onchain so others can share to you by account name |
+| `publish-key` | publish your sharing key (so others can share to you by account name) and your record-signing key (readers reject what you write until it is published) onchain |
 | `sync add/remove/status/run/exclude/include` | keep local folders in sync, selectively ([sync.md](sync.md)) |
 | `mount <folder> [remote]` | files on demand: everything listed, downloaded when opened ([mount.md](mount.md)) |
 | `up` / `down` | start / stop the background service: synced folders + local S3 endpoint ([s3.md](s3.md)) |
@@ -57,19 +59,45 @@ NEAR Drive never creates or stores NEAR keys itself.
   Onchain writes attach a NEAR deposit for storage staking (excess refunded), so they need a full-access key or a
   Ledger; the session key cannot sign them.
 - **Networks.** `--network` is a near-cli connection name (`mainnet`, `testnet`, or your own from
-  `near config add-connection`); the RPC URL and the MPC contract for `keygen --ckd` come from that connection.
+  `near config add-connection`); the RPC URL comes from that connection. Its `mpc_contract_account_id` must match
+  NEAR Drive's pinned MPC contract for `keygen --ckd` (see below).
 - `--credentials <file>` bypasses near-cli entirely (dev gateways, CI): requests and transactions are signed with that
-  NEAR credentials file.
+  NEAR credentials file. Both formats work: `{"account_id", "public_key", "private_key"}`, and near-cli-rs's per-key
+  files without `account_id` (the account is then `--account`, else the file or folder name). Transaction hashes are
+  printed.
+- Reads check every record's writer against the signing keys and rules in the drive contract (on the connection's
+  RPC). Against a dev gateway with made-up accounts there is nothing to check against:
+  `--insecure-skip-writer-check` (`NEAR_DRIVE_INSECURE_SKIP_WRITER_CHECK=1`) turns the check off, and lets that
+  gateway forge any file you read. Dev and tests only.
 
-The encryption root key is not a NEAR key. It lives in `~/.near-drive/keys/<account>.root` (the TypeScript and Python
-SDKs read it there). With `keygen --ckd` it can be re-derived from the account on any device
-([ckd.md](ckd.md)).
+## The encryption root key
+
+The encryption root key is not a NEAR key. It lives in `~/.near-drive/keys/<account>.root` (mode 0600; the TypeScript
+and Python SDKs read it there), or comes from `NEAR_DRIVE_ROOT_KEY` (hex) in services. Everything private is encrypted
+to it, and your records are signed with a key derived from it, so a lost or mismatched root key means unreadable data
+*and* records other readers reject.
+
+- `keygen --ckd` derives it from the account with NEAR's MPC network: any device can derive it again ([ckd.md](ckd.md)).
+  The MPC contract and CKD domain are pinned (`v1.signer` on mainnet, `v1.signer-prod.testnet` on testnet, domain 2),
+  because another contract or domain derives a different key. A different `--ckd-contract` / `--ckd-domain`, or a
+  near-cli connection whose `mpc_contract_account_id` points elsewhere, is refused unless `--ckd-unpinned`. Other
+  networks (sandbox, localnet) have no pin: give both `--ckd-contract` and `--ckd-domain`.
+- `keygen --random` creates a key that exists only on this machine. Back it up: `near drive key export --out <file>`,
+  and on another device `near drive key import --file <file>`.
+- **Published-key check.** `publish-key` stores the root key's public keys (X25519 for sharing, ed25519 for records)
+  in the drive contract. `keygen` and `key import` compare a key with them before saving, and refuse one from a
+  different root key (your existing data and records were made with that one); use `key import` with the right key,
+  or `--force` and then `publish-key` to rotate (data encrypted to the old key stays unreadable to the new one).
+  Commands that write (`put`, `rm`, `share`, `sync`, `mount`, `up`, `s3-proxy`) do the same check once with the cached
+  or `NEAR_DRIVE_ROOT_KEY` key: a mismatch stops them before writing; keys not published yet only warn (run
+  `publish-key`: until then others reject your records). With `--insecure-skip-writer-check` or no drive contract at
+  the RPC, the check is skipped.
 
 ## Interactive mode
 
 In a terminal, anything missing is asked for, with the same prompts as near-cli: `near drive` alone opens a menu;
 `get` lists your files to pick from; `put` suggests a destination; `grant` asks who can read, write and pay; `keygen`
-asks CKD or random. Afterwards it prints the equivalent command without prompts. Without a terminal (or with
+asks CKD or random; `key` offers export and import. Afterwards it prints the equivalent command without prompts. Without a terminal (or with
 `--no-interactive`) missing arguments are errors.
 
 ## Sharing and access rules
@@ -119,3 +147,4 @@ near drive get --range 0-1048575 models/m.safetensors > header.bin
 | `--parallel`, `--chunk-mib`, `--retries` | `NEAR_DRIVE_PARALLEL`, `NEAR_DRIVE_CHUNK_MIB`, `NEAR_DRIVE_RETRIES` | 8, 4, 8 |
 | `--near-bin`, `--near-sign` | `NEAR_DRIVE_NEAR_BIN`, `NEAR_DRIVE_NEAR_SIGN` | `near`, asked |
 | `--credentials` | `NEAR_DRIVE_CREDENTIALS` | near-cli keys |
+| (root key) | `NEAR_DRIVE_ROOT_KEY` | `~/.near-drive/keys/<account>.root` |

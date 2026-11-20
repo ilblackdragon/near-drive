@@ -462,8 +462,8 @@ impl<B: ObjectBackend> Proxy<B> {
                 if !self.known_bucket(bucket) {
                     return Err(S3Error::access_denied("not your bucket"));
                 }
-                let items = self.list_items(bucket, "").await?;
-                if !items.is_empty() {
+                let p = self.page(bucket, "", "", "", 1).await?;
+                if !p.contents.is_empty() {
                     return Err(S3Error::new(StatusCode::CONFLICT, "BucketNotEmpty", "The bucket you tried to delete is not empty"));
                 }
                 // Namespaces cannot be deleted; an empty one behaves as deleted.
@@ -571,51 +571,43 @@ impl<B: ObjectBackend> Proxy<B> {
         Ok(())
     }
 
-    /// Sorted, de-duplicated listing without metadata sidecars.
-    async fn list_items(&self, bucket: &str, prefix: &str) -> S3Result<Vec<ListItem>> {
-        let mut items = self.backend.list(bucket, prefix).await.map_err(map_backend)?;
-        items.retain(|i| i.key.starts_with(prefix) && !i.key.ends_with(META_SUFFIX));
-        items.sort_by(|a, b| a.key.cmp(&b.key));
-        items.dedup_by(|a, b| a.key == b.key);
-        Ok(items)
-    }
-
+    /// One S3 page of up to `max` keys + common prefixes, sidecars hidden.
+    /// Built from as few native backend pages as needed (each continues from
+    /// the previous cursor; nothing is re-listed). Backend pages can come
+    /// back short (sidecars, objects the proxy cannot read), so this may take
+    /// several; a page is cut after its `max`-th item and the next S3 page
+    /// starts after that item.
     async fn page(&self, bucket: &str, prefix: &str, delimiter: &str, marker: &str, max: usize) -> S3Result<Page> {
-        let items = self.list_items(bucket, prefix).await?;
+        let delim = (!delimiter.is_empty()).then_some(delimiter);
         let mut page = Page { contents: vec![], prefixes: vec![], truncated: false, last: None };
+        let mut cursor = (!marker.is_empty()).then(|| marker.to_string());
         let mut count = 0;
-        for it in items {
-            if it.key.as_str() <= marker {
-                continue;
-            }
-            let cp = if delimiter.is_empty() {
-                None
-            } else {
-                it.key[prefix.len()..].find(delimiter).map(|i| it.key[..prefix.len() + i + delimiter.len()].to_string())
-            };
-            match cp {
-                Some(cp) => {
-                    if cp.as_str() <= marker || page.prefixes.last() == Some(&cp) {
-                        continue;
-                    }
-                    if count >= max {
-                        page.truncated = true;
-                        break;
-                    }
-                    page.last = Some(cp.clone());
-                    page.prefixes.push(cp);
+        while count < max {
+            // Ask for some slack: sidecars take up to half of a backend page.
+            let want = ((max - count) * 2).min(1000);
+            let bp = self.backend.list_page(bucket, prefix, delim, cursor.as_deref(), want).await.map_err(map_backend)?;
+            let mut merged: Vec<(String, Option<ListItem>)> = bp.items.into_iter().map(|i| (i.key.clone(), Some(i))).chain(bp.prefixes.into_iter().map(|p| (p, None))).collect();
+            merged.sort_by(|a, b| a.0.cmp(&b.0));
+            for (key, item) in merged {
+                if count == max {
+                    page.truncated = true;
+                    return Ok(page);
                 }
-                None => {
-                    if count >= max {
-                        page.truncated = true;
-                        break;
-                    }
-                    page.last = Some(it.key.clone());
-                    page.contents.push(it);
+                match item {
+                    Some(_) if key.ends_with(META_SUFFIX) => continue,
+                    Some(it) => page.contents.push(it),
+                    None => page.prefixes.push(key.clone()),
                 }
+                page.last = Some(key);
+                count += 1;
             }
-            count += 1;
+            match bp.next {
+                Some(n) if Some(&n) != cursor.as_ref() => cursor = Some(n),
+                _ => return Ok(page),
+            }
         }
+        // Full page and the backend has more.
+        page.truncated = page.last.is_some();
         Ok(page)
     }
 

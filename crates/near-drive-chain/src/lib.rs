@@ -12,6 +12,7 @@ pub mod tx;
 
 use anyhow::Result;
 use near_drive_core::policy::Rule;
+pub use near_drive_core::record::SignKeyEntry;
 pub use rpc::{
     default_rpc_url, CallOutcome, KeyPermission, NearRpc, NoContract, Signer, ONE_NEAR,
     STORAGE_BYTE_COST, TGAS,
@@ -26,6 +27,17 @@ pub mod u128_str {
         s.serialize_str(&v.to_string())
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
+        String::deserialize(d)?.parse().map_err(D::Error::custom)
+    }
+}
+
+/// U64 as a JSON string (NEAR convention).
+pub mod u64_str {
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
         String::deserialize(d)?.parse().map_err(D::Error::custom)
     }
 }
@@ -77,19 +89,48 @@ pub struct SettleEntry {
     #[serde(with = "u128_str")]
     pub amount: u128,
     pub gateway: String,
-    pub period_id: String,
+    /// Billing period number (e.g. the hourly window index). Charged at most
+    /// once per (payer, gateway, period).
+    #[serde(with = "u64_str")]
+    pub period: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SettleResult {
     pub payer: String,
-    pub period_id: String,
+    pub gateway: String,
+    #[serde(with = "u64_str")]
+    pub period: u64,
     /// `Settled`, `AlreadySettled`, `InvalidEntry`, `GatewayNotAllowed`,
-    /// `UnknownGateway`, `SettlerNotAuthorized`, `NoSpendCap`, `CapExceeded`,
-    /// `InsufficientBalance`.
+    /// `UnknownGateway`, `SettlerNotAuthorized`, `PeriodTooOld`, `NoSpendCap`,
+    /// `CapExceeded`, `InsufficientBalance`.
     pub status: String,
     #[serde(with = "u128_str")]
     pub charged: u128,
+}
+
+/// A self-settler a payer authorized (`get_settler_authorizations`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlerAuthorization {
+    pub settler: String,
+    /// Set while a revocation is pending: when it takes effect (ns).
+    #[serde(default, with = "opt_u64_str")]
+    pub expires_at_ns: Option<u64>,
+}
+
+mod opt_u64_str {
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(v) => s.serialize_str(&v.to_string()),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        Option::<String>::deserialize(d)?
+            .map(|v| v.parse().map_err(D::Error::custom))
+            .transpose()
+    }
 }
 
 /// Deposit to attach for a call that may store about `json_len` bytes:
@@ -246,9 +287,93 @@ impl StorageContract {
         .await
     }
 
-    pub async fn get_settler_authorizations(&self, payer: &str) -> Result<Vec<String>> {
+    pub async fn get_settler_authorizations(
+        &self,
+        payer: &str,
+    ) -> Result<Vec<SettlerAuthorization>> {
         self.view("get_settler_authorizations", json!({"payer": payer}))
             .await
+    }
+
+    /// Daily spend cap in micro-USD (`None`: no charges). Raises apply at
+    /// once; decreases after the contract's `withdraw_delay_sec`.
+    pub async fn set_spend_cap(
+        &self,
+        signer: &Signer,
+        per_day: Option<u128>,
+    ) -> Result<CallOutcome> {
+        let args = json!({"per_day": per_day.map(|v| v.to_string())});
+        let deposit = storage_deposit_for(args.to_string().len());
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "set_spend_cap",
+                &args,
+                CALL_GAS,
+                deposit,
+            )
+            .await
+    }
+
+    /// Agree (or stop agreeing) to pay for `namespace`'s rules that name the
+    /// signer as payer.
+    pub async fn set_sponsorship(
+        &self,
+        signer: &Signer,
+        namespace: &str,
+        allowed: bool,
+    ) -> Result<CallOutcome> {
+        let args = json!({"namespace": namespace, "allowed": allowed});
+        let deposit = storage_deposit_for(args.to_string().len());
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "set_sponsorship",
+                &args,
+                CALL_GAS,
+                deposit,
+            )
+            .await
+    }
+
+    /// Whether `payer` pays for `namespace` (always true for itself).
+    pub async fn is_sponsor(&self, payer: &str, namespace: &str) -> Result<bool> {
+        self.view(
+            "is_sponsor",
+            json!({"payer": payer, "namespace": namespace}),
+        )
+        .await
+    }
+
+    /// Publish the signer's record-signing key (`ed25519:<base58>`).
+    pub async fn set_sign_key(&self, signer: &Signer, key: &str) -> Result<CallOutcome> {
+        let args = json!({"key": key});
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "set_sign_key",
+                &args,
+                CALL_GAS,
+                storage_deposit_for(key.len() + 64),
+            )
+            .await
+    }
+
+    /// The account's signing-key history, oldest first.
+    pub async fn get_sign_keys(&self, account: &str) -> Result<Vec<SignKeyEntry>> {
+        self.view("get_sign_keys", json!({"account_id": account}))
+            .await
+    }
+
+    pub async fn is_settled(&self, payer: &str, gateway: &str, period: u64) -> Result<bool> {
+        self.view(
+            "is_settled",
+            json!({"payer": payer, "gateway": gateway, "period": period.to_string()}),
+        )
+        .await
     }
 
     pub async fn propose_owner(&self, signer: &Signer, owner: &str) -> Result<CallOutcome> {
@@ -449,7 +574,8 @@ impl StorageContract {
     }
 
     /// Billing settlement (approved settlers only). ~0.001 NEAR of storage is
-    /// attached per entry; unused deposit is refunded.
+    /// attached per entry (new (payer, gateway) idempotency windows and
+    /// earnings rows); unused deposit is refunded.
     pub async fn settle(
         &self,
         signer: &Signer,
@@ -501,5 +627,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v[0].stake, 5 * ONE_NEAR);
+    }
+
+    #[test]
+    fn escrow_and_key_json_shapes() {
+        let e = SettleEntry {
+            payer: "a.near".into(),
+            amount: 5,
+            gateway: "gw.near".into(),
+            period: 493_000,
+        };
+        assert_eq!(
+            serde_json::to_value(&e).unwrap(),
+            json!({"payer": "a.near", "amount": "5", "gateway": "gw.near", "period": "493000"})
+        );
+        let r: SettleResult = serde_json::from_str(
+            r#"{"payer":"a.near","gateway":"gw.near","period":"7","status":"PeriodTooOld","charged":"0"}"#,
+        )
+        .unwrap();
+        assert_eq!((r.period, r.status.as_str()), (7, "PeriodTooOld"));
+        let k: Vec<SignKeyEntry> =
+            serde_json::from_str(r#"[{"key":"ed25519:abc","since_ms":"123"}]"#).unwrap();
+        assert_eq!(k[0].since_ms, 123);
+        let a: Vec<SettlerAuthorization> = serde_json::from_str(
+            r#"[{"settler":"gw.near","expires_at_ns":null},{"settler":"x.near","expires_at_ns":"9"}]"#,
+        )
+        .unwrap();
+        assert_eq!(a[0].expires_at_ns, None);
+        assert_eq!(a[1].expires_at_ns, Some(9));
     }
 }

@@ -105,8 +105,16 @@ On macOS add `--features macfuse` to the CLI to get the FUSE-based `near drive m
 
 ## Uninstall
 
-`near drive down`, then delete the binaries (`~/.local/bin/near-drive*` or `%LOCALAPPDATA%\NEAR Drive`). Your data
-and settings are in `~/.near-drive`; synced folders keep their files.
+`near drive down`, then delete the binaries (`~/.local/bin/near-drive*` or `%LOCALAPPDATA%\NEAR Drive`). Settings
+are in `~/.near-drive`; synced folders keep their files.
+
+**`~/.near-drive/keys/` holds your encryption root keys** (`<account>.root`). Deleting it without a backup makes your
+private files unreadable, unless the key came from `keygen --ckd` (then `keygen --ckd` derives it again). Back each key
+up first:
+
+```sh
+near drive --account <you> key export --out <file on a USB stick / password manager>   # restore: near drive key import --file <file>
+```
 
 ## Releasing (maintainers)
 

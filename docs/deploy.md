@@ -47,8 +47,11 @@ docker run -d --name drive-gateway -p 127.0.0.1:8787:8787 -v drive-gw:/data \
 ```
 
 - `NEAR_DRIVE_CONFIG_JSON` is the whole [gateway config](gateway.md) (or mount a file and pass `--config`).
-- With `rpc_url`, requests are authenticated against the account's NEAR keys. For a private gateway serving one
-  service you can instead list its key in `"dev_keys": {"app.near": ["ed25519:..."]}` and leave out `rpc_url`.
+- With `rpc_url`, requests are authenticated against the account's NEAR keys, and records must be signed with the
+  writer's published signing key (`near drive publish-key`). For a private gateway serving one service you can instead
+  list its key in `"dev_keys": {"app.near": ["ed25519:..."]}` (and its record-signing key, `near drive whoami`, in
+  `"dev_sign_keys"`) and leave out `rpc_url`. Clients still check records against the chain, so publish the signing
+  key anyway.
 - Keep the index and chunks on R2 so the container is stateless; `gc` frees chunks of deleted and replaced files
   ([gateway.md](gateway.md#garbage-collection)).
 - Inside the container it listens on `0.0.0.0`; publish the port only on a private address (as above) or a private
@@ -73,7 +76,7 @@ docker run -d --name drive-s3 -p 127.0.0.1:9000:9000 \
 | setting | |
 |---|---|
 | `NEAR_DRIVE_SECRET_KEY` | NEAR key for `NEAR_DRIVE_ACCOUNT` that signs gateway requests (instead of near-cli / files) |
-| `NEAR_DRIVE_ROOT_KEY` | encryption root key, hex (instead of `~/.near-drive/keys`); generate with `openssl rand -hex 32` or `near drive keygen` |
+| `NEAR_DRIVE_ROOT_KEY` | encryption root key, hex (instead of `~/.near-drive/keys`); use the account's key (`near drive key export` prints it). Writes are refused if it does not match the keys the account published |
 | `NEAR_DRIVE_S3_ACCESS_KEY` / `_SECRET_KEY` | the S3 credentials your code uses (replace the R2 ones) |
 | `--bucket-alias NAME=near://ACCOUNT/PREFIX/` | keep existing bucket names; repeatable |
 | `--cors-origin` | browser origins allowed to use presigned URLs (uploads from a web page) |

@@ -30,14 +30,17 @@ JSON
 target/debug/near-drive-gateway --config /tmp/gw.json &
 
 export NEAR_DRIVE_ACCOUNT=alice.near NEAR_DRIVE_CREDENTIALS=/tmp/alice.json
+# alice.near has no signing key onchain to check records against (dev only; see docs/cli.md)
+export NEAR_DRIVE_INSECURE_SKIP_WRITER_CHECK=1
 target/debug/near-drive keygen --random
 echo hello | target/debug/near-drive put - memory/today.txt
 target/debug/near-drive ls
 target/debug/near-drive get memory/today.txt
 ```
 
-With real NEAR accounts, set `"rpc_url"` in the gateway config and drop `NEAR_DRIVE_CREDENTIALS`: the CLI then uses
-near-cli's keys (`near drive login`).
+With real NEAR accounts, set `"rpc_url"` in the gateway config and drop `NEAR_DRIVE_CREDENTIALS` and
+`NEAR_DRIVE_INSECURE_SKIP_WRITER_CHECK`: the CLI then uses near-cli's keys (`near drive login`), and
+`near drive publish-key` publishes the record-signing key that readers and the gateway check.
 
 ## Client internals
 

@@ -26,11 +26,11 @@ async fn provider_api() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
     let root = *RootKey::generate().as_bytes();
-    let c = Client::new(&url, "alice.near", sk.clone(), Some(RootKey::from_bytes(root)));
+    let c = Client::new(&url, "alice.near", sk.clone(), Some(RootKey::from_bytes(root))).with_writer_check(near_drive_client::WriterCheck::Trusted(near_drive_client::TrustedWriters::new().key("alice.near", RootKey::from_bytes(root).sign_public_key())));
     c.put(&u("near://alice.near/Drive/docs/a.txt"), b"hello", &PutOptions::default()).await.unwrap();
     c.put(&u("near://alice.near/Drive/b.bin"), &vec![7u8; 100_000], &PutOptions::default()).await.unwrap();
 
-    let api = serve(Arc::new(Client::new(&url, "alice.near", sk.clone(), Some(RootKey::from_bytes(root)))), u("near://alice.near/Drive/"), tmp.path().join("ptmp")).await.unwrap();
+    let api = serve(Arc::new(Client::new(&url, "alice.near", sk.clone(), Some(RootKey::from_bytes(root))).with_writer_check(near_drive_client::WriterCheck::Trusted(near_drive_client::TrustedWriters::new().key("alice.near", RootKey::from_bytes(root).sign_public_key())))), u("near://alice.near/Drive/"), tmp.path().join("ptmp")).await.unwrap();
     let ep = api.endpoint.clone();
     let http = reqwest::Client::new();
     let req = |m: reqwest::Method, path: &str| http.request(m, format!("{}{path}", ep.url)).bearer_auth(&ep.token);

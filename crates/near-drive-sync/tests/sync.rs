@@ -32,7 +32,7 @@ async fn setup() -> Env {
 
 impl Env {
     fn client(&self) -> Client {
-        let mut c = Client::new(&self.url, "alice.near", self.sk.clone(), Some(RootKey::from_bytes(self.root)));
+        let mut c = Client::new(&self.url, "alice.near", self.sk.clone(), Some(RootKey::from_bytes(self.root))).with_writer_check(near_drive_client::WriterCheck::Trusted(near_drive_client::TrustedWriters::new().key("alice.near", RootKey::from_bytes(self.root).sign_public_key())));
         c.chunk_size = 64 * 1024;
         c
     }
@@ -189,7 +189,7 @@ async fn offline_changes_wait_and_unfinished_writes_are_not_uploaded() {
     let a = env.device("a");
     write(&a, "x.txt", b"written offline");
     // Gateway unreachable: the pass fails, nothing local is touched.
-    let mut dead = Client::new("http://127.0.0.1:9", "alice.near", env.sk.clone(), Some(RootKey::from_bytes(env.root)));
+    let mut dead = Client::new("http://127.0.0.1:9", "alice.near", env.sk.clone(), Some(RootKey::from_bytes(env.root))).insecure_skip_writer_check();
     dead.set_net(NetConfig { attempts: 1, ..Default::default() });
     assert!(sync_once(&dead, &a, &opts()).await.is_err());
     assert_eq!(read(&a, "x.txt").unwrap(), b"written offline");
@@ -272,4 +272,43 @@ async fn selective_sync_leaves_excluded_folders_alone() {
     let r = sync_once(&c, &b, &opts()).await.unwrap();
     assert_eq!(r.downloaded.len(), 2, "{r:?}");
     assert_eq!(r.uploaded, vec!["Videos/local-only.mp4"]);
+}
+
+/// A local folder that cannot be read must not look like its files were
+/// deleted: they stay on the remote and in the sync state.
+#[cfg(unix)]
+#[tokio::test]
+async fn unreadable_local_folder_is_not_a_deletion() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = setup().await;
+    let (c, a) = (env.client(), env.device("a"));
+    let o = opts();
+    write(&a, "keep/x.txt", b"x");
+    write(&a, "keep/deep/y.txt", b"y");
+    write(&a, "top.txt", b"t");
+    sync_once(&c, &a, &o).await.unwrap();
+    let uri = |p: &str| NearUri::parse(&format!("near://alice.near/Drive/{p}")).unwrap();
+    assert!(c.head(&uri("keep/x.txt")).await.unwrap().is_some());
+
+    let dir = a.local.join("keep");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&dir).is_ok() {
+        // e.g. running as root: permissions are not enforced
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: cannot make a folder unreadable here");
+        return;
+    }
+    let r = sync_once(&c, &a, &o).await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let r = r.unwrap();
+    assert!(r.skipped.iter().any(|(p, _)| p == "keep/"), "{r:?}");
+    assert!(r.deleted_remote.is_empty(), "{r:?}");
+    assert!(c.head(&uri("keep/x.txt")).await.unwrap().is_some(), "deleted remotely while unreadable locally");
+    assert!(c.head(&uri("keep/deep/y.txt")).await.unwrap().is_some());
+
+    // Readable again: nothing to do, nothing lost.
+    let r = sync_once(&c, &a, &o).await.unwrap();
+    assert!(r.errors.is_empty() && r.conflicts.is_empty(), "{r:?}");
+    assert_eq!(read(&a, "keep/x.txt").unwrap(), b"x");
+    assert!(c.head(&uri("keep/x.txt")).await.unwrap().is_some());
 }

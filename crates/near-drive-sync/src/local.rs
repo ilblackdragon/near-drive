@@ -101,6 +101,11 @@ pub struct LocalFile {
 /// Every syncable file under `root`: relative path ('/'-separated, Unicode
 /// NFC, so macOS's decomposed names match other devices) -> stat. Symlinks
 /// and ignored names are skipped; names that are not UTF-8 are reported.
+///
+/// Anything that could not be read is pushed to `skipped` as `(path, why)`:
+/// a folder as `"dir/"` (`""` = the whole tree), an entry as its relative
+/// name. Callers must treat those paths, and everything under them, as
+/// unknown (see [`under_skipped`]), never as deleted.
 pub fn scan(root: &Path, skipped: &mut Vec<(String, String)>) -> Result<BTreeMap<String, LocalFile>> {
     let mut out = BTreeMap::new();
     let mut stack = vec![(root.to_path_buf(), String::new())];
@@ -113,7 +118,15 @@ pub fn scan(root: &Path, skipped: &mut Vec<(String, String)>) -> Result<BTreeMap
                 continue;
             }
         };
-        for e in rd.flatten() {
+        for e in rd {
+            let e = match e {
+                Ok(e) => e,
+                Err(err) => {
+                    // An unreadable entry could be any name in this folder.
+                    skipped.push((prefix.clone(), format!("cannot read folder entry: {err}")));
+                    continue;
+                }
+            };
             let Some(name) = e.file_name().to_str().map(|n| n.nfc().collect::<String>()) else {
                 skipped.push((format!("{prefix}{}", e.file_name().to_string_lossy()), "name is not valid UTF-8".into()));
                 continue;
@@ -122,7 +135,13 @@ pub fn scan(root: &Path, skipped: &mut Vec<(String, String)>) -> Result<BTreeMap
                 continue;
             }
             let rel = format!("{prefix}{name}");
-            let Ok(ft) = e.file_type() else { continue };
+            let ft = match e.file_type() {
+                Ok(ft) => ft,
+                Err(err) => {
+                    skipped.push((rel, format!("cannot read file type: {err}")));
+                    continue;
+                }
+            };
             if ft.is_dir() {
                 stack.push((e.path(), format!("{rel}/")));
             } else if ft.is_file() {
@@ -133,6 +152,17 @@ pub fn scan(root: &Path, skipped: &mut Vec<(String, String)>) -> Result<BTreeMap
         }
     }
     Ok(out)
+}
+
+/// Whether `rel` is a path [`scan`] reported in `skipped`, or lies under one.
+pub fn under_skipped(rel: &str, skipped: &[String]) -> bool {
+    skipped.iter().any(|s| {
+        if s.is_empty() || s.ends_with('/') {
+            rel.starts_with(s.as_str())
+        } else {
+            rel == s || rel.strip_prefix(s.as_str()).is_some_and(|r| r.starts_with('/'))
+        }
+    })
 }
 
 /// BLAKE3 of a file's contents.
@@ -214,6 +244,16 @@ pub fn trash(root: &Path, rel: &str, src: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skipped_prefixes() {
+        let s = vec!["dir/".to_string(), "odd\u{fffd}".to_string()];
+        assert!(under_skipped("dir/x", &s) && under_skipped("dir/a/b", &s));
+        assert!(!under_skipped("dir", &s) && !under_skipped("dirt/x", &s));
+        assert!(under_skipped("odd\u{fffd}", &s) && under_skipped("odd\u{fffd}/x", &s) && !under_skipped("odd\u{fffd}x", &s));
+        assert!(under_skipped("anything", &["".to_string()]));
+        assert!(!under_skipped("a", &[]));
+    }
 
     #[test]
     fn names() {

@@ -16,7 +16,7 @@ use near_drive_client::{
 };
 use near_drive_gateway::{
     s3::{ObjectIndexStore, S3Config},
-    store::{CasError, IndexEntry, IndexStore},
+    store::{list_all, CasError, IndexEntry, IndexStore},
 };
 use serde_json::json;
 
@@ -67,14 +67,40 @@ async fn s3_index_store_cas_on_real_s3() {
         idx.cas_put(&rec(p, 1)).await.unwrap();
         assert_eq!(idx.get("alice.near", p).await.unwrap().unwrap().path, p);
     }
-    let ls: Vec<_> = idx.list("alice.near", "m/a").await.unwrap().into_iter().map(|r| r.record.path).collect();
+    let ls: Vec<_> = list_all(&idx, "alice.near", "m/a").await.unwrap().into_iter().map(|r| r.record.path).collect();
     assert_eq!(ls, vec!["m/a", "m/a b", "m/a%2F", "m/ab"]);
-    assert_eq!(idx.list("alice.near", "").await.unwrap().len(), 6);
-    assert_eq!(idx.list("alice.near", "m/ü/").await.unwrap().len(), 1);
+    assert_eq!(list_all(&idx, "alice.near", "").await.unwrap().len(), 6);
+    assert_eq!(list_all(&idx, "alice.near", "m/ü/").await.unwrap().len(), 1);
     idx.delete("alice.near", "m/a", 2).await.unwrap();
     assert!(idx.get("alice.near", "m/a").await.unwrap().is_none());
-    assert_eq!(idx.list("alice.near", "m/a").await.unwrap().len(), 3);
+    assert_eq!(list_all(&idx, "alice.near", "m/a").await.unwrap().len(), 3);
     idx.cas_put(&rec("m/a", 1)).await.unwrap();
+
+    // native pages: prefix / delimiter / start-after / max-keys; tombstones skipped
+    for i in 0..30 {
+        idx.cas_put(&rec(&format!("p/d{}/f{i:02}", i % 3), 1)).await.unwrap();
+    }
+    for i in [0, 4, 8] {
+        idx.delete("alice.near", &format!("p/d{}/f{i:02}", i % 3), 1).await.unwrap();
+    }
+    let (mut cursor, mut seen, mut pages) = (None::<String>, vec![], 0);
+    loop {
+        let pg = idx.list_page("alice.near", "p/", None, cursor.as_deref(), 7).await.unwrap();
+        pages += 1;
+        seen.extend(pg.entries.into_iter().map(|e| e.record.path));
+        match pg.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!((seen.len(), pages), (27, 5));
+    assert!(seen.windows(2).all(|w| w[0] < w[1]), "sorted by path");
+    let pg = idx.list_page("alice.near", "p/", Some("/"), None, 2).await.unwrap();
+    assert_eq!(pg.common_prefixes, vec!["p/d0/", "p/d1/"]);
+    let pg = idx.list_page("alice.near", "p/", Some("/"), pg.next_cursor.as_deref(), 2).await.unwrap();
+    assert_eq!((pg.common_prefixes, pg.next_cursor), (vec!["p/d2/".to_string()], None));
+    let pg = idx.list_page("alice.near", "", Some("/"), None, 1000).await.unwrap();
+    assert_eq!(pg.common_prefixes, vec!["m/", "n/", "p/"]);
 
     // raw concurrent CAS on one key: exactly one winner per seq
     for seq in 2..=6 {

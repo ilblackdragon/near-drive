@@ -1,7 +1,10 @@
 //! Shared helpers for integration tests (gateway on a random local port).
 #![allow(dead_code)]
 use ed25519_dalek::SigningKey;
-use near_drive_client::{near_drive_core::keys, Client};
+use near_drive_client::{
+    near_drive_core::{crypto::RootKey, keys},
+    Client, TrustedWriters, WriterCheck,
+};
 use near_drive_gateway::{
     bridge::{reference_router, ReferenceBridge},
     placement::StorageConfig,
@@ -54,8 +57,17 @@ pub async fn start_bridge(dir: PathBuf, token: Option<&str>, direct_urls: bool) 
     base
 }
 
-pub fn client(url: &str, account: &str, sk: &SigningKey, root: Option<near_drive_client::near_drive_core::crypto::RootKey>) -> Client {
-    Client::new(url, account, sk.clone(), root)
+/// A client that trusts its own record-signing key (from `root`) for `account`.
+pub fn client(url: &str, account: &str, sk: &SigningKey, root: Option<RootKey>) -> Client {
+    client_trusting(url, account, sk, root, TrustedWriters::new())
+}
+
+/// [`client`], also trusting `trusted` (other writers and rules).
+pub fn client_trusting(url: &str, account: &str, sk: &SigningKey, root: Option<RootKey>, mut trusted: TrustedWriters) -> Client {
+    if let Some(r) = &root {
+        trusted = trusted.key(account, r.sign_public_key());
+    }
+    Client::new(url, account, sk.clone(), root).with_writer_check(WriterCheck::Trusted(trusted))
 }
 
 /// Deterministic pseudo-random bytes; `off` must be a multiple of 8.

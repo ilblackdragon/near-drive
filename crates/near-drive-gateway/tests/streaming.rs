@@ -164,7 +164,7 @@ async fn classes_and_direct_urls() {
 #[tokio::test]
 async fn gateway_chunk_range_requests() {
     let s = setup().await;
-    let mut alice = client(&s.gw.url, "alice.near", &s.keys["alice.near"], None);
+    let mut alice = client(&s.gw.url, "alice.near", &s.keys["alice.near"], Some(RootKey::generate()));
     alice.chunk_size = 1000;
     let data = pattern(1, 0, 2500);
     let uri = u("near://alice.near/pub/r");

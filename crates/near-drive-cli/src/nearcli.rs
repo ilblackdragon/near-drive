@@ -298,15 +298,16 @@ impl NearCli {
         self.run(self.call_args(c))
     }
 
-    /// Like [`call`](Self::call) but returns the function's return value
-    /// (`near --quiet` prints it raw on stdout; prompts go to stderr).
+    /// Like [`call`](Self::call) but returns the function's return value.
+    /// near-cli prints the return value on stdout and everything else
+    /// (prompts, the transaction ID and explorer link) on stderr, which is
+    /// passed through so the user sees the transaction hash.
     pub fn call_capture(&self, c: &FunctionCall) -> Result<Vec<u8>> {
-        let mut args = vec!["--quiet".to_string()];
-        args.extend(self.call_args(c));
+        let args = self.call_args(c);
         eprintln!("$ {} {}", self.bin, shell_join(&args));
         let out = self.command()?.args(&args).stdin(Stdio::inherit()).stderr(Stdio::inherit()).stdout(Stdio::piped()).output()?;
         if !out.status.success() {
-            bail!("`near` failed ({})", out.status);
+            bail!("`near` failed ({}); if it printed a transaction ID, check it in an explorer before retrying", out.status);
         }
         Ok(out.stdout)
     }
@@ -341,6 +342,19 @@ impl NearCli {
             bail!("`near` failed ({st})");
         }
         Ok(())
+    }
+}
+
+/// The JSON value in near-cli's stdout (the function's return value),
+/// tolerating stray text around a JSON object.
+pub fn json_value(out: &[u8]) -> &[u8] {
+    let t = out.trim_ascii();
+    if serde_json::from_slice::<serde_json::Value>(t).is_ok() {
+        return t;
+    }
+    match (t.iter().position(|&b| b == b'{'), t.iter().rposition(|&b| b == b'}')) {
+        (Some(a), Some(b)) if a < b => &t[a..=b],
+        _ => t,
     }
 }
 
@@ -396,6 +410,15 @@ mod tests {
         assert_eq!(split_words("sign-with-ledger --seed-phrase-hd-path 'm/44 1' send"), vec!["sign-with-ledger", "--seed-phrase-hd-path", "m/44 1", "send"]);
         assert_eq!(split_words("a '' b"), vec!["a", "", "b"]);
         assert_eq!(shell_join(&["put", "my file", "near://a.near/x", ""]), "put 'my file' near://a.near/x ''");
+    }
+
+    #[test]
+    fn json_value_from_near_stdout() {
+        let v = br#"{"big_y":"a","big_c":"b"}"#;
+        assert_eq!(json_value(v), v);
+        let pretty = b"{\n  \"big_y\": \"a\",\n  \"big_c\": \"b\"\n}\n";
+        assert_eq!(json_value(pretty), pretty.trim_ascii());
+        assert_eq!(json_value(b"Function execution return value:\n{\"big_y\":\"a\"}\n\n"), br#"{"big_y":"a"}"#);
     }
 
     #[test]

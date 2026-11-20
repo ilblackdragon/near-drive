@@ -8,7 +8,8 @@ object storage (`near://alice.near/path/to/object`). Wire-compatible with the Ru
   (credential files, root key files, file upload) live in `@near-drive/sdk/node`.
 - Crypto from audited libraries: `@noble/ciphers` (XChaCha20-Poly1305), `@noble/curves`
   (ed25519, X25519), `@noble/hashes` (BLAKE3, HKDF-SHA256), `@scure/base` (base58/base64).
-- Everything read is verified: record signature, manifest cid, chunk cids, AEAD tags.
+- Everything read is verified: record signature, the writer's authorization (onchain signing key and
+  namespace rules, see [Writer check](#writer-check)), manifest cid, chunk cids, AEAD tags.
 
 ## Usage
 
@@ -19,7 +20,8 @@ const client = new Client({
   gateway: "http://127.0.0.1:8787",
   accountId: "alice.near",
   signer: "ed25519:...",          // NEAR secret key (full-access or fn-call key for the storage contract)
-  rootKey: "<64 hex chars>",      // encryption root key (`near drive keygen` writes ~/.near-drive/keys/<account>.root)
+  rootKey: "<64 hex chars>",      // root key (`near drive keygen` writes ~/.near-drive/keys/<account>.root)
+  rpcUrl: "https://rpc.mainnet.near.org",  // reads verify record writers against drive.near
 });
 
 await client.put("near://alice.near/memory/today.json", JSON.stringify({ hello: "world" }), {
@@ -27,12 +29,47 @@ await client.put("near://alice.near/memory/today.json", JSON.stringify({ hello: 
 });
 const text = await client.getText("near://alice.near/memory/today.json");
 const head = await client.head("near://alice.near/memory/today.json");   // { record, manifest } | null
-const entries = await client.list("near://alice.near/memory/");
+const entries = await client.list("near://alice.near/memory/");   // every page
+const page = await client.listPage("near://alice.near/", { delimiter: "/", limit: 100 });
+// page.entries, page.common_prefixes; pass page.next_cursor as { cursor } for the next page (null = done)
 await client.delete("near://alice.near/memory/today.json");
 
 // Public (unencrypted) data, e.g. open model weights:
 await client.put("near://alice.near/weights/v1.bin", bytes, { public: true });
 ```
+
+### Writer check
+
+A pointer record is signed with a key derived from the writer's root key
+(`HKDF-SHA256(salt="near-drive", ikm=root, info="near-drive/v1/sign")` as an ed25519 seed;
+`client.signPublicKey()` / `rootKey.signPublicKey()`). The writer publishes it once in the drive contract
+with **`near drive publish-key`** (`set_sign_key`; this SDK does not send transactions). So:
+
+- **Writing requires the root key**, also for public objects and app-writes-for-user.
+- **Every read** (`get`, `head`, `locate`, `getFile`, chunk reads of a located object) accepts a record
+  only if its `writer_pk` is one of `get_sign_keys(writer)` in force at the record's `ts_ms` (±5 min
+  around key changes) and the namespace rules (`get_rules`) let `writer` write the path (the owner always
+  may). A malicious gateway can withhold or serve stale data, but cannot forge a writer.
+
+How a client checks (`writerCheck` option, there is no silent default):
+
+```ts
+import { WriterCheck, StorageContract } from "@near-drive/sdk";
+
+// Production: NEAR RPC view calls (finality "final"), cached 60 s per account / namespace (1024 entries max).
+new Client({ ..., rpcUrl: "https://rpc.mainnet.near.org" /* contractId: "drive.near" */ });
+new Client({ ..., writerCheck: WriterCheck.chain({ rpcUrl, contractId: "drive.near" }, { ttlMs: 60_000, maxEntries: 1024 }) });
+
+// Dev gateways / tests without a chain: fixed signing keys (+ optional rules per namespace).
+new Client({ ..., writerCheck: WriterCheck.trusted({ "alice.near": [aliceRoot.signPublicKey()] }, { "app.near": rules }) });
+
+// Tests only: no writer check at all.
+new Client({ ..., writerCheck: WriterCheck.insecureSkipWriterCheck() });
+```
+
+A client with neither `writerCheck` nor `rpcUrl` can write, but every read fails with an error naming
+these options. `verifyHead(uri, head, writerCheck)` runs the same checks on a head you fetched yourself;
+`resolvePolicy` is the namespace-rule evaluation (`near_drive_core::policy::resolve`).
 
 ### Sharing
 
@@ -52,15 +89,17 @@ const data = await bob.get("near://alice.near/shared/report.pdf");
 
 ### App writes for user
 
-An app can store data that only the user can decrypt: create the client **without a
-root key** and encrypt to the user's published X25519 key. With a policy such as
+An app can store data that only the user can decrypt: encrypt to the user's published X25519 key
+with `skipOwnerKey: true`, so the object key is not also wrapped to the app's own root key (the
+app still needs a root key: it signs the record). With a policy such as
 `{"prefix": "users/{account}/", "read": ["{account}"], "write": ["{account}", "app.near"], "payer": "app.near"}`
 on `app.near`, the app pays for storage but can neither decrypt nor (via policy) serve it to anyone else.
 
 ```ts
-const app = new Client({ gateway, accountId: "app.near", signer: APP_SECRET_KEY /* no rootKey */ });
+const app = new Client({ gateway, accountId: "app.near", signer: APP_SECRET_KEY, rootKey: APP_ROOT_KEY, rpcUrl });
 await app.put("near://app.near/users/bob.near/chat/0001.json", message, {
   shareWith: [bobX25519],            // bob's key, e.g. from drive.near or `near drive whoami`
+  skipOwnerKey: true,               // the app cannot decrypt it
   contentType: "application/json",
 });
 
@@ -127,7 +166,8 @@ await getFile(c, "near://alice.near/weights/model.bin", "./model.bin");
   uploads resume only with the owner's root key. The journal uses the same JSONL layout as the Rust client's.
 
 `scripts/drive-ts.mjs` is a small `near-drive`-compatible CLI (`whoami`, `put`, `get`, `ls`, `rm`, `share`)
-used by the interop test.
+used by the interop test. It checks writers via `NEAR_DRIVE_RPC_URL` (+ `NEAR_DRIVE_CONTRACT`);
+`NEAR_DRIVE_INSECURE_SKIP_WRITER_CHECK=1` turns that off for local dev gateways.
 
 ## Notes
 
@@ -141,7 +181,7 @@ used by the interop test.
 
 ```sh
 npm install
-npm test            # vitest: Rust test vectors (../../testvectors), unit tests, bad-network tests
+npm test            # vitest: test vectors (../../testvectors), unit + writer-check tests, bad-network tests
                     # (in-memory gateway, plus ../../target/debug/near-drive-gateway on 127.0.0.1 if built)
 npm run build       # tsc -> dist/
 ../../testvectors/interop.sh   # Rust <-> TS <-> Python against a live local gateway

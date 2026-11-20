@@ -52,6 +52,11 @@ pub struct Config {
     /// account -> allowed public keys (dev / tests).
     #[serde(default)]
     pub dev_keys: HashMap<String, Vec<String>>,
+    /// account -> record-signing keys accepted on writes besides the one
+    /// published in `drive.near` (dev / tests). Without `rpc_url`, a listed
+    /// account must sign records with one of these; others are not checked.
+    #[serde(default)]
+    pub dev_sign_keys: HashMap<String, Vec<String>>,
     /// namespace -> ordered rules. Overrides `drive.near` for these
     /// namespaces; the only policy source when `rpc_url` is None.
     #[serde(default)]
@@ -102,6 +107,7 @@ impl Default for Config {
             rpc_url: None,
             storage_contract: default_contract(),
             dev_keys: HashMap::new(),
+            dev_sign_keys: HashMap::new(),
             policies: HashMap::new(),
             contract_policies: true,
             storage: StorageConfig::default(),
@@ -125,6 +131,7 @@ pub struct AppState {
     pub blobs: Placement,
     pub index: Arc<dyn IndexStore>,
     pub keys: keys::KeyResolver,
+    pub sign_keys: keys::SignKeys,
     pub policies: policies::PolicySource,
     pub usage: usage::UsageSink,
     pub billing: Option<Arc<billing::Billing>>,
@@ -148,6 +155,10 @@ impl AppState {
             blobs: Placement::from_config(&cfg.storage, &cfg.data_dir)?,
             index: small::CachedIndex::wrap(cfg.storage.index.build(&cfg.data_dir)?, &cfg.storage.small_cache),
             keys: keys::KeyResolver::new(cfg.rpc_url.clone(), cfg.storage_contract.clone(), cfg.dev_keys.clone()),
+            sign_keys: keys::SignKeys::new(
+                cfg.dev_sign_keys.clone(),
+                cfg.rpc_url.as_ref().map(|rpc| near_drive_chain::StorageContract::new(rpc.clone(), cfg.storage_contract.clone())),
+            ),
             policies: policies::PolicySource::new(
                 &cfg.policies,
                 match (&cfg.rpc_url, cfg.contract_policies) {
@@ -168,6 +179,15 @@ impl AppState {
 
     async fn rules(&self, ns: &str) -> Result<Arc<Vec<Rule>>, ApiError> {
         self.policies.rules(ns).await.map_err(|e| {
+            tracing::error!("{e:#}");
+            err(StatusCode::SERVICE_UNAVAILABLE, "namespace policy unavailable")
+        })
+    }
+
+    /// Access for `signer` at `ns/path`, with the payer opt-in applied.
+    async fn access(&self, ns: &str, path: &str, signer: &str) -> Result<policy::Access, ApiError> {
+        let rules = self.rules(ns).await?;
+        self.policies.access(ns, &rules, path, signer).await.map_err(|e| {
             tracing::error!("{e:#}");
             err(StatusCode::SERVICE_UNAVAILABLE, "namespace policy unavailable")
         })
@@ -256,7 +276,6 @@ pub(crate) fn now_ms() -> u64 {
 
 struct Signer {
     account: String,
-    public_key: String,
 }
 
 async fn authenticate(st: &AppState, method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8]) -> Result<Signer, ApiError> {
@@ -289,7 +308,7 @@ async fn authenticate(st: &AppState, method: &Method, uri: &Uri, headers: &Heade
     if !st.keys.is_authorized(&account, &public_key).await? {
         return Err(err(StatusCode::UNAUTHORIZED, "public key is not authorized for account"));
     }
-    Ok(Signer { account, public_key })
+    Ok(Signer { account })
 }
 
 fn check_ns(ns: &str) -> Result<(), ApiError> {
@@ -352,7 +371,7 @@ async fn put_object(
 ) -> Result<Response, ApiError> {
     check_obj(&ns, &path)?;
     let signer = authenticate(&st, &method, &uri, &headers, &body).await?;
-    let access = policy::resolve(&ns, &st.rules(&ns).await?, &path, &signer.account);
+    let access = st.access(&ns, &path, &signer.account).await?;
     if !access.write {
         return Err(err(StatusCode::FORBIDDEN, "no write access"));
     }
@@ -361,11 +380,26 @@ async fn put_object(
     if rec.namespace != ns || rec.path != path {
         return bad("record does not match url");
     }
-    if rec.writer != signer.account || rec.writer_pk != signer.public_key {
-        return bad("record must be signed by the request signer");
+    if rec.writer != signer.account {
+        return bad("record writer must be the request signer");
     }
     if rec.verify_signature().is_err() {
         return bad("bad record signature");
+    }
+    // Readers reject records whose key the writer has not published; refuse
+    // them here too, so they never replace a good version.
+    match st.sign_keys.is_current(&rec.writer, &rec.writer_pk).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return bad(&format!(
+                "record is signed with {}, which is not the current signing key of {} (publish it: near drive publish-key)",
+                rec.writer_pk, rec.writer
+            ))
+        }
+        Err(e) => {
+            tracing::error!("{e:#}");
+            return Err(err(StatusCode::SERVICE_UNAVAILABLE, "signing keys unavailable"));
+        }
     }
     if now_ms().abs_diff(rec.ts_ms) > auth::MAX_SKEW_MS {
         return bad("record timestamp outside allowed window");
@@ -439,7 +473,7 @@ async fn get_object(
 ) -> Result<Response, ApiError> {
     check_obj(&ns, &path)?;
     let signer = authenticate(&st, &method, &uri, &headers, &[]).await?;
-    let access = policy::resolve(&ns, &st.rules(&ns).await?, &path, &signer.account);
+    let access = st.access(&ns, &path, &signer.account).await?;
     if !access.read {
         return Err(err(StatusCode::FORBIDDEN, "no read access"));
     }
@@ -506,7 +540,7 @@ async fn delete_object(
 ) -> Result<StatusCode, ApiError> {
     check_obj(&ns, &path)?;
     let signer = authenticate(&st, &method, &uri, &headers, &[]).await?;
-    let access = policy::resolve(&ns, &st.rules(&ns).await?, &path, &signer.account);
+    let access = st.access(&ns, &path, &signer.account).await?;
     if !access.write {
         return Err(err(StatusCode::FORBIDDEN, "no write access"));
     }
@@ -528,8 +562,20 @@ async fn delete_object(
 struct ListQuery {
     #[serde(default)]
     prefix: String,
+    /// Roll paths up at this delimiter (normally `/`) into `common_prefixes`.
+    #[serde(default)]
+    delimiter: Option<String>,
+    /// Opaque: the previous page's `next_cursor`.
+    #[serde(default)]
+    cursor: Option<String>,
+    /// Page size, 1..=1000 (default 1000).
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
+/// One page of the namespace index. Entries the caller may not read are
+/// dropped from the page, so pages can be short (even empty) while
+/// `next_cursor` still advances; listing ends when it is null.
 async fn list_objects(
     State(st): State<Arc<AppState>>,
     Path(ns): Path<String>,
@@ -541,15 +587,17 @@ async fn list_objects(
     check_ns(&ns)?;
     let signer = authenticate(&st, &method, &uri, &headers, &[]).await?;
     let rules = st.rules(&ns).await?;
-    let entries: Vec<_> = st
-        .index
-        .list(&ns, &q.prefix)
-        .await?
+    let limit = q.limit.unwrap_or(store::MAX_LIST_LIMIT).clamp(1, store::MAX_LIST_LIMIT);
+    let delimiter = q.delimiter.as_deref().filter(|d| !d.is_empty());
+    let page = st.index.list_page(&ns, &q.prefix, delimiter, q.cursor.as_deref().filter(|c| !c.is_empty()), limit).await?;
+    let entries: Vec<_> = page
+        .entries
         .into_iter()
         .filter(|r| policy::resolve(&ns, &rules, &r.path, &signer.account).read)
         .map(|r| json!({"path": r.path, "size": r.size, "seq": r.seq, "writer": r.writer, "ts_ms": r.ts_ms, "manifest_cid": r.manifest_cid, "class": r.class}))
         .collect();
-    Ok(Json(entries).into_response())
+    let common_prefixes: Vec<_> = page.common_prefixes.into_iter().filter(|p| policy::subtree_readable(&ns, &rules, p, &signer.account)).collect();
+    Ok(Json(json!({"entries": entries, "common_prefixes": common_prefixes, "next_cursor": page.next_cursor})).into_response())
 }
 
 #[derive(Deserialize)]

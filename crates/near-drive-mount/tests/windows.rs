@@ -57,7 +57,7 @@ async fn cloud_files_placeholders() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
     let root_key = *RootKey::generate().as_bytes();
-    let mk = || Client::new(&url, "alice.near", sk.clone(), Some(RootKey::from_bytes(root_key)));
+    let mk = || Client::new(&url, "alice.near", sk.clone(), Some(RootKey::from_bytes(root_key))).with_writer_check(near_drive_client::WriterCheck::Trusted(near_drive_client::TrustedWriters::new().key("alice.near", RootKey::from_bytes(root_key).sign_public_key())));
     let c = mk();
     let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
     c.put(&u("near://alice.near/Drive/docs/a.txt"), b"hello", &PutOptions::default()).await.unwrap();

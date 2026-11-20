@@ -142,6 +142,9 @@ pub async fn up(ctx: &mut Ctx, proxy: ProxyArgs, no_s3: bool, file_provider: Opt
     // Resolve (and, interactively, ask for) everything the child needs, and
     // fail here on a missing key rather than in a background log.
     let (account, _, _) = ctx.request_key().await?;
+    // A root key that does not match the published keys would make the
+    // service write records nobody accepts: refuse here, not in the log.
+    ctx.check_before_write(&account).await?;
     let creds = if no_s3 { None } else { Some(s3_credentials(ctx, &proxy)?) };
 
     let mut words = vec!["daemon".to_string(), "--listen".into(), proxy.listen.to_string()];

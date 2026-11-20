@@ -91,6 +91,7 @@ Once `near-drive` is on your `PATH`, it also runs as a near-cli subcommand: `nea
 ```sh
 near drive login                        # pick your account; near-cli adds a limited NEAR Drive key
 near drive keygen --ckd                 # your encryption key, derived from your account (same on every device)
+near drive publish-key                  # publish its public keys: others accept your files and can share with you
 
 near drive put notes.txt                # -> near://<you>/notes.txt
 near drive put report.pdf docs/         # -> near://<you>/docs/report.pdf
@@ -149,7 +150,9 @@ Supported operations and options: [docs/s3.md](docs/s3.md).
 ```rust
 use near_drive_client::{near_drive_core::NearUri, Client, PutOptions};
 
-let client = Client::new("https://gateway.example", "alice.near", signing_key, Some(root_key));
+// Records read are checked against the writers' signing keys and rules in drive.near.
+let client = Client::new("https://gateway.example", "alice.near", signing_key, Some(root_key))
+    .with_chain("https://rpc.mainnet.near.org", "drive.near");
 let uri = NearUri::parse("near://alice.near/memory/today.json")?;
 client.put(&uri, br#"{"hello":"world"}"#, &PutOptions::default()).await?;
 let (_head, data) = client.get(&uri).await?;

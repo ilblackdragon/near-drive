@@ -7,6 +7,7 @@
 #   2. gateway that authenticates keys and reads rules from the sandbox
 #   3. whoami (full-access key) -> login (session key via `near account add-key`)
 #      -> put/get/ls signed by the session key -> grant/rules -> publish-key
+#      -> key export/import and the published-key check
 #      -> `near drive ...` through near-cli -> logout
 #
 # Needs: near (near-cli-rs), near-sandbox (NEAR_SANDBOX_BIN, or the one
@@ -97,6 +98,8 @@ ok "login: near-cli added a function-call key for $DRIVE and stored it ($SESSION
 
 echo "== storage with the session key"
 nd keygen --random 2>/dev/null
+# Writers must publish their record-signing key first (readers and the gateway check it).
+keys=$(nd publish-key 2>"$T/pk.log") || { cat "$T/pk.log"; die "publish-key"; }
 head -c 300000 /dev/urandom >"$T/blob"
 nd put "$T/blob" "near://$ALICE/docs/blob.bin" 2>/dev/null
 nd get "near://$ALICE/docs/blob.bin" "$T/blob.out"
@@ -108,10 +111,24 @@ echo "== transactions through near-cli"
 nd grant "near://$ALICE/shared/" --read bob.test.near >"$T/grant.log" 2>&1 || { cat "$T/grant.log"; die "grant"; }
 nd rules "$ALICE" | grep -q '"bob.test.near"' || die "rules should show bob"
 ok "grant: set_rules sent by near-cli; rules read back"
-key=$(nd publish-key 2>"$T/pk.log") || { cat "$T/pk.log"; die "publish-key"; }
+key=$(sed -n 1p <<<"$keys"); sign=$(sed -n 2p <<<"$keys")
 onchain=$("$NEAR" contract call-function as-read-only "$DRIVE" get_enc_key json-args "{\"account_id\":\"$ALICE\"}" network-config sandbox now 2>/dev/null | tr -d '"[:space:]')
 [ "$onchain" = "$key" ] || die "published key $key != onchain $onchain"
-ok "publish-key: set_enc_key sent by near-cli"
+"$NEAR" contract call-function as-read-only "$DRIVE" get_sign_keys json-args "{\"account_id\":\"$ALICE\"}" network-config sandbox now 2>/dev/null | grep -q "$sign" || die "sign key $sign not onchain"
+ok "publish-key: set_enc_key and set_sign_key sent by near-cli"
+
+echo "== root key backup and the published-key check"
+nd key export --out "$T/root.backup" 2>/dev/null
+NEAR_DRIVE_HOME="$T/home2" nd key import --file "$T/root.backup" 2>"$T/imp.log" || { cat "$T/imp.log"; die "key import of the exported key"; }
+grep -q "matches the keys" "$T/imp.log" || { cat "$T/imp.log"; die "import should confirm the published keys match"; }
+cmp -s "$T/home/keys/$ALICE.root" "$T/home2/keys/$ALICE.root" || die "imported key differs"
+other=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+if NEAR_DRIVE_HOME="$T/home3" nd key import "$other" 2>"$T/imp.log"; then die "importing a key that does not match the published ones should fail"; fi
+grep -q "different root key" "$T/imp.log" || { cat "$T/imp.log"; die "mismatch message"; }
+if NEAR_DRIVE_HOME="$T/home3" nd keygen --random 2>"$T/imp.log"; then die "keygen --random should refuse once keys are published"; fi
+if NEAR_DRIVE_ROOT_KEY=$other nd put "$T/blob" "near://$ALICE/docs/x.bin" 2>"$T/imp.log"; then die "put with a mismatched root key should fail"; fi
+grep -q "Refusing to write" "$T/imp.log" || { cat "$T/imp.log"; die "put mismatch message"; }
+ok "key export/import; mismatched keys refused by import, keygen and put"
 
 if python3 -c 'import pexpect' 2>/dev/null; then
   # Interactive: near-drive asks for the rule, then near-cli asks for the signer.

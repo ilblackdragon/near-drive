@@ -21,3 +21,4 @@ blake3.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+axum.workspace = true

@@ -205,6 +205,33 @@ async fn sandbox_end_to_end() -> Result<()> {
     assert_eq!(sc.bump_cred_epoch(&signer(&bob)).await?, 2);
     assert_eq!(sc.get_cred_epoch(bob.id().as_str()).await?, 2);
 
+    // ------------------------------------------------------ signing keys
+    let pk = |b: u8| {
+        near_drive_core::keys::format_public_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[b; 32]).verifying_key(),
+        )
+    };
+    let (sk1, sk2) = (pk(3), pk(4));
+    sc.set_sign_key(&signer(&carol), &sk1).await?;
+    sc.set_sign_key(&signer(&carol), &sk1).await?; // same key: no new entry
+    sc.set_sign_key(&signer(&carol), &sk2).await?;
+    let keys = sc.get_sign_keys(carol.id().as_str()).await?;
+    assert_eq!(
+        keys.iter().map(|k| k.key.as_str()).collect::<Vec<_>>(),
+        [sk1.as_str(), sk2.as_str()]
+    );
+    assert!(keys[0].since_ms > 0 && keys[0].since_ms <= keys[1].since_ms);
+    assert!(sc.get_sign_keys(bob.id().as_str()).await?.is_empty());
+
+    // ------------------------------------------------------- sponsorship
+    assert!(!sc.is_sponsor(bob.id().as_str(), alice.id().as_str()).await?);
+    sc.set_sponsorship(&signer(&bob), alice.id().as_str(), true)
+        .await?;
+    assert!(sc.is_sponsor(bob.id().as_str(), alice.id().as_str()).await?);
+    sc.set_sponsorship(&signer(&bob), alice.id().as_str(), false)
+        .await?;
+    assert!(!sc.is_sponsor(bob.id().as_str(), alice.id().as_str()).await?);
+
     // --------------------------------------------------------------- gateways
     let info = GatewayInfo {
         url: "https://gw.example".into(),
@@ -383,25 +410,25 @@ async fn sandbox_end_to_end() -> Result<()> {
             payer: alice.id().to_string(),
             amount: 1_200_000,
             gateway: gw.id().to_string(),
-            period_id: "2026-11-19".into(),
+            period: 493_000,
         },
         SettleEntry {
             payer: bob.id().to_string(),
             amount: 900_000,
             gateway: gw.id().to_string(),
-            period_id: "2026-11-19".into(),
+            period: 493_000,
         },
         SettleEntry {
             payer: carol.id().to_string(),
             amount: 1,
             gateway: gw.id().to_string(),
-            period_id: "2026-11-19".into(),
+            period: 493_000,
         },
         SettleEntry {
             payer: alice.id().to_string(),
             amount: 400_000,
             gateway: gw.id().to_string(),
-            period_id: "2026-11-19b".into(),
+            period: 493_001,
         },
     ];
     let res = sc.settle(&signer(&billing), &entries).await?;
@@ -409,6 +436,8 @@ async fn sandbox_end_to_end() -> Result<()> {
     assert_eq!(st, ["Settled", "Settled", "NoSpendCap", "CapExceeded"]);
     let again = sc.settle(&signer(&billing), &entries[..1]).await?;
     assert_eq!(again[0].status, "AlreadySettled");
+    assert!(sc.is_settled(alice.id().as_str(), gw.id().as_str(), 493_000).await?);
+    assert!(!sc.is_settled(alice.id().as_str(), gw.id().as_str(), 493_001).await?);
     assert!(
         sc.settle(&signer(&alice), &entries[..1]).await.is_err(),
         "not a settler"
@@ -419,6 +448,24 @@ async fn sandbox_end_to_end() -> Result<()> {
         earnings,
         json!([{"asset": ft_asset, "amount": "1200000"}, {"asset": mt_asset, "amount": "900000"}])
     );
+
+    // ----------------------------------------- delayed spend-cap decrease
+    // Lowering the cap is only scheduled (withdraw_delay_sec = 1 here).
+    let out = sc.set_spend_cap(&signer(&bob), None).await?;
+    assert!(
+        out.logs.iter().any(|l| l.contains(r#""pending":{"per_day":null"#)),
+        "{:?}",
+        out.logs
+    );
+    w.fast_forward(5).await?;
+    let late = SettleEntry {
+        payer: bob.id().to_string(),
+        amount: 1,
+        gateway: gw.id().to_string(),
+        period: 493_002,
+    };
+    let res = sc.settle(&signer(&billing), &[late]).await?;
+    assert_eq!(res[0].status, "NoSpendCap");
 
     // ------------------------------------------------------- withdraw_earnings
     // gw is not registered with the token: ft_transfer fails, earnings restored
@@ -484,5 +531,20 @@ async fn sandbox_end_to_end() -> Result<()> {
             > before.as_yoctonear() + NearToken::from_millinear(1_500).as_yoctonear()
     );
     assert!(sc.all_gateways().await?.is_empty());
+
+    // ---------------------------------------------------------------- upgrade
+    // Redeploy and migrate in one transaction (as the contract account).
+    assert!(call(&alice, sid, "migrate", json!({}), 0).await?.is_failure(), "migrate is private");
+    storage
+        .as_account()
+        .batch(storage.id())
+        .deploy(&wasm("near_drive_contract"))
+        .call(near_workspaces::operations::Function::new("migrate").args_json(json!({})))
+        .transact()
+        .await?
+        .into_result()?;
+    assert_eq!(view(&w, sid, "get_state_version", json!({})).await?, json!(1));
+    assert_eq!(sc.get_rules(alice.id().as_str()).await?.len(), 2);
+    assert_eq!(sc.get_sign_keys(carol.id().as_str()).await?.len(), 2);
     Ok(())
 }

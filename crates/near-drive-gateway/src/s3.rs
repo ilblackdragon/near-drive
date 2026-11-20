@@ -3,23 +3,26 @@
 //!
 //! Key layout (all under a configurable `prefix`):
 //! - chunks: `{prefix}b3/{hex[0..2]}/{hex}` for cid `b3:{hex}`
-//! - index:  `{prefix}{namespace}/{path}`, where each `/`-separated path
-//!   segment is escaped with `object_store`'s `PathPart` rules: the bytes
-//!   `\ { ^ } % ` ] " > [ ~ < # | * ?`, CR, LF and other ASCII controls are
-//!   percent-encoded (`%XX`), and segments equal to `.`/`..` become
-//!   `%2E`/`%2E%2E` (NEAR Drive paths never contain those). Non-ASCII bytes are
-//!   percent-encoded too (`ü` -> `%C3%BC`); everything else is stored as-is.
-//!   Escaping is per byte, so keys group like the paths and
-//!   group like the paths; LIST of a path prefix lists the S3 "directory" up to
-//!   the prefix's last `/` and filters the remainder.
+//! - index:  `{prefix}{namespace}/{path}`, the path stored verbatim. Valid
+//!   NEAR Drive paths (non-empty segments, no `.`/`..`, no control characters)
+//!   are valid object keys, so key order is path order and an index LIST is
+//!   one native S3 ListObjectsV2 request with `prefix`, `delimiter`,
+//!   `start-after` and `max-keys` mapped straight through.
 //!
 //! Index writes use conditional PUTs, so any number of gateways can share
 //! one bucket: a new record is `PutMode::Create` (`If-None-Match: *`), an
 //! update is `PutMode::Update` (`If-Match: <etag>`). A delete overwrites the
 //! record (CAS) with a tombstone `{"tombstone":true,"seq":n}` because plain S3
 //! DELETE is not conditional; tombstones are invisible to get/list and the
-//! next write of that path starts again at seq 1.
-use crate::store::{BlobStore, CasError, ChunkInfo, DirectUrl, IndexEntry, IndexStore};
+//! next write of that path starts again at seq 1. Tombstones are never
+//! removed: an unconditional DELETE could race a re-create of the same path
+//! and erase the new live record. LIST recognises them by size from the
+//! listing alone (no GET).
+//!
+//! LIST cost per page: one LIST request plus one GET per live record on the
+//! page whose (key, etag) is not in the bounded in-memory entry cache.
+use crate::store::{before_cursor, paginate, BlobStore, CasError, ChunkInfo, DirectUrl, IndexEntry, IndexStore, ListPage, Listed};
+use std::collections::HashMap;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -27,7 +30,8 @@ use futures_util::{StreamExt, TryStreamExt};
 use object_store::{
     aws::{AmazonS3, AmazonS3Builder},
     path::{Path as OPath, PathPart},
-    GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
+    list::{PaginatedListOptions, PaginatedListStore},
+    GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
 };
 use serde::{Deserialize, Serialize};
 use futures_util::stream::BoxStream;
@@ -251,30 +255,81 @@ enum Stored {
     Deleted,
 }
 
+/// A record object this small is a tombstone (at most
+/// `{"tombstone":true,"seq":18446744073709551615}`, 46 bytes); a live record
+/// carries a signature, cid and paths and is always far larger. Lets LIST skip
+/// tombstones from the listing metadata alone.
+const TOMBSTONE_MAX_SIZE: u64 = 64;
+
+/// Decoded records kept by (key, etag) so repeated listings do not re-GET
+/// unchanged entries.
+const ENTRY_CACHE_MAX: usize = 100_000;
+
+/// Bounded map key -> (etag, decoded record or None for a tombstone); oldest
+/// insertions are evicted first.
+#[derive(Default)]
+struct EntryCache {
+    map: HashMap<String, (String, Option<IndexEntry>)>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl EntryCache {
+    fn get(&self, key: &str, etag: &str) -> Option<Option<IndexEntry>> {
+        self.map.get(key).filter(|(t, _)| t == etag).map(|(_, e)| e.clone())
+    }
+    fn put(&mut self, key: String, etag: String, e: Option<IndexEntry>) {
+        if self.map.insert(key.clone(), (etag, e)).is_none() {
+            self.order.push_back(key);
+            while self.order.len() > ENTRY_CACHE_MAX {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+    }
+}
+
 /// Pointer-record index on any `object_store` backend with conditional
 /// writes (S3/R2/MinIO, or `InMemory` in tests). Safe for many gateways.
 pub struct ObjectIndexStore {
     store: Arc<dyn ObjectStore>,
-    prefix: Vec<PathPart<'static>>,
+    /// Native paginated LIST (S3: ListObjectsV2 with prefix / delimiter /
+    /// start-after / max-keys). Without it (e.g. `InMemory`) a page is cut
+    /// from a listing of the prefix's directory.
+    pager: Option<Arc<dyn PaginatedListStore>>,
+    /// Key prefix: empty or ends with `/`.
+    prefix: String,
     /// Concurrent record GETs during LIST.
     list_concurrency: usize,
+    cache: std::sync::Mutex<EntryCache>,
 }
 
 impl ObjectIndexStore {
     pub fn new(cfg: &S3Config) -> Result<Self> {
-        Ok(Self::with_store(Arc::new(cfg.build()?), &cfg.prefix_or("index/")))
+        let s3 = Arc::new(cfg.build()?);
+        Ok(Self::with_paginated(s3.clone(), Some(s3), &cfg.prefix_or("index/")))
     }
 
     pub fn with_store(store: Arc<dyn ObjectStore>, prefix: &str) -> Self {
-        Self { store, prefix: prefix_parts(prefix), list_concurrency: 32 }
+        Self::with_paginated(store, None, prefix)
     }
 
-    /// `{prefix}/{ns}/{escaped path segments}`.
-    pub fn key(&self, ns: &str, path: &str) -> OPath {
-        let mut parts = self.prefix.clone();
-        parts.push(PathPart::from(ns.to_string()));
-        parts.extend(path.split('/').map(|s| PathPart::from(s.to_string())));
-        OPath::from_iter(parts)
+    pub fn with_paginated(store: Arc<dyn ObjectStore>, pager: Option<Arc<dyn PaginatedListStore>>, prefix: &str) -> Self {
+        let p = OPath::from_iter(prefix_parts(prefix)).to_string();
+        let prefix = if p.is_empty() { p } else { format!("{p}/") };
+        Self { store, pager, prefix, list_concurrency: 32, cache: Default::default() }
+    }
+
+    /// `{prefix}{ns}/` — every key of the namespace starts with this.
+    fn ns_base(&self, ns: &str) -> String {
+        format!("{}{ns}/", self.prefix)
+    }
+
+    /// `{prefix}{ns}/{path}`, the path verbatim (valid NEAR Drive paths are
+    /// valid object keys), so key order is path order and S3 prefix /
+    /// delimiter listing works on paths directly.
+    pub fn key(&self, ns: &str, path: &str) -> Result<OPath> {
+        OPath::parse(format!("{}{path}", self.ns_base(ns))).with_context(|| format!("invalid index key for {ns}/{path}"))
     }
 
     async fn read(&self, key: &OPath) -> Result<Option<(Stored, UpdateVersion)>> {
@@ -287,6 +342,13 @@ impl ObjectIndexStore {
         let b = r.bytes().await?;
         let val: serde_json::Value = serde_json::from_slice(&b).context("corrupt index record")?;
         let stored = if val.get("tombstone").is_some() { Stored::Deleted } else { Stored::Live(serde_json::from_value(val)?) };
+        if let Some(t) = &v.e_tag {
+            let e = match &stored {
+                Stored::Live(r) => Some(r.clone()),
+                Stored::Deleted => None,
+            };
+            self.cache.lock().unwrap().put(key.to_string(), t.clone(), e);
+        }
         Ok(Some((stored, v)))
     }
 
@@ -306,6 +368,91 @@ impl ObjectIndexStore {
             }
             Err(e) => Err(CasError::Other(e.into())),
         }
+    }
+
+    /// One raw LIST page of keys (relative to the namespace) with their
+    /// metadata, plus common prefixes and the next cursor.
+    async fn raw_page(&self, ns: &str, prefix: &str, delimiter: Option<&str>, start_after: Option<&str>, limit: usize) -> Result<(Vec<Listed>, HashMap<String, ObjectMeta>, Option<String>)> {
+        let base = self.ns_base(ns);
+        let rel = |p: &OPath| p.as_ref().strip_prefix(base.as_str()).map(str::to_string);
+        let mut metas = HashMap::new();
+        let Some(pager) = &self.pager else {
+            // Emulated: list the prefix's deepest complete directory (from the
+            // cursor on) and cut one page out of it. O(directory) per page;
+            // only for stores without native paginated listing (tests).
+            let dir = match prefix.rfind('/') {
+                Some(i) => &prefix[..i],
+                None => "",
+            };
+            // A prefix that is no valid key prefix (e.g. `a//`) matches nothing.
+            let Ok(dir) = OPath::parse(format!("{base}{dir}")) else { return Ok((vec![], metas, None)) };
+            let offset = start_after.and_then(|sa| OPath::parse(format!("{base}{sa}")).ok());
+            let listing: Vec<ObjectMeta> = match &offset {
+                Some(o) => self.store.list_with_offset(Some(&dir), o).try_collect().await?,
+                None => self.store.list(Some(&dir)).try_collect().await?,
+            };
+            let mut keys = vec![];
+            for m in listing {
+                if let Some(k) = rel(&m.location) {
+                    keys.push(k.clone());
+                    metas.insert(k, m);
+                }
+            }
+            keys.sort();
+            let (items, next) = paginate(keys, prefix, delimiter, start_after, limit);
+            return Ok((items, metas, next));
+        };
+        let opts = PaginatedListOptions {
+            delimiter: delimiter.map(|d| d.to_string().into()),
+            max_keys: Some(limit),
+            // A common-prefix cursor must skip everything under it; S3's
+            // start-after is a plain key bound, so append the largest char.
+            offset: start_after.map(|sa| {
+                let mut o = format!("{base}{sa}");
+                if delimiter.is_some_and(|d| sa.ends_with(d)) {
+                    o.push(char::MAX);
+                }
+                o
+            }),
+            ..Default::default()
+        };
+        let r = pager.list_paginated(Some(&format!("{base}{prefix}")), opts).await?;
+        let mut items = vec![];
+        // The raw page's last item, before any filtering: the next cursor.
+        let mut raw_last: Option<String> = None;
+        let mut seen = |k: &str| {
+            if raw_last.as_deref().is_none_or(|l| l < k) {
+                raw_last = Some(k.to_string());
+            }
+        };
+        for m in r.result.objects {
+            if let Some(k) = rel(&m.location) {
+                seen(&k);
+                if k.starts_with(prefix) && !before_cursor(&k, start_after, delimiter) {
+                    items.push(Listed::Key(k.clone()));
+                    metas.insert(k, m);
+                }
+            }
+        }
+        for p in r.result.common_prefixes {
+            // `Path` drops a trailing `/`; S3 common prefixes end with the delimiter.
+            let Some(mut cp) = rel(&p) else { continue };
+            if let Some(d) = delimiter {
+                if !cp.ends_with(d) {
+                    cp.push_str(d);
+                }
+            }
+            seen(&cp);
+            if !before_cursor(&cp, start_after, delimiter) {
+                items.push(Listed::Prefix(cp));
+            }
+        }
+        let name = |l: &Listed| match l {
+            Listed::Key(k) | Listed::Prefix(k) => k.clone(),
+        };
+        items.sort_by_key(name);
+        let next = if r.page_token.is_some() { raw_last } else { None };
+        Ok((items, metas, next))
     }
 }
 
@@ -330,14 +477,14 @@ fn decode_part(s: &str) -> String {
 #[async_trait]
 impl IndexStore for ObjectIndexStore {
     async fn get(&self, ns: &str, path: &str) -> Result<Option<IndexEntry>> {
-        Ok(match self.read(&self.key(ns, path)).await? {
+        Ok(match self.read(&self.key(ns, path)?).await? {
             Some((Stored::Live(r), _)) => Some(r),
             _ => None,
         })
     }
 
     async fn cas_put(&self, rec: &IndexEntry) -> Result<(), CasError> {
-        let key = self.key(&rec.namespace, &rec.path);
+        let key = self.key(&rec.namespace, &rec.path)?;
         let body = serde_json::to_vec(rec).map_err(anyhow::Error::from)?;
         match self.read(&key).await? {
             None if rec.seq == 1 => self.put_cond(&key, body, PutMode::Create).await,
@@ -349,7 +496,7 @@ impl IndexStore for ObjectIndexStore {
     }
 
     async fn delete(&self, ns: &str, path: &str, expected_seq: u64) -> Result<(), CasError> {
-        let key = self.key(ns, path);
+        let key = self.key(ns, path)?;
         match self.read(&key).await? {
             Some((Stored::Live(cur), v)) if cur.seq == expected_seq => {
                 let body = serde_json::to_vec(&Tombstone { tombstone: true, seq: cur.seq }).map_err(anyhow::Error::from)?;
@@ -360,45 +507,47 @@ impl IndexStore for ObjectIndexStore {
         }
     }
 
-    async fn list(&self, ns: &str, prefix: &str) -> Result<Vec<IndexEntry>> {
-        // List the deepest complete "directory" of the prefix, filter the rest.
-        let dir = match prefix.rfind('/') {
-            Some(i) => &prefix[..i],
-            None => "",
-        };
-        let mut base = self.prefix.clone();
-        base.push(PathPart::from(ns.to_string()));
-        base.extend(dir.split('/').filter(|s| !s.is_empty()).map(|s| PathPart::from(s.to_string())));
-        let base_path = OPath::from_iter(base);
-        let skip = self.prefix.len() + 1;
-        let metas: Vec<_> = self.store.list(Some(&base_path)).try_collect().await?;
-        let keys: Vec<OPath> = metas
-            .into_iter()
-            .map(|m| m.location)
-            .filter(|loc| {
-                let p: Vec<String> = loc.parts().skip(skip).map(|p| decode_part(p.as_ref())).collect();
-                p.join("/").starts_with(prefix)
+    /// One native LIST request (S3), then GETs only for this page's records
+    /// that are neither tombstones (recognised by size) nor already cached
+    /// under their current etag.
+    async fn list_page(&self, ns: &str, prefix: &str, delimiter: Option<&str>, start_after: Option<&str>, limit: usize) -> Result<ListPage> {
+        let delimiter = delimiter.filter(|d| !d.is_empty());
+        let (items, metas, next_cursor) = self.raw_page(ns, prefix, delimiter, start_after, limit.clamp(1, crate::store::MAX_LIST_LIMIT)).await?;
+        let mut page = ListPage { next_cursor, ..Default::default() };
+        let mut keys = vec![];
+        for it in items {
+            match it {
+                Listed::Prefix(p) => page.common_prefixes.push(p),
+                Listed::Key(k) => {
+                    let m = &metas[&k];
+                    if m.size >= TOMBSTONE_MAX_SIZE {
+                        keys.push((m.location.clone(), m.e_tag.clone()));
+                    }
+                }
+            }
+        }
+        let fetched: Vec<Option<IndexEntry>> = futures_util::stream::iter(keys)
+            .map(|(k, tag)| {
+                async move {
+                    if let Some(hit) = tag.and_then(|t| self.cache.lock().unwrap().get(k.as_ref(), &t)) {
+                        return Ok(hit);
+                    }
+                    Ok::<_, anyhow::Error>(match self.read(&k).await? {
+                        Some((Stored::Live(r), _)) => Some(r),
+                        _ => None,
+                    })
+                }
             })
-            .collect();
-        let mut out: Vec<IndexEntry> = futures_util::stream::iter(keys)
-            .map(|k| async move { self.read(&k).await })
-            .buffer_unordered(self.list_concurrency)
-            .try_filter_map(|r| async move {
-                Ok(match r {
-                    Some((Stored::Live(rec), _)) => Some(rec),
-                    _ => None,
-                })
-            })
+            .buffered(self.list_concurrency)
             .try_collect()
             .await?;
-        out.retain(|r| r.namespace == ns && r.path.starts_with(prefix));
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(out)
+        page.entries = fetched.into_iter().flatten().filter(|r| r.namespace == ns && r.path.starts_with(prefix)).collect();
+        Ok(page)
     }
 
     /// The first-level "directories" under the index prefix.
     async fn namespaces(&self) -> Result<Vec<String>> {
-        let base = OPath::from_iter(self.prefix.clone());
+        let base = OPath::parse(&self.prefix)?;
         let r = self.store.list_with_delimiter(Some(&base)).await?;
         let mut out: Vec<String> = r.common_prefixes.iter().filter_map(|p| p.parts().next_back().map(|p| decode_part(p.as_ref()))).collect();
         out.sort();
@@ -409,6 +558,7 @@ impl IndexStore for ObjectIndexStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::list_all;
     use ed25519_dalek::SigningKey;
     use object_store::memory::InMemory;
 
@@ -433,19 +583,116 @@ mod tests {
         for p in ["a/bc%20d", "a/b[1]#?", "a/b c/ü*x", "ab", "a/b~"] {
             idx.cas_put(&rec(p, 1, &sk)).await.unwrap();
         }
-        let ls: Vec<_> = idx.list("alice.near", "a/b").await.unwrap().into_iter().map(|r| r.record.path).collect();
+        let ls: Vec<_> = list_all(&idx, "alice.near", "a/b").await.unwrap().into_iter().map(|r| r.record.path).collect();
         assert_eq!(ls, vec!["a/b", "a/b c/ü*x", "a/b[1]#?", "a/bc%20d", "a/b~"]);
-        assert_eq!(idx.list("alice.near", "a").await.unwrap().len(), 6);
-        assert_eq!(idx.list("alice.near", "a/b c/").await.unwrap().len(), 1);
-        assert!(idx.list("bob.near", "").await.unwrap().is_empty());
+        assert_eq!(list_all(&idx, "alice.near", "a").await.unwrap().len(), 6);
+        assert_eq!(list_all(&idx, "alice.near", "a/b c/").await.unwrap().len(), 1);
+        assert!(list_all(&idx, "bob.near", "").await.unwrap().is_empty());
         // delete is CAS; tombstone hides the record; recreate restarts at seq 1
         assert!(matches!(idx.delete("alice.near", "a/b", 1).await, Err(CasError::Conflict { current: 2 })));
         idx.delete("alice.near", "a/b", 2).await.unwrap();
         assert!(idx.get("alice.near", "a/b").await.unwrap().is_none());
-        assert_eq!(idx.list("alice.near", "a/b").await.unwrap().len(), 4);
+        assert_eq!(list_all(&idx, "alice.near", "a/b").await.unwrap().len(), 4);
         assert!(matches!(idx.cas_put(&rec("a/b", 3, &sk)).await, Err(CasError::Conflict { current: 0 })));
         idx.cas_put(&rec("a/b", 1, &sk)).await.unwrap();
         assert_eq!(idx.get("alice.near", "a/b").await.unwrap().unwrap().seq, 1);
+    }
+
+    /// S3 ListObjectsV2 semantics over `InMemory`, to exercise the native
+    /// paginated path without a real bucket.
+    struct MemPager(Arc<InMemory>);
+
+    #[async_trait]
+    impl PaginatedListStore for MemPager {
+        async fn list_paginated(&self, prefix: Option<&str>, opts: PaginatedListOptions) -> object_store::Result<object_store::list::PaginatedListResult> {
+            let prefix = prefix.unwrap_or("");
+            let mut keys: Vec<ObjectMeta> = self.0.list(None).try_collect().await?;
+            keys.sort_by(|a, b| a.location.as_ref().cmp(b.location.as_ref()));
+            let mut res = object_store::ListResult { common_prefixes: vec![], objects: vec![] };
+            let (mut n, mut last_cp, mut truncated) = (0, None::<String>, false);
+            for m in keys {
+                let k = m.location.as_ref().to_string();
+                if !k.starts_with(prefix) || opts.offset.as_deref().is_some_and(|o| k.as_str() <= o) {
+                    continue;
+                }
+                let cp = opts.delimiter.as_deref().and_then(|d| k[prefix.len()..].find(d).map(|i| k[..prefix.len() + i + d.len()].to_string()));
+                if cp.is_some() && cp == last_cp {
+                    continue;
+                }
+                if n == opts.max_keys.unwrap_or(1000) {
+                    truncated = true;
+                    break;
+                }
+                n += 1;
+                match cp {
+                    Some(cp) => {
+                        res.common_prefixes.push(OPath::parse(&cp).unwrap());
+                        last_cp = Some(cp);
+                    }
+                    None => res.objects.push(m),
+                }
+            }
+            Ok(object_store::list::PaginatedListResult { result: res, page_token: truncated.then(|| "t".to_string()) })
+        }
+    }
+
+    async fn pages(idx: &ObjectIndexStore, prefix: &str, delimiter: Option<&str>, limit: usize) -> (Vec<String>, Vec<String>, usize) {
+        let (mut paths, mut cps, mut n, mut cursor) = (vec![], vec![], 0, None::<String>);
+        loop {
+            let p = idx.list_page("alice.near", prefix, delimiter, cursor.as_deref(), limit).await.unwrap();
+            assert!(p.entries.len() + p.common_prefixes.len() <= limit);
+            n += 1;
+            paths.extend(p.entries.into_iter().map(|e| e.record.path));
+            cps.extend(p.common_prefixes);
+            match p.next_cursor {
+                None => return (paths, cps, n),
+                c => cursor = c,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn index_pagination_native_and_emulated() {
+        let mem = Arc::new(InMemory::new());
+        let sk = SigningKey::from_bytes(&[1; 32]);
+        let native = ObjectIndexStore::with_paginated(mem.clone(), Some(Arc::new(MemPager(mem.clone()))), "index/");
+        let emulated = ObjectIndexStore::with_store(mem.clone(), "index/");
+        let mut all = vec![];
+        for d in 0..5 {
+            for f in 0..7 {
+                all.push(format!("d{d}/f{f}"));
+            }
+        }
+        all.extend(["d1x", "d1/sub/a", "d1/sub/b", "top", "t[1]", "t~ü"].map(String::from));
+        for p in &all {
+            native.cas_put(&rec(p, 1, &sk)).await.unwrap();
+        }
+        // deleted entries are skipped without a GET, pages still advance
+        for p in ["d0/f0", "d0/f1", "d0/f2", "d3/f6"] {
+            native.delete("alice.near", p, 1).await.unwrap();
+            all.retain(|x| x != p);
+        }
+        all.sort();
+        for idx in [&native, &emulated] {
+            let (paths, cps, n) = pages(idx, "", None, 4).await;
+            assert_eq!(paths, all);
+            assert!(n >= all.len() / 4, "paged");
+            let (paths, cps2, _) = pages(idx, "d1", None, 3).await;
+            assert_eq!(paths, all.iter().filter(|p| p.starts_with("d1")).cloned().collect::<Vec<_>>(), "raw string prefix");
+            assert!(cps.is_empty() && cps2.is_empty());
+            let (paths, cps, _) = pages(idx, "", Some("/"), 2).await;
+            assert_eq!(paths, vec!["d1x", "t[1]", "top", "t~ü"]);
+            assert_eq!(cps, vec!["d0/", "d1/", "d2/", "d3/", "d4/"]);
+            let (paths, cps, _) = pages(idx, "d1/", Some("/"), 1).await;
+            assert_eq!(paths.len(), 7);
+            assert_eq!(cps, vec!["d1/sub/"]);
+            let p = idx.list_page("alice.near", "", Some("/"), Some("d1/"), 2).await.unwrap();
+            assert_eq!(p.entries.iter().map(|e| e.record.path.as_str()).collect::<Vec<_>>(), vec!["d1x"], "a common-prefix cursor skips its subtree");
+            assert_eq!(p.common_prefixes, vec!["d2/"]);
+        }
+        // repeated listings are served from the (key, etag) cache
+        let n = native.cache.lock().unwrap().map.len();
+        assert!(n >= all.len(), "{n}");
     }
 
     #[tokio::test]
@@ -520,7 +767,7 @@ mod tests {
         // a namespace whose records are all tombstones is listed but empty
         idx.delete("alice.near", "a/b", 1).await.unwrap();
         assert_eq!(idx.namespaces().await.unwrap().len(), 2);
-        assert!(idx.list("alice.near", "").await.unwrap().is_empty());
+        assert!(list_all(&idx, "alice.near", "").await.unwrap().is_empty());
     }
 
     #[test]

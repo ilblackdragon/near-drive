@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 // Minimal `near-drive`-compatible CLI on top of the TS SDK (same env vars and key files).
 // Used by testvectors/interop.sh. Usage: node scripts/drive-ts.mjs <cmd> [args]   (after `npm run build`)
+// Reads check record writers against drive.near via NEAR_DRIVE_RPC_URL (+ NEAR_DRIVE_CONTRACT, default
+// drive.near); NEAR_DRIVE_INSECURE_SKIP_WRITER_CHECK=1 disables that (local dev gateways / interop tests only).
 //   whoami | put <src|-> <uri> [--public] [--content-type T] [--share x25519:..]... | get <uri> [dst] | ls <uri> | rm <uri> | share <uri> <recipient>
 import { readFileSync, writeFileSync } from "node:fs";
+import { WriterCheck } from "../dist/index.js";
 import { clientFromFiles, defaultCredentialsPath, defaultRootKeyPath } from "../dist/node.js";
 
 const env = process.env;
@@ -25,12 +28,16 @@ const c = await clientFromFiles({
   gateway: env.NEAR_DRIVE_GATEWAY ?? "http://127.0.0.1:8787",
   credentials: env.NEAR_DRIVE_CREDENTIALS ?? defaultCredentialsPath(account, env.NEAR_DRIVE_NETWORK ?? env.NEAR_NETWORK ?? "mainnet"),
   rootKey: defaultRootKeyPath(account),
+  rpcUrl: env.NEAR_DRIVE_RPC_URL,
+  contractId: env.NEAR_DRIVE_CONTRACT,
+  writerCheck: env.NEAR_DRIVE_INSECURE_SKIP_WRITER_CHECK === "1" ? WriterCheck.insecureSkipWriterCheck() : undefined,
 });
 if (c.accountId !== account) throw new Error(`credentials are for ${c.accountId}, not ${account}`);
 switch (cmd) {
   case "whoami":
     console.log(`account: ${c.accountId}`);
     console.log(`x25519:  ${c.x25519Public() ?? "(no root key)"}`);
+    console.log(`sign:    ${c.signPublicKey() ?? "(no root key)"}`);
     break;
   case "put": {
     const data = pos[0] === "-" ? readFileSync(0) : readFileSync(pos[0]);

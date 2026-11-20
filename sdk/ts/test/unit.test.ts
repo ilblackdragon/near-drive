@@ -47,25 +47,34 @@ describe("crypto", () => {
   });
 });
 
-import { cid, manifestCid, NearUri, recordSigningBytes, sign, verifyHead, publicKeyOf, type Manifest, type PointerRecord } from "../src/index.js";
+import { cid, manifestCid, NearUri, recordSigningBytes, sign, verifyHead, publicKeyOf, WriterCheck, type Manifest, type PointerRecord } from "../src/index.js";
 
 describe("verifyHead (untrusted gateway responses)", () => {
   const seed = new Uint8Array(32).fill(7);
   const uri = NearUri.parse("near://alice.near/a/b");
   const manifest: Manifest = { version: 1, size: 3, chunk_size: 8, chunks: [{ cid: cid(new TextEncoder().encode("abc")), len: 3 }] };
+  const trusted = WriterCheck.trusted({ "alice.near": [publicKeyOf(seed)] });
   const mk = (m: Manifest, over: Partial<PointerRecord> = {}): PointerRecord => {
     const u = { namespace: "alice.near", path: "a/b", manifest_cid: manifestCid(m), size: m.size, stored_size: 100, seq: 1, writer: "alice.near", writer_pk: publicKeyOf(seed), ts_ms: 1, ...over };
     return { ...u, sig: sign(seed, recordSigningBytes(u)) };
   };
-  it("accepts a consistent head", () => verifyHead(uri, { record: mk(manifest), manifest }));
-  it("rejects a record for another path", () => expect(() => verifyHead(uri, { record: mk(manifest, { path: "a/c" }), manifest })).toThrow(/different object/));
-  it("rejects a forged signature", () => expect(() => verifyHead(uri, { record: { ...mk(manifest), seq: 2 }, manifest })).toThrow(/signature/));
+  it("accepts a consistent head", () => verifyHead(uri, { record: mk(manifest), manifest }, trusted));
+  it("rejects a record for another path", () => expect(verifyHead(uri, { record: mk(manifest, { path: "a/c" }), manifest }, trusted)).rejects.toThrow(/different object/));
+  it("rejects a forged signature", () => expect(verifyHead(uri, { record: { ...mk(manifest), seq: 2 }, manifest }, trusted)).rejects.toThrow(/signature/));
   it("rejects a swapped manifest", () => {
     const other = { ...manifest, content_type: "x" };
-    expect(() => verifyHead(uri, { record: mk(manifest), manifest: other })).toThrow(/manifest does not match/);
+    return expect(verifyHead(uri, { record: mk(manifest), manifest: other }, trusted)).rejects.toThrow(/manifest does not match/);
   });
   it("rejects inconsistent sizes", () => {
     const m = { ...manifest, size: 4 };
-    expect(() => verifyHead(uri, { record: mk(m), manifest: m })).toThrow(/do not add up/);
+    return expect(verifyHead(uri, { record: mk(m), manifest: m }, trusted)).rejects.toThrow(/do not add up/);
   });
+  it("rejects a self-signed record by a key the writer never published", () => {
+    const evil = new Uint8Array(32).fill(9);
+    const u = { namespace: "alice.near", path: "a/b", manifest_cid: manifestCid(manifest), size: 3, stored_size: 100, seq: 1, writer: "alice.near", writer_pk: publicKeyOf(evil), ts_ms: 1 };
+    const record = { ...u, sig: sign(evil, recordSigningBytes(u)) };
+    return expect(verifyHead(uri, { record, manifest }, trusted)).rejects.toThrow(/not a signing key of alice.near/);
+  });
+  it("requires a writer check", () => expect(verifyHead(uri, { record: mk(manifest), manifest }, undefined)).rejects.toThrow(/writerCheck/));
+  it("insecure skip accepts any self-signed writer", () => verifyHead(uri, { record: mk(manifest), manifest }, WriterCheck.insecureSkipWriterCheck()));
 });

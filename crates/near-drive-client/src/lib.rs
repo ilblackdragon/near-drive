@@ -1,5 +1,6 @@
 //! Rust SDK for NEAR Drive. Does chunking, client-side encryption and request
-//! signing; verifies everything it reads (record signature, manifest and
+//! signing; verifies everything it reads (record signature, that the record's
+//! writer published its signing key and may write the path, manifest and
 //! chunk content ids, AEAD).
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use ed25519_dalek::SigningKey;
@@ -22,7 +23,9 @@ mod chain;
 mod large;
 mod net;
 mod resume;
-pub use chain::discover_gateway;
+mod writer;
+pub use chain::{check_published_keys, discover_gateway, PublishedKeys};
+pub use writer::{TrustedWriters, WriterCheck, WRITER_CACHE_MAX, WRITER_CACHE_TTL};
 pub use large::{Located, LocatedChunk, ObjectWriter};
 pub use net::NetConfig;
 use net::{ok_or_attempt, reject, transport, with_retries, Attempt};
@@ -65,6 +68,18 @@ pub struct ListEntry {
     pub manifest_cid: Option<String>,
 }
 
+/// One page of `GET /v1/list` ([`Client::list_page`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListPage {
+    pub entries: Vec<ListEntry>,
+    /// Rolled-up prefixes (with a delimiter), each ending with it.
+    #[serde(default)]
+    pub common_prefixes: Vec<String>,
+    /// Pass back as `cursor` for the next page; `None` at the end.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
 /// Non-2xx answer from the gateway. `Display` keeps the historical
 /// "gateway returned {status}: {body}" text; callers can downcast
 /// (`err.downcast_ref::<GatewayError>()`) to get the status code.
@@ -88,9 +103,13 @@ pub struct PutOptions {
     /// Store plaintext (for public data such as open model weights).
     pub public: bool,
     pub content_type: Option<String>,
-    /// Extra recipients (`x25519:<base58>` keys) who can decrypt. Lets an app
-    /// write data only the user can read: no owner root key + `share_with`.
+    /// Extra recipients (`x25519:<base58>` keys) who can decrypt. With
+    /// `skip_owner_key`, lets an app write data only the user can read.
     pub share_with: Vec<String>,
+    /// Don't wrap the object key to this client's own root key: only the
+    /// `share_with` recipients can decrypt (an app writing for a user). The
+    /// root key is still needed, since it signs the record.
+    pub skip_owner_key: bool,
     /// Storage class for the chunks (`hot`, `bulk`, ...); None = gateway default.
     pub class: Option<String>,
     /// [`Client::put_file`] keeps a journal here so an interrupted upload of the
@@ -128,6 +147,8 @@ pub struct Client {
     pub parallelism: usize,
     /// `drive.near` access for sharing-by-account and policy grants.
     chain: Option<near_drive_chain::StorageContract>,
+    /// Who may have written what is read (see [`WriterCheck`]).
+    writers: writer::WriterVerifier,
     net: NetConfig,
 }
 
@@ -161,6 +182,10 @@ pub fn encode_path(p: &str) -> String {
 }
 
 impl Client {
+    /// `sk` signs requests (a NEAR access key of `account`); records are
+    /// signed with `root`'s derived signing key, so writing needs `root`.
+    /// Reads need a [`WriterCheck`]: [`Client::with_chain`] sets one, or see
+    /// [`Client::with_writer_check`].
     pub fn new(gateway: impl Into<String>, account: impl Into<String>, sk: SigningKey, root: Option<RootKey>) -> Self {
         let net = NetConfig::default();
         Self {
@@ -173,7 +198,52 @@ impl Client {
             chunk_size: DEFAULT_CHUNK_SIZE,
             parallelism: DEFAULT_PARALLELISM,
             chain: None,
+            writers: Default::default(),
         }
+    }
+
+    /// How records' writers are checked on every read (replaces the default
+    /// [`WriterCheck::Chain`] that [`Client::with_chain`] sets).
+    pub fn with_writer_check(mut self, check: WriterCheck) -> Self {
+        self.writers.set(check);
+        self
+    }
+
+    /// Accept records without checking who wrote them. A gateway can then
+    /// forge any record (signed with its own key, claiming any writer). For
+    /// tests only.
+    pub fn insecure_skip_writer_check(self) -> Self {
+        self.with_writer_check(WriterCheck::InsecureSkip)
+    }
+
+    /// Who can decrypt a new object written with `opts`.
+    fn recipients(&self, opts: &PutOptions) -> Result<Vec<crypto::Recipient<'_>>> {
+        let mut rs = Vec::new();
+        if let (Some(root), false) = (&self.root, opts.skip_owner_key) {
+            rs.push(crypto::Recipient::Owner(root));
+        }
+        for k in &opts.share_with {
+            rs.push(crypto::Recipient::X25519(crypto::parse_x25519(k)?));
+        }
+        ensure!(!rs.is_empty(), "nobody could decrypt this object: no root key loaded (run `near drive keygen`) or skip_owner_key without share_with recipients; or use --public");
+        Ok(rs)
+    }
+
+    /// The key that signs this client's records (needs the root key).
+    fn record_key(&self) -> Result<SigningKey> {
+        Ok(self.root.as_ref().ok_or_else(|| anyhow!("writing requires the root key (it signs records); run `near drive keygen`"))?.signing_key())
+    }
+
+    /// This account's record-signing public key (`ed25519:<base58>`), if the root key is loaded.
+    pub fn sign_public_key(&self) -> Option<String> {
+        self.root.as_ref().map(RootKey::sign_public_key)
+    }
+
+    /// Full read-side check of a head from the gateway: [`verify_head`] plus
+    /// the writer check.
+    pub(crate) async fn verify_read(&self, uri: &NearUri, head: &ObjectHead) -> Result<()> {
+        verify_head(uri, head)?;
+        self.writers.verify(&head.record).await.with_context(|| format!("rejecting {uri} from the gateway"))
     }
 
     fn next_ts(&self) -> u64 {
@@ -258,27 +328,28 @@ impl Client {
         .await
     }
 
+    /// Current version of `uri`, verified (signature, writer, manifest).
     pub async fn head(&self, uri: &NearUri) -> Result<Option<ObjectHead>> {
         let Some(head): Option<ObjectHead> = self.get_json("head", &Self::obj_path(uri), "").await? else { return Ok(None) };
-        verify_head(uri, &head)?;
+        self.verify_read(uri, &head).await?;
         Ok(Some(head))
+    }
+
+    /// Current seq per the gateway, unverified: only the gateway's CAS uses
+    /// it, so a wrong answer can only make a write fail.
+    async fn current_seq(&self, uri: &NearUri) -> Result<u64> {
+        let head: Option<ObjectHead> = self.get_json("head", &Self::obj_path(uri), "").await?;
+        Ok(head.map_or(0, |h| h.record.seq))
     }
 
     /// Upload `data` to `uri`. Retries once on a concurrent-write conflict.
     pub async fn put(&self, uri: &NearUri, data: &[u8], opts: &PutOptions) -> Result<PointerRecord> {
         NearUri::object(&uri.namespace, &uri.path)?;
+        self.record_key()?;
         let (chunks, enc) = if opts.public {
             (crypto::plaintext_chunks(data, self.chunk_size)?, None)
         } else {
-            let mut rs = Vec::new();
-            if let Some(root) = &self.root {
-                rs.push(crypto::Recipient::Owner(root));
-            }
-            for k in &opts.share_with {
-                rs.push(crypto::Recipient::X25519(crypto::parse_x25519(k)?));
-            }
-            ensure!(!rs.is_empty(), "no root key loaded and no share_with recipients; run `near drive keygen` or use --public");
-            let (c, e) = crypto::encrypt_for(&rs, data, self.chunk_size)?;
+            let (c, e) = crypto::encrypt_for(&self.recipients(opts)?, data, self.chunk_size)?;
             (c, Some(e))
         };
         use futures_util::{StreamExt, TryStreamExt};
@@ -307,28 +378,31 @@ impl Client {
     /// head, and if that head is this manifest by this key, the write succeeded.
     /// A conflict with someone else's write is retried once with the new seq.
     async fn commit_manifest(&self, uri: &NearUri, manifest: &Manifest, class: Option<&str>, expect_seq: Option<u64>) -> Result<PointerRecord> {
+        let rkey = self.record_key()?;
         let mbytes = manifest.to_bytes();
         let stored = manifest.stored_size() + mbytes.len() as u64;
         let (mref, mut prev) = match expect_seq {
             Some(s) => (self.put_chunk(&uri.namespace, mbytes, class).await?, s),
             None => {
                 // Independent: upload the manifest chunk while reading the current seq.
-                let (mref, head) = tokio::join!(self.put_chunk(&uri.namespace, mbytes, class), self.head(uri));
-                (mref?, head?.map(|h| h.record.seq).unwrap_or(0))
+                let (mref, seq) = tokio::join!(self.put_chunk(&uri.namespace, mbytes, class), self.current_seq(uri));
+                (mref?, seq?)
             }
         };
-        let my_pk = near_drive_core::keys::format_public_key(&self.sk.verifying_key());
+        let my_pk = near_drive_core::keys::format_public_key(&rkey.verifying_key());
         let mut maybe_landed = false;
         let mut conflicts = 0;
         let mut attempt = 0;
         loop {
-            let rec = PointerRecord::new_signed(&uri.namespace, &uri.path, &mref.cid, manifest.size, stored, prev + 1, &self.account, &self.sk, now_ms());
+            let rec = PointerRecord::new_signed(&uri.namespace, &uri.path, &mref.cid, manifest.size, stored, prev + 1, &self.account, &rkey, now_ms());
             // Same class header as the chunks: the gateway records it in the index.
             let r = self.send_with(Method::PUT, &Self::obj_path(uri), "", serde_json::to_vec(&rec)?.into(), class, 0).await;
             let wait = match r {
                 Ok(resp) if resp.status().is_success() => return Ok(rec),
                 Ok(resp) if resp.status() == StatusCode::CONFLICT => {
-                    let cur = self.head(uri).await?;
+                    // Unverified is enough: it only decides between "ours
+                    // landed" and retrying the CAS.
+                    let cur: Option<ObjectHead> = self.get_json("head", &Self::obj_path(uri), "").await?;
                     if let Some(h) = &cur {
                         if maybe_landed && h.record.manifest_cid == mref.cid && h.record.writer_pk == my_pk && h.record.seq == prev + 1 {
                             return Ok(h.record.clone());
@@ -433,8 +507,39 @@ impl Client {
         }
     }
 
+    /// Every readable object whose path starts with `prefix.path` (a raw
+    /// string prefix), sorted by path: [`Client::list_page`] until the end.
     pub async fn list(&self, prefix: &NearUri) -> Result<Vec<ListEntry>> {
-        let q = format!("prefix={}", encode_path(&prefix.path));
+        let mut out = vec![];
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self.list_page(prefix, None, cursor.as_deref(), None).await?;
+            out.extend(page.entries);
+            match page.next_cursor {
+                Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
+                Some(_) => return Err(anyhow!("gateway listing of {prefix} did not advance")),
+                None => return Ok(out),
+            }
+        }
+    }
+
+    /// One page of the listing under `prefix.path`. With a `delimiter`
+    /// (normally `/`), deeper paths are rolled up into `common_prefixes`.
+    /// `cursor` is the previous page's `next_cursor`; `limit` defaults to and
+    /// is capped at 1000 by the gateway. Pages may hold fewer items than the
+    /// limit (entries the caller cannot read are dropped) — keep going while
+    /// `next_cursor` is set.
+    pub async fn list_page(&self, prefix: &NearUri, delimiter: Option<&str>, cursor: Option<&str>, limit: Option<usize>) -> Result<ListPage> {
+        let mut q = format!("prefix={}", encode_path(&prefix.path));
+        if let Some(d) = delimiter {
+            q.push_str(&format!("&delimiter={}", encode_path(d)));
+        }
+        if let Some(c) = cursor {
+            q.push_str(&format!("&cursor={}", encode_path(c)));
+        }
+        if let Some(l) = limit {
+            q.push_str(&format!("&limit={l}"));
+        }
         Ok(self.get_json("list", &format!("/v1/list/{}", prefix.namespace), &q).await?.unwrap_or_default())
     }
 
@@ -474,7 +579,11 @@ impl Client {
     }
 }
 
-/// Client-side checks on what a (possibly untrusted) gateway returned.
+/// Client-side checks on what a (possibly untrusted) gateway returned that
+/// need no NEAR state: the record is for `uri`, its signature verifies with
+/// its `writer_pk`, and the manifest matches. Whether `writer_pk` belongs to
+/// the writer and the writer may write the path is the [`WriterCheck`] that
+/// [`Client::head`] / [`Client::locate`] also apply.
 pub fn verify_head(uri: &NearUri, head: &ObjectHead) -> Result<()> {
     let r = &head.record;
     ensure!(r.namespace == uri.namespace && r.path == uri.path, "gateway returned a record for a different object");

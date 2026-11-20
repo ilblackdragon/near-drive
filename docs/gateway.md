@@ -27,11 +27,12 @@ The config file can also be given as `NEAR_DRIVE_CONFIG=gateway.json`, or the wh
 |---|---|
 | `listen` | address to serve on (put it behind TLS) |
 | `data_dir` | local state: default chunk store and index, usage log, billing state |
-| `rpc_url` | NEAR RPC used to check that a request's public key belongs to the account (full-access, or a function-call key for `storage_contract`); without it only `dev_keys` work |
+| `rpc_url` | NEAR RPC used to check that a request's public key belongs to the account (full-access, or a function-call key for `storage_contract`), and that a written record is signed with the writer's latest published signing key (`get_sign_keys`, cached 60 s); without it only `dev_keys` work |
 | `storage_contract` | the NEAR Drive contract (`drive.near`) |
 | `contract_policies` | read access rules from the contract (`get_rules`, cached 30 s); default `true` |
 | `policies` | `account -> [rules]`, overriding the contract for those accounts (the only source without `rpc_url`) |
 | `dev_keys` | `account -> [public keys]` accepted without RPC (development and tests) |
+| `dev_sign_keys` | `account -> [record-signing keys]` accepted on writes besides the key published onchain (`set_sign_key`). Without `rpc_url`, a listed account must sign records with one of these and unlisted accounts are not checked (development and tests) |
 | `storage` | backends, storage classes, index, caches ([below](#storage-backends-classes-and-index)) |
 | `billing` | NEAR AI Cloud credits billing ([below](#billing-near-ai-cloud-credits)) |
 | `cors_origins` | browser origins allowed to call the gateway ([below](#browser-access-cors)) |
@@ -67,6 +68,12 @@ The optional `storage` section sets up the following.
   kept, so any number of gateways can share the configuration.
 
 **The index** can live on S3 / R2 / MinIO with conditional writes; then any number of gateways can share it.
+Each record is one object, `{prefix}{namespace}/{path}` with the path verbatim, so key order is path order. Listing a
+page (`GET /v1/list`) is one S3 ListObjectsV2 request (prefix, delimiter, start-after and max-keys passed through)
+plus a GET for each live record on that page that the gateway has not already cached under its current ETag (bounded
+in-memory cache, 100k records). Deleted paths leave a small tombstone object (S3 DELETE cannot be made conditional,
+so removing it could race a re-create); listings recognise tombstones by size and skip them without a GET. The `fs`
+index (default) scans the namespace directory's file names for each page but reads only that page's records.
 
 ```json
 "storage": {
@@ -132,6 +139,8 @@ by mark and sweep rather than per file:
   Never point two deployments with different indexes at the same backend (bucket + prefix or directory): each would
   collect the other's chunks.
 
+The mark phase walks each namespace one listing page (1000 records) at a time.
+
 Run it once (prints a JSON report with per-backend counts and bytes; exit code 1 if a backend had errors):
 
 ```sh
@@ -147,6 +156,32 @@ or periodically inside the server:
 
 GC is safe while gateways serve traffic. With several gateways sharing one index and backends, run it from one place
 (a cron job, or `gc` on a single gateway): concurrent runs do not corrupt anything but duplicate the work.
+
+## Listing API
+
+`GET /v1/list/{namespace}?prefix=&delimiter=&cursor=&limit=` (signed like every request) returns one page:
+
+```json
+{"entries": [{"path": "docs/a.txt", "size": 12, "seq": 1, "writer": "alice.near", "ts_ms": 1763000000000,
+              "manifest_cid": "b3:...", "class": "hot"}],
+ "common_prefixes": ["docs/sub/"],
+ "next_cursor": "docs/sub/"}
+```
+
+- `prefix` is a raw string prefix (`docs/a` matches `docs/a.txt` and `docs/ab/c`), not cut at `/`.
+- `delimiter` (normally `/`) rolls paths that contain it after the prefix up into `common_prefixes`, as in S3.
+- `limit` is 1..=1000, default 1000; it bounds entries plus common prefixes.
+- Entries the caller may not read are dropped after the page is fetched, and deleted paths are skipped, so a page can
+  hold fewer items than `limit` (even none) while `next_cursor` is still set. Keep requesting with
+  `cursor=<next_cursor>` until it is `null`.
+- A common prefix is shown when the namespace rules let the caller read something under it (the rules are checked,
+  not the objects under it).
+- The cursor is opaque to SDK users. Today it is the last path or common prefix the page examined, and any path works
+  as a start-after bound (a cursor ending in the delimiter skips everything under it); the S3 endpoint relies on
+  that to map S3 markers onto it.
+
+The SDKs expose `list_page` / `listPage` for one page and `list` for everything under a prefix; `near drive ls`
+lists recursively, `near drive ls --dir` one level (`delimiter=/`).
 
 ## Browser access (CORS)
 

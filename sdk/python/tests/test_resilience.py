@@ -46,6 +46,26 @@ def test_every_operation_survives_a_flaky_network(env):
     assert env.proxy.k > 40, "faults were actually injected"
 
 
+def test_list_pages_with_and_without_delimiter(env):
+    c = env.client(attempts=4, parallelism=2)
+    names = ["a", "b", "c", "d/1", "d/2", "e/1", "f"]
+    for n in names:
+        c.put(f"near://alice.near/ls/{n}", n.encode())
+    assert [e.path for e in c.list("near://alice.near/ls/")] == [f"ls/{n}" for n in names]
+    assert [e.path for e in c.list("near://alice.near/ls/d")] == ["ls/d/1", "ls/d/2"], "raw string prefix"
+    seen, pages, cursor = [], 0, None
+    while True:
+        pg = c.list_page("near://alice.near/ls/", delimiter="/", cursor=cursor, limit=2)
+        pages += 1
+        assert len(pg.entries) + len(pg.common_prefixes) <= 2
+        seen += [e.path for e in pg.entries] + pg.common_prefixes
+        if pg.next_cursor is None:
+            break
+        cursor = pg.next_cursor
+    assert sorted(seen) == ["ls/a", "ls/b", "ls/c", "ls/d/", "ls/e/", "ls/f"]
+    assert pages == 3
+
+
 def test_lost_commit_response_is_not_a_conflict(env):
     c = env.client(attempts=4, parallelism=1)
     u = "near://alice.near/lost.txt"
@@ -116,7 +136,7 @@ def test_interrupted_public_upload_resumes(env):
     with pytest.raises(TransferInterrupted):
         env.client(1, 1).put_file(env.path("f"), u, public=True, resume_dir=jdir)
     env.proxy.set("pass")
-    env.client(1, 1, root=False).put_file(env.path("f"), u, public=True, resume_dir=jdir)
+    env.client(1, 1).put_file(env.path("f"), u, public=True, resume_dir=jdir)
     assert env.proxy.chunk_puts == 16 - 3 + 1
     assert env.client(root=False).get(u) == data
 

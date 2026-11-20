@@ -14,7 +14,8 @@ use near_drive_core::{
     crypto::{self, EncInfo, Recipient, RootKey},
     keys,
     manifest::{ChunkRef, Manifest},
-    record::PointerRecord,
+    policy::Rule,
+    record::{PointerRecord, SignKeyEntry},
     uri::{validate_path, NearUri},
 };
 use serde_json::{json, Value};
@@ -39,6 +40,9 @@ fn root_json(r: &RootKey) -> Value {
         "kek_id": r.kek_id(),
         "x25519_secret": hex::encode(r.x25519_secret().to_bytes()),
         "x25519_public": r.x25519_public(),
+        // HKDF(root, "near-drive/v1/sign") = ed25519 seed of the record-signing key
+        "sign_seed": hex::encode(r.signing_key().to_bytes()),
+        "sign_public_key": r.sign_public_key(),
     })
 }
 
@@ -176,6 +180,59 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    // --- records signed with a root-derived signing key (what writers produce now) ---
+    let owner_root = root(0);
+    let signed_records: Vec<Value> = [("alice.near", "memory/today.txt", "alice.near", 6u64, 120u64, 1u64), ("app.near", "users/alice.near/ü x", "alice.near", 0, 300, 7)]
+        .iter()
+        .map(|(ns, path, writer, size, stored, seq)| {
+            let ts = 1_763_456_789_999u64;
+            let r = PointerRecord::new_signed(ns, path, &cid(path.as_bytes()), *size, *stored, *seq, writer, &owner_root.signing_key(), ts);
+            r.verify_signature().unwrap();
+            assert_eq!(r.writer_pk, owner_root.sign_public_key());
+            let signing = format!(
+                "near-drive-record-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                r.namespace, r.path, r.manifest_cid, r.size, r.stored_size, r.seq, r.writer, r.writer_pk, r.ts_ms
+            );
+            json!({"root": "owner", "record": r, "signing_string": signing, "json": serde_json::to_string(&r).unwrap()})
+        })
+        .collect();
+
+    // --- reader rule: key history window + namespace policy ---
+    let (ka, kb) = (root(0).sign_public_key(), root(100).sign_public_key());
+    let min = 60_000u64;
+    let t0 = 1_763_000_000_000u64;
+    let hist = vec![
+        SignKeyEntry { key: ka.clone(), since_ms: t0 },
+        SignKeyEntry { key: kb.clone(), since_ms: t0 + 60 * min },
+    ];
+    let app_rules: Vec<Rule> = serde_json::from_value(json!([
+        {"prefix": "users/{account}/", "read": ["{account}"], "write": ["{account}", "app.near"], "payer": "app.near"},
+        {"prefix": "public/", "read": ["*"], "write": []}
+    ]))?;
+    let wc_cases: Vec<(&str, &str, &str, &str, &String, u64)> = vec![
+        ("own namespace, first key", "alice.near", "a/b", "alice.near", &ka, t0 + min),
+        ("first key, 5 min before publication", "alice.near", "a/b", "alice.near", &ka, t0 - 5 * min),
+        ("first key, too early", "alice.near", "a/b", "alice.near", &ka, t0 - 5 * min - 1),
+        ("old key within 5 min after rotation", "alice.near", "a/b", "alice.near", &ka, t0 + 65 * min - 1),
+        ("old key after rotation window", "alice.near", "a/b", "alice.near", &ka, t0 + 65 * min),
+        ("new key", "alice.near", "a/b", "alice.near", &kb, t0 + 1000 * min),
+        ("new key before its window", "alice.near", "a/b", "alice.near", &kb, t0 + 55 * min - 1),
+        ("rule grants {account}", "app.near", "users/alice.near/x", "alice.near", &kb, t0 + 61 * min),
+        ("rule does not grant another user's folder", "app.near", "users/bob.near/x", "alice.near", &kb, t0 + 61 * min),
+        ("no rule matches: owner only", "app.near", "other/x", "alice.near", &kb, t0 + 61 * min),
+        ("public/ is not writable", "app.near", "public/x", "alice.near", &kb, t0 + 61 * min),
+    ];
+    let writer_checks: Vec<Value> = wc_cases
+        .into_iter()
+        .map(|(name, ns, path, writer, pk, ts)| {
+            let rules: &[Rule] = if ns == "app.near" { &app_rules } else { &[] };
+            let rec = PointerRecord { namespace: ns.into(), path: path.into(), manifest_cid: cid(b"m"), size: 0, stored_size: 0, seq: 1, writer: writer.into(), writer_pk: pk.clone(), ts_ms: ts, sig: String::new() };
+            let ok = rec.verify_writer(&hist, rules).is_ok();
+            json!({"name": name, "namespace": ns, "path": path, "writer": writer, "writer_pk": pk, "ts_ms": ts,
+                   "sign_keys": hist, "rules": rules, "accept": ok})
+        })
+        .collect();
+
     // --- manifest serialization (fixed values) ---
     let fixed_enc = EncInfo {
         alg: crypto::ALG.into(),
@@ -285,6 +342,8 @@ fn main() -> anyhow::Result<()> {
         "uri": {"valid": uri_valid, "invalid": uri_invalid, "object_invalid_paths": object_invalid, "encode_path": encode},
         "canonical_requests": canon,
         "records": records,
+        "signed_records": signed_records,
+        "writer_checks": writer_checks,
         "manifests": manifests,
         "objects": objects,
     });

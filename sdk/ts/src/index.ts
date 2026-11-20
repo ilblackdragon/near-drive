@@ -1,5 +1,5 @@
-export { CLASS_HEADER, Client, ConflictError, DEFAULT_CHUNK_SIZE, DEFAULT_PARALLELISM, GatewayError, keySigner, mapLimit, verifyHead } from "./client.js";
-export type { ClientOptions, ListEntry, Located, LocatedChunk, ObjectHead, PutOptions, Signer } from "./client.js";
+export { CLASS_HEADER, Client, ConflictError, DEFAULT_CHUNK_SIZE, DEFAULT_CONTRACT, DEFAULT_PARALLELISM, GatewayError, keySigner, mapLimit, verifyHead } from "./client.js";
+export type { ClientOptions, ListEntry, ListPage, ListPageOptions, Located, LocatedChunk, ObjectHead, PutOptions, Signer } from "./client.js";
 export { DEFAULT_NET, retryDelay, timeoutFor } from "./net.js";
 export type { NetConfig } from "./net.js";
 export { ALG, TAG_LEN, ChunkOpener, ChunkSealer, RootKey, addRecipient, chunkCount, chunkPlainLen, decryptObject, encryptFor, encryptObject, plaintextChunks } from "./crypto.js";
@@ -12,3 +12,7 @@ export { canonicalRequest } from "./auth.js";
 export { formatPublicKey, formatSecretKey, formatX25519, generateSecretKey, parsePublicKey, parseSecretKey, parseX25519, publicKeyOf, sign, verify } from "./keys.js";
 export { NearUri, UriError, encodePath, isValidAccountId, validateAccountId, validatePath } from "./uri.js";
 export { cid, isValidCid } from "./bytes.js";
+export { DEFAULT_CACHE_MAX_ENTRIES, DEFAULT_CACHE_TTL_MS, SIGN_KEY_SKEW_MS, StorageContract, WriterCheck, signKeyInForce } from "./chain.js";
+export type { ChainCheckOptions, SignKeyEntry, StorageContractOptions } from "./chain.js";
+export { normalizeRules, resolve as resolvePolicy } from "./policy.js";
+export type { Access, Rule } from "./policy.js";

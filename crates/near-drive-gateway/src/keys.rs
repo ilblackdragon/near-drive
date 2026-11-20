@@ -69,3 +69,66 @@ impl KeyResolver {
         Ok(ok)
     }
 }
+
+/// Whether a record's `writer_pk` is its writer's current signing key.
+///
+/// With an RPC: the latest entry of `get_sign_keys(writer)` in `drive.near`
+/// (cached [`SIGN_KEY_TTL`]; a mismatch against an older cache entry re-reads
+/// once, so a just-published key works). `dev_sign_keys` entries are accepted
+/// as well. Without an RPC (dev): an account listed in `dev_sign_keys` must
+/// use one of those keys; any key is accepted for an unlisted account.
+pub struct SignKeys {
+    dev: HashMap<String, Vec<String>>,
+    contract: Option<near_drive_chain::StorageContract>,
+    cache: Mutex<HashMap<String, (Option<String>, Instant)>>,
+}
+
+pub const SIGN_KEY_TTL: Duration = Duration::from_secs(60);
+const SIGN_KEY_RECHECK: Duration = Duration::from_secs(2);
+const SIGN_KEY_CACHE_MAX: usize = 4096;
+
+impl SignKeys {
+    pub fn new(dev: HashMap<String, Vec<String>>, contract: Option<near_drive_chain::StorageContract>) -> Self {
+        Self { dev, contract, cache: Mutex::new(HashMap::new()) }
+    }
+
+    async fn latest(&self, c: &near_drive_chain::StorageContract, account: &str, force: bool) -> Result<(Option<String>, Duration)> {
+        if !force {
+            if let Some((k, at)) = self.cache.lock().await.get(account) {
+                if at.elapsed() < SIGN_KEY_TTL {
+                    return Ok((k.clone(), at.elapsed()));
+                }
+            }
+        }
+        let latest = match c.get_sign_keys(account).await {
+            Ok(h) => h.last().map(|e| e.key.clone()),
+            Err(e) if e.downcast_ref::<near_drive_chain::NoContract>().is_some() => None,
+            Err(e) => return Err(e.context(format!("reading the signing keys of {account}"))),
+        };
+        let mut cache = self.cache.lock().await;
+        if cache.len() >= SIGN_KEY_CACHE_MAX {
+            cache.retain(|_, (_, at)| at.elapsed() < SIGN_KEY_TTL);
+            if cache.len() >= SIGN_KEY_CACHE_MAX {
+                cache.clear();
+            }
+        }
+        cache.insert(account.to_string(), (latest.clone(), Instant::now()));
+        Ok((latest, Duration::ZERO))
+    }
+
+    pub async fn is_current(&self, account: &str, key: &str) -> Result<bool> {
+        let listed = self.dev.get(account);
+        if listed.is_some_and(|ks| ks.iter().any(|k| k == key)) {
+            return Ok(true);
+        }
+        let Some(c) = &self.contract else { return Ok(listed.is_none()) };
+        let (latest, age) = self.latest(c, account, false).await?;
+        if latest.as_deref() == Some(key) {
+            return Ok(true);
+        }
+        if age < SIGN_KEY_RECHECK {
+            return Ok(false);
+        }
+        Ok(self.latest(c, account, true).await?.0.as_deref() == Some(key))
+    }
+}
