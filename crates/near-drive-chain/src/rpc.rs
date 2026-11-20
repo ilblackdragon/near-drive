@@ -25,7 +25,9 @@ pub fn default_rpc_url(network: &str) -> Option<&'static str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyPermission {
     FullAccess,
-    FunctionCall { receiver_id: String },
+    FunctionCall {
+        receiver_id: String,
+    },
     /// Gas keys and future kinds.
     Other,
 }
@@ -51,7 +53,10 @@ pub struct Signer {
 
 impl Signer {
     pub fn new(account_id: impl Into<String>, sk: SigningKey) -> Self {
-        Self { account_id: account_id.into(), sk }
+        Self {
+            account_id: account_id.into(),
+            sk,
+        }
     }
 
     pub fn public_key(&self) -> String {
@@ -90,7 +95,11 @@ pub struct NearRpc {
 
 impl NearRpc {
     pub fn new(url: impl Into<String>) -> Self {
-        Self { http: reqwest::Client::new(), url: url.into(), finality: "optimistic".into() }
+        Self {
+            http: reqwest::Client::new(),
+            url: url.into(),
+            finality: "optimistic".into(),
+        }
     }
 
     /// View-call finality: `optimistic` (default; reads your own writes) or `final`.
@@ -108,7 +117,9 @@ impl NearRpc {
         let resp: Value = self
             .http
             .post(&self.url)
-            .json(&json!({"jsonrpc": "2.0", "id": "near-drive", "method": method, "params": params}))
+            .json(
+                &json!({"jsonrpc": "2.0", "id": "near-drive", "method": method, "params": params}),
+            )
             .timeout(timeout)
             .send()
             .await
@@ -119,7 +130,9 @@ impl NearRpc {
         if let Some(e) = resp.get("error") {
             bail!("rpc {method} error: {e}");
         }
-        resp.get("result").cloned().ok_or_else(|| anyhow!("rpc {method}: response without result: {resp}"))
+        resp.get("result")
+            .cloned()
+            .ok_or_else(|| anyhow!("rpc {method}: response without result: {resp}"))
     }
 
     /// `query call_function` at the configured finality. Returns the raw result bytes.
@@ -134,7 +147,15 @@ impl NearRpc {
             Ok(r) => r,
             Err(e) => {
                 let s = e.to_string();
-                if ["UNKNOWN_ACCOUNT", "NO_CONTRACT_CODE", "CodeDoesNotExist", "does not exist"].iter().any(|m| s.contains(m)) {
+                if [
+                    "UNKNOWN_ACCOUNT",
+                    "NO_CONTRACT_CODE",
+                    "CodeDoesNotExist",
+                    "does not exist",
+                ]
+                .iter()
+                .any(|m| s.contains(m))
+                {
                     return Err(NoContract(contract.to_string()).into());
                 }
                 return Err(e);
@@ -147,11 +168,26 @@ impl NearRpc {
             }
             bail!("view {contract}.{method} failed: {e}");
         }
-        let bytes = r.get("result").and_then(Value::as_array).ok_or_else(|| anyhow!("view {method}: missing result bytes"))?;
-        bytes.iter().map(|b| b.as_u64().and_then(|b| u8::try_from(b).ok()).ok_or_else(|| anyhow!("bad result byte"))).collect()
+        let bytes = r
+            .get("result")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("view {method}: missing result bytes"))?;
+        bytes
+            .iter()
+            .map(|b| {
+                b.as_u64()
+                    .and_then(|b| u8::try_from(b).ok())
+                    .ok_or_else(|| anyhow!("bad result byte"))
+            })
+            .collect()
     }
 
-    pub async fn view<T: DeserializeOwned>(&self, contract: &str, method: &str, args: &Value) -> Result<T> {
+    pub async fn view<T: DeserializeOwned>(
+        &self,
+        contract: &str,
+        method: &str,
+        args: &Value,
+    ) -> Result<T> {
         let raw = self.view_raw(contract, method, args).await?;
         serde_json::from_slice(&raw).with_context(|| format!("decoding {contract}.{method} result"))
     }
@@ -168,9 +204,18 @@ impl NearRpc {
         if let Some(e) = r.get("error") {
             bail!("access key {public_key} for {account}: {e}");
         }
-        let nonce = r.get("nonce").and_then(Value::as_u64).ok_or_else(|| anyhow!("access key: no nonce in {r}"))?;
-        let hash = r.get("block_hash").and_then(Value::as_str).ok_or_else(|| anyhow!("access key: no block_hash"))?;
-        let hash: [u8; 32] = bs58::decode(hash).into_vec()?.try_into().map_err(|_| anyhow!("bad block hash"))?;
+        let nonce = r
+            .get("nonce")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("access key: no nonce in {r}"))?;
+        let hash = r
+            .get("block_hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("access key: no block_hash"))?;
+        let hash: [u8; 32] = bs58::decode(hash)
+            .into_vec()?
+            .try_into()
+            .map_err(|_| anyhow!("bad block hash"))?;
         Ok((nonce, hash))
     }
 
@@ -184,7 +229,10 @@ impl NearRpc {
                 Duration::from_secs(10),
             )
             .await?;
-        let keys = r.get("keys").and_then(Value::as_array).ok_or_else(|| anyhow!("access key list: no keys in {r}"))?;
+        let keys = r
+            .get("keys")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("access key list: no keys in {r}"))?;
         Ok(keys
             .iter()
             .filter_map(|k| {
@@ -193,7 +241,9 @@ impl NearRpc {
                 let perm = if perm.as_str() == Some("FullAccess") {
                     KeyPermission::FullAccess
                 } else if let Some(fc) = perm.get("FunctionCall") {
-                    KeyPermission::FunctionCall { receiver_id: fc.get("receiver_id")?.as_str()?.to_string() }
+                    KeyPermission::FunctionCall {
+                        receiver_id: fc.get("receiver_id")?.as_str()?.to_string(),
+                    }
                 } else {
                     KeyPermission::Other
                 };
@@ -204,10 +254,17 @@ impl NearRpc {
 
     /// Sign and send a transaction with the given actions; waits until all
     /// its receipts executed. Retries once on a stale nonce.
-    pub async fn send(&self, signer: &Signer, receiver_id: &str, actions: Vec<Action>) -> Result<CallOutcome> {
+    pub async fn send(
+        &self,
+        signer: &Signer,
+        receiver_id: &str,
+        actions: Vec<Action>,
+    ) -> Result<CallOutcome> {
         let mut last_err = None;
         for _ in 0..3 {
-            let (nonce, block_hash) = self.access_key(&signer.account_id, &signer.public_key()).await?;
+            let (nonce, block_hash) = self
+                .access_key(&signer.account_id, &signer.public_key())
+                .await?;
             let tx = Transaction {
                 signer_id: signer.account_id.clone(),
                 public_key: signer.sk.verifying_key().to_bytes(),
@@ -217,7 +274,10 @@ impl NearRpc {
                 actions: actions.clone(),
             };
             let params = json!({"signed_tx_base64": B64.encode(tx.sign(&signer.sk)), "wait_until": "EXECUTED_OPTIMISTIC"});
-            match self.request("send_tx", params, Duration::from_secs(60)).await {
+            match self
+                .request("send_tx", params, Duration::from_secs(60))
+                .await
+            {
                 Ok(r) => return parse_outcome(&r, &bs58::encode(tx.hash()).into_string()),
                 Err(e) if e.to_string().contains("InvalidNonce") => last_err = Some(e),
                 Err(e) => return Err(e),
@@ -236,19 +296,40 @@ impl NearRpc {
         gas: u64,
         deposit: u128,
     ) -> Result<CallOutcome> {
-        let action = Action::FunctionCall { method_name: method.into(), args: serde_json::to_vec(args)?, gas, deposit };
+        let action = Action::FunctionCall {
+            method_name: method.into(),
+            args: serde_json::to_vec(args)?,
+            gas,
+            deposit,
+        };
         self.send(signer, contract, vec![action]).await
     }
 }
 
 fn parse_outcome(r: &Value, tx_hash: &str) -> Result<CallOutcome> {
     let mut logs = Vec::new();
-    for o in r.pointer("/transaction_outcome/outcome/logs").into_iter().chain(
-        r.get("receipts_outcome").and_then(Value::as_array).into_iter().flatten().filter_map(|ro| ro.pointer("/outcome/logs")),
-    ) {
-        logs.extend(o.as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from));
+    for o in r
+        .pointer("/transaction_outcome/outcome/logs")
+        .into_iter()
+        .chain(
+            r.get("receipts_outcome")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|ro| ro.pointer("/outcome/logs")),
+        )
+    {
+        logs.extend(
+            o.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(String::from),
+        );
     }
-    let status = r.get("status").ok_or_else(|| anyhow!("tx {tx_hash}: no status in {r}"))?;
+    let status = r
+        .get("status")
+        .ok_or_else(|| anyhow!("tx {tx_hash}: no status in {r}"))?;
     if let Some(f) = status.get("Failure") {
         bail!("tx {tx_hash} failed: {f}");
     }
@@ -256,5 +337,9 @@ fn parse_outcome(r: &Value, tx_hash: &str) -> Result<CallOutcome> {
         Some(v) => B64.decode(v)?,
         None => Vec::new(),
     };
-    Ok(CallOutcome { tx_hash: tx_hash.to_string(), value, logs })
+    Ok(CallOutcome {
+        tx_hash: tx_hash.to_string(),
+        value,
+        logs,
+    })
 }

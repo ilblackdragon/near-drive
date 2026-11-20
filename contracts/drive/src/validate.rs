@@ -62,10 +62,18 @@ pub fn validate_prefix(prefix: &str) -> Result<bool, String> {
 
 fn validate_principal(p: &str, has_capture: bool, allow_star: bool) -> Result<(), String> {
     if p == "*" {
-        return if allow_star { Ok(()) } else { Err("'*' is not allowed as payer".into()) };
+        return if allow_star {
+            Ok(())
+        } else {
+            Err("'*' is not allowed as payer".into())
+        };
     }
     if p == ACCOUNT_PLACEHOLDER {
-        return if has_capture { Ok(()) } else { Err("{account} used but the prefix has no {account}".into()) };
+        return if has_capture {
+            Ok(())
+        } else {
+            Err("{account} used but the prefix has no {account}".into())
+        };
     }
     if is_account_id(p) {
         Ok(())
@@ -80,6 +88,9 @@ pub fn validate_rules(rules: &[Rule]) -> Result<(), String> {
     }
     for (i, r) in rules.iter().enumerate() {
         let ctx = |e: String| format!("rule {i}: {e}");
+        if rules[..i].iter().any(|prev| prev.prefix == r.prefix) {
+            return Err(ctx(format!("duplicate prefix {:?}", r.prefix)));
+        }
         let cap = validate_prefix(&r.prefix).map_err(ctx)?;
         if r.read.len() > MAX_PRINCIPALS || r.write.len() > MAX_PRINCIPALS {
             return Err(ctx(format!("at most {MAX_PRINCIPALS} read/write entries")));
@@ -91,7 +102,9 @@ pub fn validate_rules(rules: &[Rule]) -> Result<(), String> {
             validate_principal(p, cap, false).map_err(ctx)?;
         }
     }
-    let size = near_sdk::serde_json::to_vec(rules).map(|v| v.len()).unwrap_or(usize::MAX);
+    let size = near_sdk::serde_json::to_vec(rules)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
     if size > MAX_RULES_JSON_BYTES {
         return Err(format!("rules exceed {MAX_RULES_JSON_BYTES} bytes"));
     }
@@ -100,9 +113,12 @@ pub fn validate_rules(rules: &[Rule]) -> Result<(), String> {
 
 /// `x25519:<base58 of 32 bytes>`
 pub fn validate_enc_key(k: &str) -> Result<(), String> {
-    let b58 = k.strip_prefix("x25519:").ok_or("key must start with x25519:")?;
+    let b58 = k
+        .strip_prefix("x25519:")
+        .ok_or("key must start with x25519:")?;
     match bs58::decode(b58).into_vec() {
-        Ok(v) if v.len() == 32 => Ok(()),
+        Ok(v) if v.len() == 32 && v.iter().any(|b| *b != 0) => Ok(()),
+        Ok(v) if v.len() == 32 => Err("x25519 key must not be all zero".into()),
         _ => Err("x25519 key must be base58 of 32 bytes".into()),
     }
 }
@@ -114,17 +130,24 @@ fn validate_tags(what: &str, tags: &[String]) -> Result<(), String> {
     for t in tags {
         if t.is_empty()
             || t.len() > MAX_TAG_LEN
-            || !t.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.'))
+            || !t.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
+            })
         {
-            return Err(format!("invalid {what} entry {t:?} (1..={MAX_TAG_LEN} of [a-z0-9-_.])"));
+            return Err(format!(
+                "invalid {what} entry {t:?} (1..={MAX_TAG_LEN} of [a-z0-9-_.])"
+            ));
         }
     }
     Ok(())
 }
 
 pub fn validate_gateway(g: &crate::gateway::GatewayInfo) -> Result<(), String> {
-    if g.url.len() > MAX_URL_LEN || !(g.url.starts_with("https://") || g.url.starts_with("http://")) {
-        return Err(format!("url must be http(s):// and at most {MAX_URL_LEN} bytes"));
+    if g.url.len() > MAX_URL_LEN || !(g.url.starts_with("https://") || g.url.starts_with("http://"))
+    {
+        return Err(format!(
+            "url must be http(s):// and at most {MAX_URL_LEN} bytes"
+        ));
     }
     if g.url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("url contains whitespace".into());
@@ -134,22 +157,31 @@ pub fn validate_gateway(g: &crate::gateway::GatewayInfo) -> Result<(), String> {
     if g.price_hint.len() > MAX_PRICE_HINT_LEN {
         return Err(format!("price_hint longer than {MAX_PRICE_HINT_LEN} bytes"));
     }
-    if g.attestation.as_ref().is_some_and(|a| a.len() > MAX_ATTESTATION_LEN) {
-        return Err(format!("attestation longer than {MAX_ATTESTATION_LEN} bytes"));
+    if g.attestation
+        .as_ref()
+        .is_some_and(|a| a.len() > MAX_ATTESTATION_LEN)
+    {
+        return Err(format!(
+            "attestation longer than {MAX_ATTESTATION_LEN} bytes"
+        ));
     }
     Ok(())
 }
 
 pub fn validate_root(root: &str) -> Result<(), String> {
     if root.is_empty() || root.len() > MAX_ROOT_LEN || !root.bytes().all(|b| b.is_ascii_graphic()) {
-        return Err(format!("root must be 1..={MAX_ROOT_LEN} printable ASCII bytes"));
+        return Err(format!(
+            "root must be 1..={MAX_ROOT_LEN} printable ASCII bytes"
+        ));
     }
     Ok(())
 }
 
 pub fn validate_period_id(p: &str) -> Result<(), String> {
     if p.is_empty() || p.len() > MAX_PERIOD_ID_LEN || !p.bytes().all(|b| b.is_ascii_graphic()) {
-        return Err(format!("period_id must be 1..={MAX_PERIOD_ID_LEN} printable ASCII bytes"));
+        return Err(format!(
+            "period_id must be 1..={MAX_PERIOD_ID_LEN} printable ASCII bytes"
+        ));
     }
     Ok(())
 }
@@ -193,7 +225,12 @@ mod tests {
     #[test]
     fn rules() {
         validate_rules(&[
-            rule("users/{account}/", &["{account}"], &["{account}", "app.near"], Some("app.near")),
+            rule(
+                "users/{account}/",
+                &["{account}"],
+                &["{account}", "app.near"],
+                Some("app.near"),
+            ),
             rule("public/", &["*"], &[], None),
             rule("p/{account}/", &[], &[], Some("{account}")),
         ])
@@ -202,7 +239,9 @@ mod tests {
         assert!(validate_rules(&[rule("x/", &["Bad.near"], &[], None)]).is_err());
         assert!(validate_rules(&[rule("x/", &[], &[], Some("*"))]).is_err());
         assert!(validate_rules(&[rule("x/", &[], &[], Some("{account}"))]).is_err());
-        let many: Vec<_> = (0..=MAX_RULES).map(|_| rule("x/", &[], &[], None)).collect();
+        let many: Vec<_> = (0..=MAX_RULES)
+            .map(|_| rule("x/", &[], &[], None))
+            .collect();
         assert!(validate_rules(&many).is_err());
         let wide: Vec<String> = (0..=MAX_PRINCIPALS).map(|i| format!("a{i}.near")).collect();
         let wide: Vec<&str> = wide.iter().map(String::as_str).collect();
@@ -213,8 +252,14 @@ mod tests {
     fn enc_keys() {
         let k = format!("x25519:{}", bs58::encode([7u8; 32]).into_string());
         validate_enc_key(&k).unwrap();
-        assert!(validate_enc_key(&format!("ed25519:{}", bs58::encode([7u8; 32]).into_string())).is_err());
-        assert!(validate_enc_key(&format!("x25519:{}", bs58::encode([7u8; 31]).into_string())).is_err());
+        assert!(validate_enc_key(&format!(
+            "ed25519:{}",
+            bs58::encode([7u8; 32]).into_string()
+        ))
+        .is_err());
+        assert!(
+            validate_enc_key(&format!("x25519:{}", bs58::encode([7u8; 31]).into_string())).is_err()
+        );
         assert!(validate_enc_key("x25519:0OIl").is_err());
     }
 }

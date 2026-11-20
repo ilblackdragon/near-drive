@@ -200,12 +200,12 @@ Metered units:
 
 Implemented in `contracts/drive` (method list in docs/contract.md; payments in docs/payments.md):
 
-- `register_gateway(info)` / `update_gateway` / `deregister_gateway` / `withdraw_gateway_stake` (NEAR stake, unstake delay), `list_gateways`
+- `register_gateway(info)` / `update_gateway` / `deregister_gateway` / `force_deregister_gateway` / `withdraw_gateway_stake` (NEAR stake, snapshotted unstake delay), `list_gateways`
 - `set_rules(rules)`, `get_rules(namespace)`
 - `set_enc_key(x25519_pk)`, `get_enc_key(account)`
 - `bump_cred_epoch()`, `get_cred_epoch(account)`
-- `anchor(namespace, root, seq)`: periodic Merkle root of pointer records for rollback detection (phase 3)
-- escrow: deposits via `ft_on_transfer` / `mt_on_transfer` (NEAR Intents), `set_spend_cap`, `settle`, notice-period `withdraw_balance`, `withdraw_earnings`. Prepaid reservations (`reserve`) are not implemented yet.
+- `anchor(namespace, root, seq)` / `clear_anchor` / `set_anchor_authority`: periodic Merkle root of pointer records for rollback detection (phase 3); the owner or an owner-authorized active gateway may anchor
+- escrow: deposits via `ft_on_transfer` / `mt_on_transfer` (after `register_payer`), `set_spend_cap`, `settle`, notice-period `withdraw_balance`, `withdraw_earnings`, `close_payer`. Prepaid reservations (`reserve`) are not implemented yet.
 
 ## 8. APIs
 

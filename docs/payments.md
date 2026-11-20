@@ -27,12 +27,25 @@ NEP-141 token and a mock NEP-245 intents contract).
   held in intents). The owner changes it with
   `set_asset({id, decimals, accept_deposits})`. Decimals cannot change after
   an asset is added. `accept_deposits: false` stops new deposits, but existing
-  balances can still be spent and withdrawn.
+  balances can still be spent and withdrawn. **The owner's asset allow-list
+  and the $1-per-whole-token valuation are trust assumptions**: a depegged or
+  malicious allow-listed token is still valued at $1 by the contract.
 - `settle` draws from a payer's assets **in allow-list order**. Payouts go
   back the way the asset came in: `ft_transfer` for `nep141:` assets, and
   `mt_transfer` into the receiver's intents account for `nep245:` assets.
 
 ## Funding
+
+Before a new payer can receive a deposit, it must create its escrow entry and pay for its storage:
+
+```sh
+near call drive.near register_payer '{}' --accountId alice.near --deposit 0.01
+```
+
+`register_payer` charges the actual storage cost and refunds the excess. This is what prevents an
+attacker from creating arbitrarily many contract-paid `PayerAccount` entries using refundable token
+deposits: token deposits alone no longer create state. An empty entry can be removed with
+`close_payer`, which refunds its storage.
 
 Every deposit carries a `msg` that is either empty or JSON:
 
@@ -40,15 +53,15 @@ Every deposit carries a `msg` that is either empty or JSON:
 {"payer": "alice.near", "spend_cap_per_day": "5000000"}
 ```
 
-- `payer` is the account to credit. It defaults to the sender.
+- `payer` is the account to credit. It defaults to the sender. The payer must already be registered.
 - `spend_cap_per_day` is the daily cap in micro-USD. It applies only when the
   payer is the sender. You cannot set someone else's cap.
-- The first deposit for a new payer must be at least `min_new_payer_deposit`
-  (default $0.10). Token deposits cannot attach NEAR, so this minimum bounds
-  the storage that deposits can make the contract pay for.
-- A bad `msg`, a token not on the allow-list, or a below-minimum first
-  deposit makes the receiver panic. The token contract then refunds the sender
-  in full (`ft_resolve_transfer` / `mt_resolve_transfer`).
+- The first deposit for a newly registered payer must be at least
+  `min_new_payer_deposit` (default $0.10). This is now an anti-dust minimum, not
+  the storage payment; storage is paid by `register_payer`.
+- A bad `msg`, a token not on the allow-list, an unregistered payer, or a
+  below-minimum first deposit makes the receiver panic. The token contract then
+  refunds the sender in full (`ft_resolve_transfer` / `mt_resolve_transfer`).
 
 Below, `USDC=17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1`.
 
@@ -60,9 +73,9 @@ near call $USDC ft_transfer_call \
   --accountId alice.near --depositYocto 1 --gas 100000000000000
 ```
 
-This credits $5 to alice and caps spending at $1/day. One-time deployment
-step: drive.near must be registered with the token
-(`near call $USDC storage_deposit '{"account_id":"drive.near"}' --deposit 0.00125`).
+This credits $5 to alice and caps spending at $1/day. Alice must have called
+`register_payer` first. One-time deployment step: drive.near must be registered
+with the token (`near call $USDC storage_deposit '{"account_id":"drive.near"}' --deposit 0.00125`).
 
 ### 2. From a NEAR Intents balance with `mt_transfer_call` (NEP-245)
 
@@ -81,7 +94,8 @@ intents.near debits alice, credits drive.near, and then calls
 ["alice.near"], token_ids: ["nep141:$USDC"], amounts: ["5000000"], msg)`.
 The escrow credits asset `nep245:intents.near:nep141:$USDC` and returns
 `["0"]` (nothing unused). If the call panics, intents.near's
-`mt_resolve_transfer` refunds the whole amount.
+`mt_resolve_transfer` refunds the whole amount. The payer must already be
+registered (`register_payer`).
 
 ### 3. Gasless: a signed `transfer` intent
 
@@ -132,6 +146,9 @@ near call drive.near set_spend_cap '{"per_day":"1000000"}' --accountId alice.nea
 
 - `per_day: null` blocks all charges. **A payer with no cap cannot be charged
   at all.** A payer must opt in by setting a cap here or in a deposit `msg`.
+- `set_spend_cap` also creates the caller's `PayerAccount` if needed (it is
+  payable and charges/refunds storage), so it can be used instead of a separate
+  `register_payer`.
 - The window is the UTC day: `block_timestamp / 86400 s`.
 
 ## Settlement: integration notes for the billing lane
@@ -139,9 +156,20 @@ near call drive.near set_spend_cap '{"per_day":"1000000"}' --accountId alice.nea
 Only owner-approved settlers can call `settle`:
 
 - `add_settler(account_id, any_gateway: true)` is for a billing operator
-  (cloud-api metering job) that credits any registered gateway.
+  (cloud-api metering job) that credits any registered gateway. This is the
+  fully trusted billing lane and does **not** require per-payer authorization.
 - `add_settler(account_id, any_gateway: false)` is for a gateway operator
-  billing its own usage. Each entry's `gateway` must equal the settler.
+  billing its own usage. Each entry's `gateway` must equal the settler, and
+  the payer must authorize that settler with
+  `set_settler_authorization(settler, true)`. This prevents an approved
+  self-settler from charging payers that never chose it. Revoke with
+  `set_settler_authorization(settler, false)`. Example:
+
+  ```sh
+  near call drive.near set_settler_authorization \
+    '{"settler":"gw1.operator.near","allowed":true}' \
+    --accountId alice.near --deposit 0.01
+  ```
 
 ```sh
 near call drive.near settle '{"entries":[
@@ -157,8 +185,9 @@ Rust: `near_drive_chain::StorageContract::settle(&signer, &[SettleEntry{..}])`.
   `{payer, period_id, status, charged}` per entry. `status` is one of:
   `Settled`, `AlreadySettled`, `InvalidEntry` (zero amount or bad
   `period_id`), `GatewayNotAllowed`, `UnknownGateway` (not in the registry,
-  where registered and deregistering gateways both count), `NoSpendCap`,
-  `CapExceeded`, `InsufficientBalance`.
+  where registered and deregistering gateways both count),
+  `SettlerNotAuthorized` (a self-settler the payer did not authorize),
+  `NoSpendCap`, `CapExceeded`, `InsufficientBalance`.
 - **Idempotency key** is `(settler, payer, period_id)`. `gateway` and
   `amount` are not part of it. So:
   - put the gateway in `period_id` when one settler bills several gateways
@@ -192,6 +221,8 @@ near call drive.near withdraw_balance '{}' --accountId alice.near --depositYocto
 
 - `withdraw_balance` pays out min(requested, current balance). Settlements
   made during the notice period reduce what is left.
+- The storage deposit for the withdrawal request is refunded when the request
+  executes or is cancelled.
 - A new request replaces the pending one and restarts the timer.
   `cancel_withdraw_balance` drops it.
 - For `nep245:` assets the payout is `intents.near.mt_transfer`, back into

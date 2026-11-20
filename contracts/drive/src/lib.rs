@@ -11,8 +11,10 @@
 //!
 //! Storage staking: every method that grows state charges the caller for the
 //! bytes it added (attach NEAR; the excess is refunded) and refunds bytes it
-//! frees. The two exceptions are token deposits (cannot carry NEAR; bounded by
-//! a minimum deposit for new payers) and payout callbacks.
+//! frees. The exceptions are deposits, which cannot carry NEAR: a payer must
+//! first call `register_payer` (payable) to create its `PayerAccount`, and
+//! adding balance rows is bounded by `MAX_ASSETS`. Payout callbacks also grow
+//! state without a new deposit; they restore what was removed.
 use near_sdk::{
     env,
     json_types::{U128, U64},
@@ -55,8 +57,12 @@ pub struct Rule {
 pub struct Anchor {
     pub root: String,
     pub seq: u64,
-    /// Account that submitted it (namespace owner or a registered gateway).
+    /// Account that submitted it (namespace owner or an authorized gateway).
     pub by: AccountId,
+    /// Account that paid for the bytes currently occupied by this anchor.
+    /// Refunds for shrinking/clearing go here, not to whoever happens to
+    /// replace the anchor.
+    pub payer: AccountId,
     pub block_height: U64,
     pub timestamp_ns: U64,
 }
@@ -104,22 +110,27 @@ enum Key {
     Gateways,
     CredEpochs,
     Anchors,
+    AnchorAuthorities,
     Payers,
     Earnings,
     Settled,
     Settlers,
+    SettlerAuths,
 }
 
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct Contract {
     pub(crate) owner: AccountId,
+    pub(crate) pending_owner: Option<AccountId>,
     pub(crate) config: Config,
     pub(crate) rules: LookupMap<AccountId, Vec<Rule>>,
     pub(crate) enc_keys: LookupMap<AccountId, String>,
     pub(crate) gateways: IterableMap<AccountId, Gateway>,
     pub(crate) cred_epochs: LookupMap<AccountId, u64>,
     pub(crate) anchors: LookupMap<AccountId, Anchor>,
+    /// namespace -> active gateway allowed to anchor on its behalf.
+    pub(crate) anchor_authorities: LookupMap<AccountId, AccountId>,
     /// Allow-listed escrow assets, in spending order.
     pub(crate) assets: Vec<AssetConfig>,
     pub(crate) payers: LookupMap<AccountId, PayerAccount>,
@@ -129,6 +140,8 @@ pub struct Contract {
     pub(crate) settled: LookupSet<[u8; 32]>,
     /// settler -> may credit any gateway (true) or only itself (false).
     pub(crate) settlers: IterableMap<AccountId, bool>,
+    /// payer -> settlers the payer allows to charge it (self-settlers only).
+    pub(crate) settler_auths: LookupMap<AccountId, Vec<AccountId>>,
 }
 
 #[near]
@@ -136,11 +149,23 @@ impl Contract {
     /// `assets` defaults to mainnet USDC, held directly (NEP-141) or as an
     /// `intents.near` balance (NEP-245 token `nep141:<usdc>`).
     #[init]
-    pub fn new(owner_id: AccountId, assets: Option<Vec<AssetConfig>>, config: Option<Config>) -> Self {
+    pub fn new(
+        owner_id: AccountId,
+        assets: Option<Vec<AssetConfig>>,
+        config: Option<Config>,
+    ) -> Self {
         let assets = assets.unwrap_or_else(|| {
             vec![
-                AssetConfig { id: format!("nep141:{MAINNET_USDC}"), decimals: 6, accept_deposits: true },
-                AssetConfig { id: format!("nep245:{MAINNET_INTENTS}:nep141:{MAINNET_USDC}"), decimals: 6, accept_deposits: true },
+                AssetConfig {
+                    id: format!("nep141:{MAINNET_USDC}"),
+                    decimals: 6,
+                    accept_deposits: true,
+                },
+                AssetConfig {
+                    id: format!("nep245:{MAINNET_INTENTS}:nep141:{MAINNET_USDC}"),
+                    decimals: 6,
+                    accept_deposits: true,
+                },
             ]
         });
         for a in &assets {
@@ -148,17 +173,20 @@ impl Contract {
         }
         Self {
             owner: owner_id,
+            pending_owner: None,
             config: config.unwrap_or_default(),
             rules: LookupMap::new(Key::Rules),
             enc_keys: LookupMap::new(Key::EncKeys),
             gateways: IterableMap::new(Key::Gateways),
             cred_epochs: LookupMap::new(Key::CredEpochs),
             anchors: LookupMap::new(Key::Anchors),
+            anchor_authorities: LookupMap::new(Key::AnchorAuthorities),
             assets,
             payers: LookupMap::new(Key::Payers),
             earnings: LookupMap::new(Key::Earnings),
             settled: LookupSet::new(Key::Settled),
             settlers: IterableMap::new(Key::Settlers),
+            settler_auths: LookupMap::new(Key::SettlerAuths),
         }
     }
 
@@ -232,20 +260,55 @@ impl Contract {
 
     // --------------------------------------------------------------- anchors
 
+    /// Authorize a registered gateway to submit anchors for the caller's own
+    /// namespace. `None` revokes it. The gateway must still be active when
+    /// `anchor` is called. The owner can always anchor.
+    #[payable]
+    pub fn set_anchor_authority(&mut self, gateway: Option<AccountId>) {
+        let ns = env::predecessor_account_id();
+        let start = env::storage_usage();
+        match gateway {
+            Some(gateway) => {
+                self.anchor_authorities.insert(ns.clone(), gateway);
+            }
+            None => {
+                self.anchor_authorities.remove(&ns);
+            }
+        }
+        self.anchor_authorities.flush();
+        self.charge_storage(&ns, start);
+        env::log_str(&format!(
+            "EVENT_JSON:{{\"standard\":\"near-drive\",\"version\":\"1.0.0\",\"event\":\"set_anchor_authority\",\"data\":[{{\"namespace\":\"{ns}\"}}]}}"
+        ));
+    }
+
+    pub fn get_anchor_authority(&self, namespace: AccountId) -> Option<AccountId> {
+        self.anchor_authorities.get(&namespace).cloned()
+    }
+
     /// Record a Merkle root of the namespace's pointer records. Callable by
-    /// the namespace owner or an active registered gateway; `seq` must
-    /// strictly increase.
+    /// the namespace owner or a gateway the owner authorized for that
+    /// namespace. `seq` must strictly increase; the owner can reset it with
+    /// `clear_anchor` after a poisoned/unreachable sequence.
     #[payable]
     pub fn anchor(&mut self, namespace: AccountId, root: String, seq: u64) {
         validate::validate_root(&root).unwrap_or_else(|e| env::panic_str(&e));
         let caller = env::predecessor_account_id();
+        let authorized = caller == namespace
+            || (self.anchor_authorities.get(&namespace) == Some(&caller)
+                && self.is_active_gateway(&caller));
         require!(
-            caller == namespace || self.gateways.get(&caller).is_some_and(|g| g.deregistered_at.is_none()),
-            "only the namespace owner or a registered gateway can anchor"
+            authorized,
+            "only the namespace owner or an authorized active gateway can anchor"
         );
-        if let Some(prev) = self.anchors.get(&namespace) {
-            require!(seq > prev.seq, format!("seq must be greater than {}", prev.seq));
+        let prev = self.anchors.get(&namespace);
+        if let Some(prev) = &prev {
+            require!(
+                seq > prev.seq,
+                format!("seq must be greater than {}", prev.seq)
+            );
         }
+        let prev_payer = prev.as_ref().map(|a| a.payer.clone());
         let start = env::storage_usage();
         self.anchors.insert(
             namespace,
@@ -253,12 +316,37 @@ impl Contract {
                 root,
                 seq,
                 by: caller.clone(),
+                payer: caller.clone(),
                 block_height: U64(env::block_height()),
                 timestamp_ns: U64(env::block_timestamp()),
             },
         );
         self.anchors.flush();
-        self.charge_storage(&caller, start);
+        self.settle_anchor_storage(&caller, prev_payer.as_ref(), start);
+    }
+
+    /// Delete the caller's anchor and refund its storage. This is the owner's
+    /// escape hatch if an authorized gateway ever submits a poisoned root or
+    /// an unreachable `seq`.
+    #[payable]
+    pub fn clear_anchor(&mut self, namespace: AccountId) {
+        let caller = env::predecessor_account_id();
+        require!(
+            caller == namespace,
+            "only the namespace owner can clear the anchor"
+        );
+        let prev = self
+            .anchors
+            .get(&namespace)
+            .cloned()
+            .unwrap_or_else(|| env::panic_str("no anchor"));
+        let start = env::storage_usage();
+        self.anchors.remove(&namespace);
+        self.anchors.flush();
+        self.settle_anchor_storage(&caller, Some(&prev.payer), start);
+        env::log_str(&format!(
+            "EVENT_JSON:{{\"standard\":\"near-drive\",\"version\":\"1.0.0\",\"event\":\"clear_anchor\",\"data\":[{{\"namespace\":\"{namespace}\"}}]}}"
+        ));
     }
 
     pub fn get_anchor(&self, namespace: AccountId) -> Option<Anchor> {
@@ -271,13 +359,42 @@ impl Contract {
         self.owner.clone()
     }
 
+    pub fn get_pending_owner(&self) -> Option<AccountId> {
+        self.pending_owner.clone()
+    }
+
     pub fn get_config(&self) -> Config {
         self.config.clone()
     }
 
-    pub fn set_owner(&mut self, owner_id: AccountId) {
+    /// Start a two-step ownership transfer. The new owner must call
+    /// `accept_owner`, which prevents a typo from permanently losing the
+    /// contract.
+    pub fn propose_owner(&mut self, owner_id: AccountId) {
         self.assert_owner();
-        self.owner = owner_id;
+        require!(owner_id != self.owner, "already the owner");
+        self.pending_owner = Some(owner_id);
+        env::log_str(&format!(
+            "EVENT_JSON:{{\"standard\":\"near-drive\",\"version\":\"1.0.0\",\"event\":\"propose_owner\",\"data\":[{{\"owner\":\"{}\"}}]}}",
+            self.owner
+        ));
+    }
+
+    pub fn accept_owner(&mut self) {
+        let pending = self
+            .pending_owner
+            .clone()
+            .unwrap_or_else(|| env::panic_str("no pending owner"));
+        require!(
+            env::predecessor_account_id() == pending,
+            "only the pending owner can accept"
+        );
+        self.owner = pending;
+        self.pending_owner = None;
+        env::log_str(&format!(
+            "EVENT_JSON:{{\"standard\":\"near-drive\",\"version\":\"1.0.0\",\"event\":\"set_owner\",\"data\":[{{\"owner\":\"{}\"}}]}}",
+            self.owner
+        ));
     }
 
     pub fn set_config(&mut self, patch: ConfigPatch) {
@@ -312,13 +429,60 @@ impl Contract {
         let end = env::storage_usage();
         let refund = if end > start {
             let need = byte_cost * u128::from(end - start);
-            require!(attached >= need, format!("attach at least {need} yoctoNEAR to cover {} bytes of storage", end - start));
+            require!(
+                attached >= need,
+                format!(
+                    "attach at least {need} yoctoNEAR to cover {} bytes of storage",
+                    end - start
+                )
+            );
             attached - need
         } else {
-            attached + byte_cost * u128::from(start - end)
+            attached.saturating_add(byte_cost * u128::from(start - end))
         };
-        if refund > 0 {
-            Promise::new(account.clone()).transfer(NearToken::from_yoctonear(refund)).detach();
+        self.refund(account, refund);
+    }
+
+    pub(crate) fn refund(&self, account: &AccountId, amount: u128) {
+        if amount > 0 {
+            Promise::new(account.clone())
+                .transfer(NearToken::from_yoctonear(amount))
+                .detach();
+        }
+    }
+
+    /// Anchor storage can be paid by a different account than the one that
+    /// replaces or clears it. Charge growth to the caller, refund excess
+    /// attached deposit to the caller, and refund freed bytes to the previous
+    /// storage payer.
+    pub(crate) fn settle_anchor_storage(
+        &self,
+        caller: &AccountId,
+        prev_payer: Option<&AccountId>,
+        start: u64,
+    ) {
+        let attached = env::attached_deposit().as_yoctonear();
+        let byte_cost = env::storage_byte_cost().as_yoctonear();
+        let end = env::storage_usage();
+        if end > start {
+            let need = byte_cost * u128::from(end - start);
+            require!(
+                attached >= need,
+                format!(
+                    "attach at least {need} yoctoNEAR to cover {} bytes of storage",
+                    end - start
+                )
+            );
+            self.refund(caller, attached - need);
+            return;
+        }
+        let freed = byte_cost * u128::from(start - end);
+        let payer = prev_payer.unwrap_or(caller);
+        if payer == caller {
+            self.refund(caller, attached.saturating_add(freed));
+        } else {
+            self.refund(caller, attached);
+            self.refund(payer, freed);
         }
     }
 }

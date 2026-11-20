@@ -6,6 +6,8 @@
 //! at $1.
 //!
 //! Funding:
+//! - the payer first calls `register_payer` (payable; pays the PayerAccount
+//!   storage), then
 //! - NEP-141: `<token>.ft_transfer_call(drive.near, amount, msg)` lands in
 //!   `ft_on_transfer`; asset id `nep141:<token>`;
 //! - NEP-245 (NEAR Intents): `intents.near.mt_transfer_call(drive.near,
@@ -15,12 +17,15 @@
 //!
 //! `msg` is empty (credit the sender) or JSON
 //! `{"payer":"alice.near","spend_cap_per_day":"5000000"}`; the cap is only
-//! applied when the payer is the sender.
+//! applied when the payer is the sender. The payer must already have
+//! registered, so token deposits cannot grow contract-paid state.
 //!
 //! Spending: approved settlers call `settle`. Each entry is applied whole or
 //! not at all, at most once per (settler, payer, period_id), within the
-//! payer's daily cap and balance. Payers withdraw with a notice period, so
-//! usage served before the request can still be settled.
+//! payer's daily cap and balance. `any_gateway = true` is the owner-approved
+//! billing lane; `any_gateway = false` self-settlers must also be authorized
+//! by the payer. Payers withdraw with a notice period, so usage served before
+//! the request can still be settled.
 use crate::{validate, Contract, ContractExt, SEC};
 use near_sdk::{
     assert_one_yocto, env,
@@ -32,6 +37,7 @@ use near_sdk::{
 
 pub const MAX_ASSETS: usize = 8;
 pub const MAX_SETTLE_ENTRIES: usize = 100;
+pub const MAX_AUTHORIZED_SETTLERS: usize = 32;
 const DAY_NS: u64 = 24 * 3600 * SEC;
 const PAYOUT_GAS: Gas = Gas::from_tgas(20);
 const ON_PAYOUT_GAS: Gas = Gas::from_tgas(10);
@@ -70,7 +76,10 @@ impl AssetConfig {
             if tok.is_empty() || tok.len() > validate::MAX_TOKEN_ID_LEN {
                 return Err(bad());
             }
-            return Ok(AssetKind::Mt(c.parse().map_err(|_| bad())?, tok.to_string()));
+            return Ok(AssetKind::Mt(
+                c.parse().map_err(|_| bad())?,
+                tok.to_string(),
+            ));
         }
         Err(bad())
     }
@@ -98,6 +107,9 @@ pub struct PayerAccount {
     pub day: u64,
     pub spent_today: u128,
     pub withdrawal: Option<WithdrawRequest>,
+    /// Whether at least one deposit has been accepted. Used to apply
+    /// `min_new_payer_deposit` exactly once, independent of later withdrawals.
+    pub funded: bool,
 }
 
 #[near(serializers = [json])]
@@ -144,6 +156,7 @@ pub enum SettleStatus {
     InvalidEntry,
     GatewayNotAllowed,
     UnknownGateway,
+    SettlerNotAuthorized,
     NoSpendCap,
     CapExceeded,
     InsufficientBalance,
@@ -174,14 +187,24 @@ fn emit(event: &str, data: serde_json::Value) {
 
 fn add_to(v: &mut Vec<(String, u128)>, asset: &str, amount: u128) {
     match v.iter_mut().find(|(a, _)| a == asset) {
-        Some((_, b)) => *b = b.checked_add(amount).unwrap_or_else(|| env::panic_str("balance overflow")),
+        Some((_, b)) => {
+            *b = b
+                .checked_add(amount)
+                .unwrap_or_else(|| env::panic_str("balance overflow"))
+        }
         None => v.push((asset.to_string(), amount)),
     }
 }
 
 fn sub_from(v: &mut Vec<(String, u128)>, asset: &str, amount: u128) {
-    let i = v.iter().position(|(a, _)| a == asset).unwrap_or_else(|| env::panic_str("no balance"));
-    v[i].1 = v[i].1.checked_sub(amount).unwrap_or_else(|| env::panic_str("insufficient balance"));
+    let i = v
+        .iter()
+        .position(|(a, _)| a == asset)
+        .unwrap_or_else(|| env::panic_str("no balance"));
+    v[i].1 = v[i]
+        .1
+        .checked_sub(amount)
+        .unwrap_or_else(|| env::panic_str("insufficient balance"));
     if v[i].1 == 0 {
         v.remove(i);
     }
@@ -196,7 +219,12 @@ impl Contract {
     // -------------------------------------------------------------- deposits
 
     /// NEP-141 receiver. Returns the unused amount (always 0 when accepted).
-    pub fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> PromiseOrValue<U128> {
+    pub fn ft_on_transfer(
+        &mut self,
+        sender_id: AccountId,
+        amount: U128,
+        msg: String,
+    ) -> PromiseOrValue<U128> {
         let asset = format!("nep141:{}", env::predecessor_account_id());
         self.credit(&sender_id, &msg, &[(asset, amount.0)]);
         PromiseOrValue::Value(U128(0))
@@ -212,17 +240,66 @@ impl Contract {
         msg: String,
     ) -> PromiseOrValue<Vec<U128>> {
         require!(
-            !token_ids.is_empty() && token_ids.len() == amounts.len() && previous_owner_ids.len() == token_ids.len(),
+            !token_ids.is_empty()
+                && token_ids.len() == amounts.len()
+                && previous_owner_ids.len() == token_ids.len(),
             "invalid args"
         );
+        require!(
+            previous_owner_ids.iter().all(|owner| owner == &sender_id),
+            "previous owners must equal sender"
+        );
         let mt = env::predecessor_account_id();
-        let deposits: Vec<(String, u128)> =
-            token_ids.iter().zip(&amounts).map(|(t, a)| (format!("nep245:{mt}:{t}"), a.0)).collect();
+        let deposits: Vec<(String, u128)> = token_ids
+            .iter()
+            .zip(&amounts)
+            .map(|(t, a)| (format!("nep245:{mt}:{t}"), a.0))
+            .collect();
         self.credit(&sender_id, &msg, &deposits);
         PromiseOrValue::Value(vec![U128(0); amounts.len()])
     }
 
+    /// Create the caller's escrow entry and pay for its storage. Deposits to
+    /// an account that has not registered are rejected by `ft_on_transfer` /
+    /// `mt_on_transfer`; this is what prevents refundable token deposits from
+    /// growing contract-paid state without bound.
+    #[payable]
+    pub fn register_payer(&mut self) {
+        let payer = env::predecessor_account_id();
+        require!(
+            self.payers.get(&payer).is_none(),
+            "payer already registered"
+        );
+        let start = env::storage_usage();
+        self.payers.insert(payer.clone(), PayerAccount::default());
+        self.payers.flush();
+        self.charge_storage(&payer, start);
+        emit("register_payer", json!({"payer": payer}));
+    }
+
+    /// Close an empty escrow entry and refund its storage deposit. Balances
+    /// and any pending withdrawal must be cleared first.
+    #[payable]
+    pub fn close_payer(&mut self) {
+        let payer = env::predecessor_account_id();
+        let acct = self
+            .payers
+            .get(&payer)
+            .cloned()
+            .unwrap_or_else(|| env::panic_str("no escrow balance"));
+        require!(acct.balances.is_empty(), "withdraw the balance first");
+        require!(acct.withdrawal.is_none(), "cancel the withdrawal first");
+        let start = env::storage_usage();
+        self.payers.remove(&payer);
+        self.settler_auths.remove(&payer);
+        self.payers.flush();
+        self.settler_auths.flush();
+        self.charge_storage(&payer, start);
+        emit("close_payer", json!({"payer": payer}));
+    }
+
     /// Set the caller's daily spend cap in micro-USD (None = no charges).
+    /// Also creates the caller's escrow entry if needed.
     #[payable]
     pub fn set_spend_cap(&mut self, per_day: Option<U128>) {
         let payer = env::predecessor_account_id();
@@ -234,6 +311,51 @@ impl Contract {
         self.charge_storage(&payer, start);
     }
 
+    /// Authorize (`allowed = true`) or revoke a self-settler that may charge
+    /// the caller. Only `any_gateway = false` settlers need this; the
+    /// owner-approved billing operator (`any_gateway = true`) remains a fully
+    /// trusted lane.
+    #[payable]
+    pub fn set_settler_authorization(&mut self, settler: AccountId, allowed: bool) {
+        let payer = env::predecessor_account_id();
+        require!(
+            self.payers.get(&payer).is_some(),
+            "register payer before authorizing a settler"
+        );
+        let start = env::storage_usage();
+        let mut list = self.settler_auths.get(&payer).cloned().unwrap_or_default();
+        if allowed {
+            if !list.contains(&settler) {
+                require!(
+                    list.len() < MAX_AUTHORIZED_SETTLERS,
+                    format!("at most {MAX_AUTHORIZED_SETTLERS} authorized settlers")
+                );
+                list.push(settler.clone());
+            }
+        } else {
+            list.retain(|s| s != &settler);
+        }
+        if list.is_empty() {
+            self.settler_auths.remove(&payer);
+        } else {
+            self.settler_auths.insert(payer.clone(), list);
+        }
+        self.settler_auths.flush();
+        self.charge_storage(&payer, start);
+        emit(
+            "set_settler_authorization",
+            json!({"payer": payer, "settler": settler, "allowed": allowed}),
+        );
+    }
+
+    pub fn is_settler_authorized(&self, payer: AccountId, settler: AccountId) -> bool {
+        self.authorized_settler(&payer, &settler)
+    }
+
+    pub fn get_settler_authorizations(&self, payer: AccountId) -> Vec<AccountId> {
+        self.settler_auths.get(&payer).cloned().unwrap_or_default()
+    }
+
     // ------------------------------------------------------------ settlement
 
     /// Charge payers for usage and credit gateways. Only approved settlers.
@@ -242,21 +364,54 @@ impl Contract {
     #[payable]
     pub fn settle(&mut self, entries: Vec<SettleEntry>) -> Vec<SettleResult> {
         let settler = env::predecessor_account_id();
-        let any_gateway = *self.settlers.get(&settler).unwrap_or_else(|| env::panic_str("not an approved settler"));
-        require!(entries.len() <= MAX_SETTLE_ENTRIES, format!("at most {MAX_SETTLE_ENTRIES} entries"));
-        let start = env::storage_usage();
+        let any_gateway = *self
+            .settlers
+            .get(&settler)
+            .unwrap_or_else(|| env::panic_str("not an approved settler"));
+        require!(
+            entries.len() <= MAX_SETTLE_ENTRIES,
+            format!("at most {MAX_SETTLE_ENTRIES} entries")
+        );
         let today = env::block_timestamp() / DAY_NS;
+        let byte_cost = env::storage_byte_cost().as_yoctonear();
+        let mut settler_growth: u64 = 0;
         let results = entries
             .into_iter()
             .map(|e| {
+                let before = env::storage_usage();
                 let status = self.settle_one(&settler, any_gateway, today, &e);
-                let charged = if status == SettleStatus::Settled { e.amount } else { U128(0) };
-                SettleResult { payer: e.payer, period_id: e.period_id, status, charged }
+                // LookupMap writes are cached; flush before measuring so the
+                // payer's freed rows and the settler's new rows are visible.
+                self.payers.flush();
+                self.earnings.flush();
+                let after = env::storage_usage();
+                if after > before {
+                    settler_growth = settler_growth.saturating_add(after - before);
+                } else if before > after {
+                    // Only payer balance rows shrink here (settle never
+                    // removes earnings), so the refund belongs to the payer.
+                    self.refund(&e.payer, byte_cost * u128::from(before - after));
+                }
+                let charged = if status == SettleStatus::Settled {
+                    e.amount
+                } else {
+                    U128(0)
+                };
+                SettleResult {
+                    payer: e.payer,
+                    period_id: e.period_id,
+                    status,
+                    charged,
+                }
             })
             .collect();
-        self.payers.flush();
-        self.earnings.flush();
-        self.charge_storage(&settler, start);
+        let need = byte_cost * u128::from(settler_growth);
+        let attached = env::attached_deposit().as_yoctonear();
+        require!(
+            attached >= need,
+            format!("attach at least {need} yoctoNEAR to cover {settler_growth} bytes of settlement storage")
+        );
+        self.refund(&settler, attached - need);
         results
     }
 
@@ -271,11 +426,15 @@ impl Contract {
         require!(self.asset(&asset).is_some(), "unknown asset");
         let payer = env::predecessor_account_id();
         let start = env::storage_usage();
-        let acct = self.payers.get_mut(&payer).unwrap_or_else(|| env::panic_str("no escrow balance"));
+        let acct = self
+            .payers
+            .get_mut(&payer)
+            .unwrap_or_else(|| env::panic_str("no escrow balance"));
         let req = WithdrawRequest {
             asset,
             amount,
-            ready_at_ns: U64(env::block_timestamp().saturating_add(self.config.withdraw_delay_sec.saturating_mul(SEC))),
+            ready_at_ns: U64(env::block_timestamp()
+                .saturating_add(self.config.withdraw_delay_sec.saturating_mul(SEC))),
         };
         acct.withdrawal = Some(req.clone());
         self.payers.flush();
@@ -301,14 +460,50 @@ impl Contract {
     pub fn withdraw_balance(&mut self) -> Promise {
         assert_one_yocto();
         let payer = env::predecessor_account_id();
-        let acct = self.payers.get_mut(&payer).unwrap_or_else(|| env::panic_str("no escrow balance"));
-        let req = acct.withdrawal.take().unwrap_or_else(|| env::panic_str("no withdrawal requested"));
-        require!(env::block_timestamp() >= req.ready_at_ns.0, format!("withdrawal ready at {} ns", req.ready_at_ns.0));
-        let have = acct.balances.iter().find(|(a, _)| *a == req.asset).map(|(_, b)| *b).unwrap_or(0);
+        let start = env::storage_usage();
+        let req = {
+            let acct = self
+                .payers
+                .get_mut(&payer)
+                .unwrap_or_else(|| env::panic_str("no escrow balance"));
+            acct.withdrawal
+                .take()
+                .unwrap_or_else(|| env::panic_str("no withdrawal requested"))
+        };
+        self.payers.flush();
+        let after_take = env::storage_usage();
+        require!(
+            env::block_timestamp() >= req.ready_at_ns.0,
+            format!("withdrawal ready at {} ns", req.ready_at_ns.0)
+        );
+        let acct = self
+            .payers
+            .get_mut(&payer)
+            .unwrap_or_else(|| env::panic_str("no escrow balance"));
+        let have = acct
+            .balances
+            .iter()
+            .find(|(a, _)| *a == req.asset)
+            .map(|(_, b)| *b)
+            .unwrap_or(0);
         let amount = req.amount.0.min(have);
         require!(amount > 0, "nothing to withdraw");
         sub_from(&mut acct.balances, &req.asset, amount);
-        emit("withdraw_balance", json!({"payer": payer, "asset": req.asset, "amount": U128(amount)}));
+        self.payers.flush();
+        // Refund the request bytes paid by the payer. The balance row was
+        // created by a token deposit (no attached NEAR), so its freed storage
+        // stays with the contract to cover that subsidy.
+        let request_bytes = start.saturating_sub(after_take);
+        if request_bytes > 0 {
+            self.refund(
+                &payer,
+                env::storage_byte_cost().as_yoctonear() * u128::from(request_bytes),
+            );
+        }
+        emit(
+            "withdraw_balance",
+            json!({"payer": payer, "asset": req.asset, "amount": U128(amount)}),
+        );
         self.payout(&req.asset, &payer, amount, PayoutKind::Balance)
     }
 
@@ -319,24 +514,44 @@ impl Contract {
     pub fn withdraw_earnings(&mut self) {
         assert_one_yocto();
         let op = env::predecessor_account_id();
-        let earned: Vec<_> = self.earnings.remove(&op).unwrap_or_default().into_iter().filter(|(_, a)| *a > 0).collect();
+        let earned: Vec<_> = self
+            .earnings
+            .remove(&op)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, a)| *a > 0)
+            .collect();
         require!(!earned.is_empty(), "no earnings");
         // One independent payout per asset (joint promises cannot be returned).
         for (asset, amount) in earned {
-            emit("withdraw_earnings", json!({"gateway": op, "asset": asset, "amount": U128(amount)}));
-            self.payout(&asset, &op, amount, PayoutKind::Earnings).detach();
+            emit(
+                "withdraw_earnings",
+                json!({"gateway": op, "asset": asset, "amount": U128(amount)}),
+            );
+            self.payout(&asset, &op, amount, PayoutKind::Earnings)
+                .detach();
         }
     }
 
     /// Restores the amount if the token transfer failed.
     #[private]
-    pub fn on_payout(&mut self, account: AccountId, asset: String, amount: U128, kind: PayoutKind) -> bool {
-        if env::promise_result_checked(0, 64).is_ok() {
+    pub fn on_payout(
+        &mut self,
+        account: AccountId,
+        asset: String,
+        amount: U128,
+        kind: PayoutKind,
+    ) -> bool {
+        // Accept any successful token result. 1024 bytes covers standard
+        // implementer payloads (the previous 64-byte cap misread longer
+        // successful results as failures).
+        if env::promise_result_checked(0, 1024).is_ok() {
             return true;
         }
         match kind {
             PayoutKind::Balance => {
                 let mut acct = self.payers.get(&account).cloned().unwrap_or_default();
+                acct.funded = true;
                 add_to(&mut acct.balances, &asset, amount.0);
                 self.payers.insert(account.clone(), acct);
             }
@@ -346,7 +561,10 @@ impl Contract {
                 self.earnings.insert(account.clone(), e);
             }
         }
-        emit("payout_failed", json!({"account": account, "asset": asset, "amount": amount}));
+        emit(
+            "payout_failed",
+            json!({"account": account, "asset": asset, "amount": amount}),
+        );
         false
     }
 
@@ -356,7 +574,14 @@ impl Contract {
         let a = self.payers.get(&account_id)?;
         let today = env::block_timestamp() / DAY_NS;
         Some(PayerView {
-            balances: a.balances.iter().map(|(asset, b)| AssetBalance { asset: asset.clone(), amount: U128(*b) }).collect(),
+            balances: a
+                .balances
+                .iter()
+                .map(|(asset, b)| AssetBalance {
+                    asset: asset.clone(),
+                    amount: U128(*b),
+                })
+                .collect(),
             available: U128(self.available(a)),
             spend_cap_per_day: a.spend_cap_per_day.map(U128),
             spent_today: U128(if a.day == today { a.spent_today } else { 0 }),
@@ -367,12 +592,20 @@ impl Contract {
     pub fn get_earnings(&self, account_id: AccountId) -> Vec<AssetBalance> {
         self.earnings
             .get(&account_id)
-            .map(|v| v.iter().map(|(asset, b)| AssetBalance { asset: asset.clone(), amount: U128(*b) }).collect())
+            .map(|v| {
+                v.iter()
+                    .map(|(asset, b)| AssetBalance {
+                        asset: asset.clone(),
+                        amount: U128(*b),
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
     pub fn is_settled(&self, settler: AccountId, payer: AccountId, period_id: String) -> bool {
-        self.settled.contains(&settle_key(&settler, &payer, &period_id))
+        self.settled
+            .contains(&settle_key(&settler, &payer, &period_id))
     }
 
     pub fn get_assets(&self) -> Vec<AssetConfig> {
@@ -396,7 +629,10 @@ impl Contract {
                 a.accept_deposits = asset.accept_deposits;
             }
             None => {
-                require!(self.assets.len() < MAX_ASSETS, format!("at most {MAX_ASSETS} assets"));
+                require!(
+                    self.assets.len() < MAX_ASSETS,
+                    format!("at most {MAX_ASSETS} assets")
+                );
                 self.assets.push(asset);
             }
         }
@@ -422,20 +658,32 @@ impl Contract {
 
     /// Spendable micro-USD across all assets.
     fn available(&self, a: &PayerAccount) -> u128 {
-        a.balances.iter().filter_map(|(id, b)| self.asset(id).map(|c| b / c.scale())).sum()
+        a.balances
+            .iter()
+            .filter_map(|(id, b)| self.asset(id).map(|c| b / c.scale()))
+            .fold(0u128, |acc, v| acc.saturating_add(v))
+    }
+
+    fn authorized_settler(&self, payer: &AccountId, settler: &AccountId) -> bool {
+        self.settler_auths
+            .get(payer)
+            .is_some_and(|v| v.contains(settler))
     }
 
     /// Accounts that hold tokens on behalf of others (NEP-245 contracts such
     /// as intents.near): deposits sent *from* them must name the payer.
     fn is_custodian(&self, account: &AccountId) -> bool {
-        self.assets.iter().any(|a| matches!(a.kind(), Ok(AssetKind::Mt(c, _)) if &c == account))
+        self.assets
+            .iter()
+            .any(|a| matches!(a.kind(), Ok(AssetKind::Mt(c, _)) if &c == account))
     }
 
     fn credit(&mut self, sender: &AccountId, msg: &str, deposits: &[(String, u128)]) {
         let m: DepositMsg = if msg.trim().is_empty() {
             DepositMsg::default()
         } else {
-            serde_json::from_str(msg).unwrap_or_else(|e| env::panic_str(&format!("invalid msg: {e}")))
+            serde_json::from_str(msg)
+                .unwrap_or_else(|e| env::panic_str(&format!("invalid msg: {e}")))
         };
         if m.payer.is_none() && self.is_custodian(sender) {
             env::panic_str("deposits relayed by an intents contract must set msg.payer");
@@ -443,21 +691,30 @@ impl Contract {
         let payer = m.payer.unwrap_or_else(|| sender.clone());
         let mut usd: u128 = 0;
         for (asset, amount) in deposits {
-            let cfg = self.asset(asset).unwrap_or_else(|| env::panic_str(&format!("asset {asset} is not accepted")));
-            require!(cfg.accept_deposits, format!("asset {asset} is not accepting deposits"));
+            let cfg = self
+                .asset(asset)
+                .unwrap_or_else(|| env::panic_str(&format!("asset {asset} is not accepted")));
+            require!(
+                cfg.accept_deposits,
+                format!("asset {asset} is not accepting deposits")
+            );
             require!(*amount > 0, "amount must be positive");
             usd = usd.saturating_add(amount / cfg.scale());
         }
-        let mut acct = match self.payers.get(&payer) {
-            Some(a) => a.clone(),
-            None => {
-                require!(
-                    usd >= self.config.min_new_payer_deposit.0,
-                    format!("first deposit must be at least {} micro-USD", self.config.min_new_payer_deposit.0)
-                );
-                PayerAccount::default()
-            }
-        };
+        let mut acct =
+            self.payers.get(&payer).cloned().unwrap_or_else(|| {
+                env::panic_str("payer not registered; call register_payer first")
+            });
+        if !acct.funded {
+            require!(
+                usd >= self.config.min_new_payer_deposit.0,
+                format!(
+                    "first deposit must be at least {} micro-USD",
+                    self.config.min_new_payer_deposit.0
+                )
+            );
+            acct.funded = true;
+        }
         for (asset, amount) in deposits {
             add_to(&mut acct.balances, asset, *amount);
         }
@@ -468,11 +725,20 @@ impl Contract {
         }
         self.payers.insert(payer.clone(), acct);
         for (asset, amount) in deposits {
-            emit("deposit", json!({"payer": payer, "sender": sender, "asset": asset, "amount": U128(*amount)}));
+            emit(
+                "deposit",
+                json!({"payer": payer, "sender": sender, "asset": asset, "amount": U128(*amount)}),
+            );
         }
     }
 
-    fn settle_one(&mut self, settler: &AccountId, any_gateway: bool, today: u64, e: &SettleEntry) -> SettleStatus {
+    fn settle_one(
+        &mut self,
+        settler: &AccountId,
+        any_gateway: bool,
+        today: u64,
+        e: &SettleEntry,
+    ) -> SettleStatus {
         if e.amount.0 == 0 || validate::validate_period_id(&e.period_id).is_err() {
             return SettleStatus::InvalidEntry;
         }
@@ -481,6 +747,9 @@ impl Contract {
         }
         if !self.is_gateway(&e.gateway) {
             return SettleStatus::UnknownGateway;
+        }
+        if !any_gateway && !self.authorized_settler(&e.payer, settler) {
+            return SettleStatus::SettlerNotAuthorized;
         }
         let key = settle_key(settler, &e.payer, &e.period_id);
         if self.settled.contains(&key) {
@@ -492,7 +761,11 @@ impl Contract {
         let Some(cap) = acct.spend_cap_per_day else {
             return SettleStatus::NoSpendCap;
         };
-        let spent = if acct.day == today { acct.spent_today } else { 0 };
+        let spent = if acct.day == today {
+            acct.spent_today
+        } else {
+            0
+        };
         if spent.saturating_add(e.amount.0) > cap {
             return SettleStatus::CapExceeded;
         }
@@ -507,7 +780,14 @@ impl Contract {
             if left == 0 {
                 break;
             }
-            let Some(bal) = acct.balances.iter().find(|(a, _)| *a == cfg.id).map(|(_, b)| *b) else { continue };
+            let Some(bal) = acct
+                .balances
+                .iter()
+                .find(|(a, _)| *a == cfg.id)
+                .map(|(_, b)| *b)
+            else {
+                continue;
+            };
             let take_usd = left.min(bal / cfg.scale());
             if take_usd == 0 {
                 continue;
@@ -519,7 +799,7 @@ impl Contract {
         }
         require!(left == 0, "internal: balance accounting");
         acct.day = today;
-        acct.spent_today = spent + e.amount.0;
+        acct.spent_today = spent.saturating_add(e.amount.0);
         self.payers.insert(e.payer.clone(), acct);
         self.earnings.insert(e.gateway.clone(), earned);
         self.settled.insert(key);
@@ -531,7 +811,9 @@ impl Contract {
     }
 
     fn payout(&self, asset: &str, to: &AccountId, amount: u128, kind: PayoutKind) -> Promise {
-        let cfg = self.asset(asset).unwrap_or_else(|| env::panic_str("unknown asset"));
+        let cfg = self
+            .asset(asset)
+            .unwrap_or_else(|| env::panic_str("unknown asset"));
         let memo = "NEAR Drive payout";
         let one = NearToken::from_yoctonear(1);
         let p = match cfg.kind().unwrap_or_else(|e| env::panic_str(&e)) {
@@ -550,11 +832,10 @@ impl Contract {
                 PAYOUT_GAS,
             ),
         };
-        p.then(Self::ext(env::current_account_id()).with_static_gas(ON_PAYOUT_GAS).on_payout(
-            to.clone(),
-            asset.to_string(),
-            U128(amount),
-            kind,
-        ))
+        p.then(
+            Self::ext(env::current_account_id())
+                .with_static_gas(ON_PAYOUT_GAS)
+                .on_payout(to.clone(), asset.to_string(), U128(amount), kind),
+        )
     }
 }

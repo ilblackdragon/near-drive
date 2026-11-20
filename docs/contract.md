@@ -11,12 +11,25 @@ Methods (JSON args; `U128` = decimal string):
 | rules | `set_rules(rules)` (payable; the caller's own namespace; ≤ 32 rules, one `{account}` per prefix), `get_rules(namespace)` |
 | keys | `set_enc_key(key)` / `remove_enc_key()` (payable), `get_enc_key(account_id)` |
 | revocation | `bump_cred_epoch() -> u64` (payable), `get_cred_epoch(account_id) -> u64` |
-| anchors | `anchor(namespace, root, seq)` (owner or active gateway; seq strictly increasing), `get_anchor(namespace)` |
-| registry | `register_gateway(info)` (stake ≥ `gateway_min_stake` + storage), `update_gateway(info)`, `deregister_gateway()`, `withdraw_gateway_stake()` (after a delay), `get_gateway(operator)`, `list_gateways(from_index, limit)`, `gateways_count()` |
-| escrow | `ft_on_transfer`, `mt_on_transfer`, `set_spend_cap(per_day)`, `settle(entries)`, `request_withdraw_balance(asset, amount)`, `cancel_withdraw_balance()`, `withdraw_balance()`, `withdraw_earnings()`, `get_payer`, `get_earnings`, `is_settled`, `get_assets`, `get_settlers` |
-| owner | `new(owner_id, assets?, config?)`, `set_config(patch)`, `set_asset(asset)`, `add_settler(account_id, any_gateway)`, `remove_settler`, `set_owner`, `get_config`, `get_owner` |
+| anchors | `anchor(namespace, root, seq)` (owner or the owner-authorized active gateway; seq strictly increasing), `clear_anchor(namespace)` (owner), `set_anchor_authority(gateway?)` / `get_anchor_authority(namespace)`, `get_anchor(namespace)` |
+| registry | `register_gateway(info)` (stake ≥ `gateway_min_stake` + storage), `update_gateway(info)`, `deregister_gateway()`, `force_deregister_gateway(operator)` (owner), `withdraw_gateway_stake()` (after the snapshotted delay), `get_gateway(operator)`, `list_gateways(from_index, limit)`, `gateways_count()` |
+| escrow | `ft_on_transfer`, `mt_on_transfer`, `register_payer()` (payable; required before deposits), `close_payer()` (payable; empty entry), `set_spend_cap(per_day)`, `set_settler_authorization(settler, allowed)` / `is_settler_authorized`, `settle(entries)`, `request_withdraw_balance(asset, amount)`, `cancel_withdraw_balance()`, `withdraw_balance()`, `withdraw_earnings()`, `get_payer`, `get_earnings`, `is_settled`, `get_assets`, `get_settlers`, `get_settler_authorizations` |
+| owner | `new(owner_id, assets?, config?)`, `set_config(patch)`, `set_asset(asset)`, `add_settler(account_id, any_gateway)`, `remove_settler`, `propose_owner(owner_id)`, `accept_owner()`, `get_pending_owner`, `get_config`, `get_owner` |
 
 `info = {url, regions, backends, price_hint, attestation?}`.
+
+`anchor` is authorized per namespace: the owner can always call it, or the owner may set
+`set_anchor_authority(gateway)` for one active registered gateway. `clear_anchor` lets the owner recover from a
+gateway that submits a poisoned root or an unreachable `seq` (including `u64::MAX`). Freed anchor storage is
+refunded to the account that paid for the current anchor (`Anchor.payer`), not to whoever replaces it.
+
+`register_payer` is required before `ft_on_transfer` / `mt_on_transfer` credits a new payer. It pays for the
+`PayerAccount` storage in NEAR; the old refundable token-deposit minimum remains only as an initial-deposit
+minimum. `close_payer` removes an empty entry and refunds its storage.
+
+For `settle`, `add_settler(account, any_gateway: true)` is the trusted billing lane and needs no payer
+signature. `any_gateway: false` self-settlers must also be authorized by the payer with
+`set_settler_authorization`; otherwise the result status is `SettlerNotAuthorized`.
 
 The CLI wraps the user-facing calls: `near drive grant` / `rules` (`set_rules` / `get_rules`), `publish-key`
 (`set_enc_key`), `gateways` (`list_gateways`).

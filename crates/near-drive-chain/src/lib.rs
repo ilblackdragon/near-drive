@@ -12,7 +12,10 @@ pub mod tx;
 
 use anyhow::Result;
 use near_drive_core::policy::Rule;
-pub use rpc::{default_rpc_url, CallOutcome, KeyPermission, NearRpc, NoContract, Signer, ONE_NEAR, STORAGE_BYTE_COST, TGAS};
+pub use rpc::{
+    default_rpc_url, CallOutcome, KeyPermission, NearRpc, NoContract, Signer, ONE_NEAR,
+    STORAGE_BYTE_COST, TGAS,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -62,6 +65,9 @@ pub struct Anchor {
     pub root: String,
     pub seq: u64,
     pub by: String,
+    /// Account that paid for the current anchor's storage.
+    #[serde(default)]
+    pub payer: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,7 +85,8 @@ pub struct SettleResult {
     pub payer: String,
     pub period_id: String,
     /// `Settled`, `AlreadySettled`, `InvalidEntry`, `GatewayNotAllowed`,
-    /// `UnknownGateway`, `NoSpendCap`, `CapExceeded`, `InsufficientBalance`.
+    /// `UnknownGateway`, `SettlerNotAuthorized`, `NoSpendCap`, `CapExceeded`,
+    /// `InsufficientBalance`.
     pub status: String,
     #[serde(with = "u128_str")]
     pub charged: u128,
@@ -110,31 +117,202 @@ pub struct StorageContract {
 
 impl StorageContract {
     pub fn new(rpc_url: impl Into<String>, contract_id: impl Into<String>) -> Self {
-        Self { rpc: NearRpc::new(rpc_url), contract_id: contract_id.into() }
+        Self {
+            rpc: NearRpc::new(rpc_url),
+            contract_id: contract_id.into(),
+        }
     }
 
-    async fn view<T: serde::de::DeserializeOwned>(&self, method: &str, args: serde_json::Value) -> Result<T> {
+    async fn view<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        args: serde_json::Value,
+    ) -> Result<T> {
         self.rpc.view(&self.contract_id, method, &args).await
     }
 
     pub async fn get_rules(&self, namespace: &str) -> Result<Vec<Rule>> {
-        self.view("get_rules", json!({"namespace": namespace})).await
+        self.view("get_rules", json!({"namespace": namespace}))
+            .await
     }
 
     pub async fn get_enc_key(&self, account: &str) -> Result<Option<String>> {
-        self.view("get_enc_key", json!({"account_id": account})).await
+        self.view("get_enc_key", json!({"account_id": account}))
+            .await
     }
 
     pub async fn get_cred_epoch(&self, account: &str) -> Result<u64> {
-        self.view("get_cred_epoch", json!({"account_id": account})).await
+        self.view("get_cred_epoch", json!({"account_id": account}))
+            .await
     }
 
     pub async fn get_anchor(&self, namespace: &str) -> Result<Option<Anchor>> {
-        self.view("get_anchor", json!({"namespace": namespace})).await
+        self.view("get_anchor", json!({"namespace": namespace}))
+            .await
+    }
+
+    pub async fn set_anchor_authority(
+        &self,
+        signer: &Signer,
+        gateway: Option<&str>,
+    ) -> Result<CallOutcome> {
+        let args = json!({"gateway": gateway});
+        let deposit = storage_deposit_for(args.to_string().len());
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "set_anchor_authority",
+                &args,
+                CALL_GAS,
+                deposit,
+            )
+            .await
+    }
+
+    pub async fn get_anchor_authority(&self, namespace: &str) -> Result<Option<String>> {
+        self.view("get_anchor_authority", json!({"namespace": namespace}))
+            .await
+    }
+
+    pub async fn clear_anchor(&self, signer: &Signer, namespace: &str) -> Result<CallOutcome> {
+        let args = json!({"namespace": namespace});
+        let deposit = storage_deposit_for(0);
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "clear_anchor",
+                &args,
+                CALL_GAS,
+                deposit,
+            )
+            .await
+    }
+
+    pub async fn register_payer(&self, signer: &Signer) -> Result<CallOutcome> {
+        let deposit = storage_deposit_for(0);
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "register_payer",
+                &json!({}),
+                CALL_GAS,
+                deposit,
+            )
+            .await
+    }
+
+    pub async fn close_payer(&self, signer: &Signer) -> Result<CallOutcome> {
+        let deposit = storage_deposit_for(0);
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "close_payer",
+                &json!({}),
+                CALL_GAS,
+                deposit,
+            )
+            .await
+    }
+
+    pub async fn set_settler_authorization(
+        &self,
+        signer: &Signer,
+        settler: &str,
+        allowed: bool,
+    ) -> Result<CallOutcome> {
+        let args = json!({"settler": settler, "allowed": allowed});
+        let deposit = storage_deposit_for(args.to_string().len());
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "set_settler_authorization",
+                &args,
+                CALL_GAS,
+                deposit,
+            )
+            .await
+    }
+
+    pub async fn is_settler_authorized(&self, payer: &str, settler: &str) -> Result<bool> {
+        self.view(
+            "is_settler_authorized",
+            json!({"payer": payer, "settler": settler}),
+        )
+        .await
+    }
+
+    pub async fn get_settler_authorizations(&self, payer: &str) -> Result<Vec<String>> {
+        self.view("get_settler_authorizations", json!({"payer": payer}))
+            .await
+    }
+
+    pub async fn propose_owner(&self, signer: &Signer, owner: &str) -> Result<CallOutcome> {
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "propose_owner",
+                &json!({"owner_id": owner}),
+                CALL_GAS,
+                0,
+            )
+            .await
+    }
+
+    pub async fn accept_owner(&self, signer: &Signer) -> Result<CallOutcome> {
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "accept_owner",
+                &json!({}),
+                CALL_GAS,
+                0,
+            )
+            .await
+    }
+
+    pub async fn force_deregister_gateway(
+        &self,
+        signer: &Signer,
+        operator: &str,
+    ) -> Result<CallOutcome> {
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "force_deregister_gateway",
+                &json!({"operator": operator}),
+                CALL_GAS,
+                0,
+            )
+            .await
+    }
+
+    pub async fn withdraw_gateway_stake(&self, signer: &Signer) -> Result<CallOutcome> {
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "withdraw_gateway_stake",
+                &json!({}),
+                CALL_GAS,
+                1,
+            )
+            .await
     }
 
     pub async fn list_gateways(&self, from_index: u32, limit: u32) -> Result<Vec<GatewayView>> {
-        self.view("list_gateways", json!({"from_index": from_index, "limit": limit})).await
+        self.view(
+            "list_gateways",
+            json!({"from_index": from_index, "limit": limit}),
+        )
+        .await
     }
 
     /// Every registered gateway (pages of 100).
@@ -153,7 +331,16 @@ impl StorageContract {
     pub async fn set_rules(&self, signer: &Signer, rules: &[Rule]) -> Result<CallOutcome> {
         let args = json!({"rules": rules});
         let deposit = storage_deposit_for(args.to_string().len());
-        self.rpc.call(signer, &self.contract_id, "set_rules", &args, CALL_GAS, deposit).await
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "set_rules",
+                &args,
+                CALL_GAS,
+                deposit,
+            )
+            .await
     }
 
     /// Read the signer's rules, upsert `rule` by prefix, write them back.
@@ -166,41 +353,121 @@ impl StorageContract {
 
     pub async fn set_enc_key(&self, signer: &Signer, key: &str) -> Result<CallOutcome> {
         let args = json!({"key": key});
-        self.rpc.call(signer, &self.contract_id, "set_enc_key", &args, CALL_GAS, storage_deposit_for(key.len())).await
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "set_enc_key",
+                &args,
+                CALL_GAS,
+                storage_deposit_for(key.len()),
+            )
+            .await
     }
 
     pub async fn bump_cred_epoch(&self, signer: &Signer) -> Result<u64> {
-        self.rpc.call(signer, &self.contract_id, "bump_cred_epoch", &json!({}), CALL_GAS, storage_deposit_for(0)).await?.json()
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "bump_cred_epoch",
+                &json!({}),
+                CALL_GAS,
+                storage_deposit_for(0),
+            )
+            .await?
+            .json()
     }
 
-    pub async fn anchor(&self, signer: &Signer, namespace: &str, root: &str, seq: u64) -> Result<CallOutcome> {
+    pub async fn anchor(
+        &self,
+        signer: &Signer,
+        namespace: &str,
+        root: &str,
+        seq: u64,
+    ) -> Result<CallOutcome> {
         let args = json!({"namespace": namespace, "root": root, "seq": seq});
-        self.rpc.call(signer, &self.contract_id, "anchor", &args, CALL_GAS, storage_deposit_for(root.len())).await
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "anchor",
+                &args,
+                CALL_GAS,
+                storage_deposit_for(root.len()),
+            )
+            .await
     }
 
     /// `stake` is in yoctoNEAR; the storage cost is added on top.
-    pub async fn register_gateway(&self, signer: &Signer, info: &GatewayInfo, stake: u128) -> Result<CallOutcome> {
+    pub async fn register_gateway(
+        &self,
+        signer: &Signer,
+        info: &GatewayInfo,
+        stake: u128,
+    ) -> Result<CallOutcome> {
         let args = json!({"info": info});
         let deposit = stake + storage_deposit_for(args.to_string().len());
-        self.rpc.call(signer, &self.contract_id, "register_gateway", &args, CALL_GAS, deposit).await
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "register_gateway",
+                &args,
+                CALL_GAS,
+                deposit,
+            )
+            .await
     }
 
     pub async fn update_gateway(&self, signer: &Signer, info: &GatewayInfo) -> Result<CallOutcome> {
         let args = json!({"info": info});
         let deposit = storage_deposit_for(args.to_string().len());
-        self.rpc.call(signer, &self.contract_id, "update_gateway", &args, CALL_GAS, deposit).await
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "update_gateway",
+                &args,
+                CALL_GAS,
+                deposit,
+            )
+            .await
     }
 
     pub async fn deregister_gateway(&self, signer: &Signer) -> Result<CallOutcome> {
-        self.rpc.call(signer, &self.contract_id, "deregister_gateway", &json!({}), CALL_GAS, 1).await
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "deregister_gateway",
+                &json!({}),
+                CALL_GAS,
+                1,
+            )
+            .await
     }
 
     /// Billing settlement (approved settlers only). ~0.001 NEAR of storage is
     /// attached per entry; unused deposit is refunded.
-    pub async fn settle(&self, signer: &Signer, entries: &[SettleEntry]) -> Result<Vec<SettleResult>> {
+    pub async fn settle(
+        &self,
+        signer: &Signer,
+        entries: &[SettleEntry],
+    ) -> Result<Vec<SettleResult>> {
         let args = json!({"entries": entries});
         let deposit = storage_deposit_for(entries.len() * 200);
-        self.rpc.call(signer, &self.contract_id, "settle", &args, 300 * TGAS, deposit).await?.json()
+        self.rpc
+            .call(
+                signer,
+                &self.contract_id,
+                "settle",
+                &args,
+                300 * TGAS,
+                deposit,
+            )
+            .await?
+            .json()
     }
 }
 
@@ -210,11 +477,19 @@ mod tests {
 
     #[test]
     fn upsert() {
-        let r = |p: &str, w: &str| Rule { prefix: p.into(), read: vec![], write: vec![w.into()], payer: None };
+        let r = |p: &str, w: &str| Rule {
+            prefix: p.into(),
+            read: vec![],
+            write: vec![w.into()],
+            payer: None,
+        };
         let mut rules = vec![r("a/", "x.near"), r("b/", "y.near")];
         upsert_rule(&mut rules, r("a/", "z.near"));
         upsert_rule(&mut rules, r("c/", "w.near"));
-        assert_eq!(rules, vec![r("a/", "z.near"), r("b/", "y.near"), r("c/", "w.near")]);
+        assert_eq!(
+            rules,
+            vec![r("a/", "z.near"), r("b/", "y.near"), r("c/", "w.near")]
+        );
     }
 
     #[test]

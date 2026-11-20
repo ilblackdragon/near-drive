@@ -17,8 +17,15 @@ use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    FunctionCall { method_name: String, args: Vec<u8>, gas: u64, deposit: u128 },
-    Transfer { deposit: u128 },
+    FunctionCall {
+        method_name: String,
+        args: Vec<u8>,
+        gas: u64,
+        deposit: u128,
+    },
+    Transfer {
+        deposit: u128,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -48,7 +55,12 @@ impl Transaction {
         o.extend_from_slice(&(self.actions.len() as u32).to_le_bytes());
         for a in &self.actions {
             match a {
-                Action::FunctionCall { method_name, args, gas, deposit } => {
+                Action::FunctionCall {
+                    method_name,
+                    args,
+                    gas,
+                    deposit,
+                } => {
                     o.push(2);
                     put_bytes(&mut o, method_name.as_bytes());
                     put_bytes(&mut o, args);
@@ -94,7 +106,12 @@ mod tests {
             receiver_id: "cd".into(),
             block_hash: [9u8; 32],
             actions: vec![
-                Action::FunctionCall { method_name: "m".into(), args: b"{}".to_vec(), gas: 7, deposit: 1 },
+                Action::FunctionCall {
+                    method_name: "m".into(),
+                    args: b"{}".to_vec(),
+                    gas: 7,
+                    deposit: 1,
+                },
                 Action::Transfer { deposit: 2 },
             ],
         };
