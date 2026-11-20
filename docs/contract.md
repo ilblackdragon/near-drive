@@ -56,12 +56,16 @@ compares: `OK: ... runs exactly the code built from ... @ <commit>`, or `MISMATC
 ordinary (non-reproducible) build has no build info and is reported as not verifiable. The same metadata also lets
 [SourceScan](https://nearblocks.io/verifier) verify the contract and show its source on NEAR explorers.
 
+The code hash changes with every commit, even if the contract source didn't change, because the wasm embeds the
+commit it was built from; compare builds of the same commit.
+
 **Deploying:** always deploy the wasm from `build-reproducible.sh` (or the release asset), never a local
 `cargo near build non-reproducible-wasm` output, so the deployment stays verifiable.
 
 Checked so far:
 - Three independent builds of the same commit (two fresh clones, and a pinned checkout) gave the identical wasm
   (sha256 `1fbf13c5…6c52`, code hash `38vdScEnDv777Hoeir9BnfBZi1Ph6qoeJXEHpGbLHXqB` for commit `d338bb4`).
+- GitHub's runner (`contract.yml`) rebuilt the same commit to the same code hash, so it reproduces across machines.
 - The contract's sandbox test suites pass with the reproducible wasm.
 - `verify.sh` against a local sandbox chain reports OK for the reproducible deployment and rejects an ordinary build.
 
