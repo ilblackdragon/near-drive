@@ -1,0 +1,53 @@
+name: contract
+# Reproducible build of the drive.near contract (contracts/build-reproducible.sh):
+# pinned Docker image, fresh clone of the pushed commit, NEP-330 build info
+# embedded. Runs when the contract changes, by hand, and from release.yml
+# (the wasm is attached to every release).
+on:
+  push:
+    branches: [main]
+    paths: ["contracts/**"]
+  workflow_dispatch:
+    inputs:
+      rev:
+        description: "Commit or tag to build (default: the selected branch head)"
+        required: false
+  workflow_call:
+    inputs:
+      rev:
+        type: string
+        required: true
+    outputs:
+      code_hash:
+        value: ${{ jobs.build.outputs.code_hash }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      code_hash: ${{ steps.build.outputs.code_hash }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install cargo-near
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/near/cargo-near/releases/latest/download/cargo-near-installer.sh | sh
+      - name: reproducible build
+        id: build
+        env:
+          REV: ${{ inputs.rev || github.sha }}
+        run: |
+          sh contracts/build-reproducible.sh "$REV" dist | tee build.txt
+          hash=$(sed -n 's/^code hash: *\([^ ]*\).*/\1/p' build.txt)
+          echo "code_hash=$hash" >> "$GITHUB_OUTPUT"
+          {
+            echo "### drive.near reproducible build"
+            echo '```'
+            cat build.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: contract-wasm
+          path: |
+            dist/near_drive_contract.wasm
+            dist/near_drive_contract.wasm.sha256

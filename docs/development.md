@@ -121,6 +121,9 @@ contracts/build.sh                                     # cargo near build -> con
 cd contracts && cargo test -p near-drive-contract      # unit tests + local sandbox (near-workspaces) tests
 ```
 
+For deployment, build reproducibly instead (Docker, pinned image, NEP-330 build info):
+`contracts/build-reproducible.sh` — see [contract.md](contract.md#reproducible-build-and-verification).
+
 `tests/sandbox.rs` covers contract flows with mock FT/MT tokens and the `near-drive-chain` transaction builder;
 `tests/gateway_chain.rs` runs a real gateway resolving keys and rules from the sandbox chain, sharing by account and
 discovery. The sandbox node binary is downloaded on first run.

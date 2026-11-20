@@ -21,4 +21,48 @@ Methods (JSON args; `U128` = decimal string):
 The CLI wraps the user-facing calls: `near drive grant` / `rules` (`set_rules` / `get_rules`), `publish-key`
 (`set_enc_key`), `gateways` (`list_gateways`).
 
-Building and testing the contract: [development.md](development.md#contract).
+## Reproducible build and verification
+
+The contract builds reproducibly: anyone can rebuild it from source and get byte-for-byte the same wasm, and so check
+that a deployed `drive.near` runs exactly the published source.
+
+- `contracts/drive/Cargo.toml` pins the build environment (`[package.metadata.near.reproducible_build]`): the
+  `sourcescan/cargo-near` Docker image **by digest**, and the build command inside it (`cargo near build
+  non-reproducible-wasm --locked`, so the dependency versions come from `contracts/Cargo.lock`).
+- `cargo near build reproducible-wasm` only runs on a clean commit that is pushed to the public repository, and
+  embeds [NEP-330](https://github.com/near/NEPs/blob/master/neps/nep-0330.md) build info in the wasm: image, command,
+  `contract_path` and `source_code_snapshot` (`git+https://github.com/ilblackdragon/near-drive?rev=<commit>`). A deployed
+  contract returns it from the `contract_source_metadata` view.
+
+**Build** (needs git, Docker and [cargo-near](https://github.com/near/cargo-near)):
+
+```sh
+contracts/build-reproducible.sh [commit-or-tag] [out-dir]     # default: main -> contracts/res/
+```
+
+It clones the public repository at that revision into a temporary directory (so local, uncommitted changes can't
+leak in), builds in the pinned image, and prints the wasm's SHA-256 and its NEAR code hash (base58). Each release
+attaches `near_drive_contract.wasm` built this way, with its code hash in the release notes
+(`.github/workflows/contract.yml`, also run whenever `contracts/` changes on `main`).
+
+**Verify a deployment:**
+
+```sh
+contracts/verify.sh drive.near            # or: verify.sh <account> testnet | <rpc-url>
+```
+
+It reads the account's `contract_source_metadata` and on-chain code hash, rebuilds the recorded commit, and
+compares: `OK: ... runs exactly the code built from ... @ <commit>`, or `MISMATCH`. A contract deployed from an
+ordinary (non-reproducible) build has no build info and is reported as not verifiable. The same metadata also lets
+[SourceScan](https://nearblocks.io/verifier) verify the contract and show its source on NEAR explorers.
+
+**Deploying:** always deploy the wasm from `build-reproducible.sh` (or the release asset), never a local
+`cargo near build non-reproducible-wasm` output, so the deployment stays verifiable.
+
+Checked so far:
+- Three independent builds of the same commit (two fresh clones, and a pinned checkout) gave the identical wasm
+  (sha256 `1fbf13c5…6c52`, code hash `38vdScEnDv777Hoeir9BnfBZi1Ph6qoeJXEHpGbLHXqB` for commit `d338bb4`).
+- The contract's sandbox test suites pass with the reproducible wasm.
+- `verify.sh` against a local sandbox chain reports OK for the reproducible deployment and rejects an ordinary build.
+
+Building and testing the contract during development: [development.md](development.md#contract).

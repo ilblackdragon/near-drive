@@ -87,8 +87,14 @@ jobs:
           name: near-drive-${{ matrix.target }}
           path: dist/*
 
+  # Reproducible drive.near wasm, attached to the release.
+  contract:
+    uses: ./.github/workflows/contract.yml
+    with:
+      rev: ${{ inputs.tag || github.ref_name }}
+
   publish:
-    needs: build
+    needs: [build, contract]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -106,7 +112,9 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           cp install.sh install.ps1 dist/
-          notes="Install: see https://github.com/${{ github.repository }}/blob/main/docs/install.md"
+          notes="Install: see https://github.com/${{ github.repository }}/blob/main/docs/install.md
+
+          drive.near contract: \`near_drive_contract.wasm\`, reproducible build, code hash \`${{ needs.contract.outputs.code_hash }}\` (verify a deployment with \`contracts/verify.sh <account>\`; see docs/contract.md)."
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
           else
