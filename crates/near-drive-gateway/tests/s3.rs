@@ -153,7 +153,10 @@ async fn s3_blobs_presigned_locate_and_cache() {
     let storage = json!({
         "backends": {"s3": s3_with_prefix(&base, &format!("{run}/chunks/"))},
         "index": s3_with_prefix(&base, &format!("{run}/index/")),
-        "cache": {"max_bytes": 32 << 20}
+        "cache": {"max_bytes": 32 << 20},
+        // off: its write-through would serve small chunks from memory, and
+        // this test checks the disk cache
+        "small_cache": {"max_bytes": 0}
     });
     let gw = start_gateway(dir.path().join("gw"), dev, storage).await;
     let mut alice = client(&gw.url, "alice.near", &keys["alice.near"], Some(RootKey::generate()));
@@ -174,18 +177,31 @@ async fn s3_blobs_presigned_locate_and_cache() {
     let b = reqwest::get(loc.chunks[3].url.as_deref().unwrap()).await.unwrap().bytes().await.unwrap();
     assert_eq!(near_drive_client::near_drive_core::cid(&b), loc.chunks[3].cid);
 
-    let usage = || std::fs::read_to_string(gw.data_dir.join("usage.jsonl")).unwrap().lines().filter(|l| l.contains("egress")).count();
-    let before = usage();
+    // Egress is metered once per locate (all URL chunks, up front); chunks
+    // served through the gateway would add an event each.
+    let egress = || -> Vec<u64> {
+        std::fs::read_to_string(gw.data_dir.join("usage.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|e| e["kind"] == "egress")
+            .map(|e| e["bytes"].as_u64().unwrap())
+            .collect()
+    };
+    let located: u64 = loc.chunks.iter().map(|c| c.len).sum();
+    assert_eq!(egress(), vec![located], "locate meters the direct chunks");
     alice.get_to_file(&uri, dir.path().join("out")).await.unwrap();
     assert_eq!(hash_file(&dir.path().join("out")), h);
-    assert_eq!(usage(), before, "chunks came from S3 directly");
+    assert_eq!(egress(), vec![located, located], "only the download's locate: chunks came from S3 directly");
     let data = std::fs::read(&src).unwrap();
     assert_eq!(alice.get_range(&uri, 1_000_000..3_500_000).await.unwrap(), data[1_000_000..3_500_000]);
 
     // gateway path (one-shot get) fills the read-through cache
     assert_eq!(alice.get(&uri).await.unwrap().1, data);
-    let cached = std::fs::read_dir(gw.data_dir.join("cache")).unwrap().count();
-    assert!(cached >= 9, "cache has {cached} entries");
+    for c in &loc.chunks {
+        let f = gw.data_dir.join("cache").join(c.cid.strip_prefix("b3:").unwrap());
+        assert!(f.is_file(), "{} not in the disk cache", c.cid);
+    }
 }
 
 #[tokio::test]
