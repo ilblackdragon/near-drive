@@ -8,6 +8,7 @@ pub mod placement;
 pub mod policies;
 pub mod s3;
 pub mod changes;
+pub mod gc;
 pub mod small;
 pub mod store;
 pub mod usage;
@@ -69,6 +70,28 @@ pub struct Config {
     /// signatures, not cookies, so credentials are never allowed.
     #[serde(default)]
     pub cors_origins: Vec<String>,
+    /// Periodic chunk garbage collection in the server; off when absent
+    /// (see `gc.rs`; `near-drive-gateway gc` runs it once).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gc: Option<gc::GcConfig>,
+}
+
+/// Environment variable holding the whole config as inline JSON (containers).
+pub const CONFIG_JSON_ENV: &str = "NEAR_DRIVE_CONFIG_JSON";
+
+impl Config {
+    /// From a JSON file (`--config` / `NEAR_DRIVE_CONFIG`) or inline JSON
+    /// (`NEAR_DRIVE_CONFIG_JSON`); exactly one must be given.
+    pub fn load(path: Option<&std::path::Path>, inline_json: Option<&str>) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        match (path, inline_json) {
+            (Some(p), None) => serde_json::from_slice(&std::fs::read(p).with_context(|| format!("reading config {}", p.display()))?)
+                .with_context(|| format!("parsing config {}", p.display())),
+            (None, Some(j)) => serde_json::from_str(j).with_context(|| format!("parsing {CONFIG_JSON_ENV}")),
+            (Some(_), Some(_)) => anyhow::bail!("both a config file (--config / NEAR_DRIVE_CONFIG) and {CONFIG_JSON_ENV} are set; use one"),
+            (None, None) => anyhow::bail!("no config: pass --config <file>, or set NEAR_DRIVE_CONFIG (path) or {CONFIG_JSON_ENV} (inline JSON)"),
+        }
+    }
 }
 
 impl Default for Config {
@@ -84,6 +107,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             billing: None,
             cors_origins: Vec::new(),
+            gc: None,
         }
     }
 }
@@ -119,7 +143,7 @@ impl AppState {
             }
             None => None,
         };
-        Ok(Arc::new(Self {
+        let st = Arc::new(Self {
             billing,
             blobs: Placement::from_config(&cfg.storage, &cfg.data_dir)?,
             index: small::CachedIndex::wrap(cfg.storage.index.build(&cfg.data_dir)?, &cfg.storage.small_cache),
@@ -135,7 +159,11 @@ impl AppState {
             replay: Mutex::new(HashMap::new()),
             changes: changes::Hub::default(),
             cfg,
-        }))
+        });
+        if let Some(g) = &st.cfg.gc {
+            gc::spawn_periodic(Arc::downgrade(&st), g.clone());
+        }
+        Ok(st)
     }
 
     async fn rules(&self, ns: &str) -> Result<Arc<Vec<Rule>>, ApiError> {

@@ -134,7 +134,7 @@ pub async fn up(ctx: &mut Ctx, proxy: ProxyArgs, no_s3: bool, file_provider: Opt
         return Ok(());
     }
     if !no_s3 {
-        near_drive_s3::check_loopback(&proxy.listen)?;
+        near_drive_s3::check_listen(&proxy.listen, proxy.public_listen)?;
         if listening(&proxy.listen) {
             bail!("something is already listening on {}; pick another with --listen (or --no-s3)", proxy.listen);
         }
@@ -158,6 +158,18 @@ pub async fn up(ctx: &mut Ctx, proxy: ProxyArgs, no_s3: bool, file_provider: Opt
         words.extend(["--public-prefix".into(), p.clone()]);
     }
     words.extend(["--max-body-mib".into(), proxy.max_body_mib.to_string(), "--region".into(), proxy.region.clone()]);
+    for a in &proxy.bucket_aliases {
+        words.extend(["--bucket-alias".into(), a.clone()]);
+    }
+    for o in &proxy.cors_origins {
+        words.extend(["--cors-origin".into(), o.clone()]);
+    }
+    for d in &proxy.vhost_domains {
+        words.extend(["--virtual-host-domain".into(), d.clone()]);
+    }
+    if proxy.public_listen {
+        words.push("--public-listen".into());
+    }
     let mut echo = words.clone();
     echo[0] = "up".into();
     ctx.echo(&echo);

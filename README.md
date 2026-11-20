@@ -166,7 +166,8 @@ All three SDKs read and write the same format and use the same keys as the CLI.
 | [docs/sync.md](docs/sync.md) | synced folders: behaviour, conflicts, deletes, file names |
 | [docs/mount.md](docs/mount.md) | files on demand (`near drive mount`) |
 | [docs/s3.md](docs/s3.md) | the S3-compatible endpoint |
-| [docs/gateway.md](docs/gateway.md) | running a gateway: storage backends, classes, caches, billing |
+| [docs/gateway.md](docs/gateway.md) | running a gateway: storage backends, classes, caches, garbage collection, billing |
+| [docs/deploy.md](docs/deploy.md) | deploying for a service (containers, moving off S3 / R2 without code changes) |
 | [docs/contract.md](docs/contract.md) | the `drive.near` contract |
 | [docs/ckd.md](docs/ckd.md) | deriving encryption keys from your account (MPC CKD) |
 | [docs/payments.md](docs/payments.md) | paying for storage with stablecoins / NEAR Intents |

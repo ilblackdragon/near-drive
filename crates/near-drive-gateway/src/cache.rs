@@ -154,6 +154,19 @@ impl ChunkCache {
         }
     }
 
+    /// Drop a chunk (garbage collection deleted it from the backends).
+    pub async fn remove(&self, cid: &str) {
+        let had = {
+            let mut lru = self.lru.lock().await;
+            let had = lru.entries.contains_key(cid);
+            lru.remove(cid);
+            had
+        };
+        if had {
+            let _ = tokio::fs::remove_file(self.file(cid)).await;
+        }
+    }
+
     pub async fn total_bytes(&self) -> u64 {
         self.lru.lock().await.total
     }

@@ -19,7 +19,7 @@
 //! record (CAS) with a tombstone `{"tombstone":true,"seq":n}` because plain S3
 //! DELETE is not conditional; tombstones are invisible to get/list and the
 //! next write of that path starts again at seq 1.
-use crate::store::{BlobStore, CasError, DirectUrl, IndexEntry, IndexStore};
+use crate::store::{BlobStore, CasError, ChunkInfo, DirectUrl, IndexEntry, IndexStore};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -30,7 +30,12 @@ use object_store::{
     GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
 };
 use serde::{Deserialize, Serialize};
-use std::{ops::Range, sync::Arc, time::Duration};
+use futures_util::stream::BoxStream;
+use std::{
+    ops::Range,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 /// `{"type":"s3", ...}` in gateway config. Unset credentials / region /
 /// endpoint fall back to the standard `AWS_*` environment variables.
@@ -143,6 +148,16 @@ impl S3BlobStore {
     }
 }
 
+/// `object_store` timestamp as `SystemTime`.
+fn system_time(t: &object_store::ObjectMeta) -> SystemTime {
+    let ms = t.last_modified.timestamp_millis();
+    if ms >= 0 {
+        UNIX_EPOCH + Duration::from_millis(ms as u64)
+    } else {
+        UNIX_EPOCH
+    }
+}
+
 #[async_trait]
 impl BlobStore for S3BlobStore {
     async fn put(&self, cid: &str, bytes: Bytes) -> Result<()> {
@@ -186,6 +201,42 @@ impl BlobStore for S3BlobStore {
         let url = object_store::signer::Signer::signed_url(signer.as_ref(), reqwest::Method::GET, &key, self.presign_ttl).await?;
         let expires_ms = crate::now_ms() + self.presign_ttl.as_millis() as u64;
         Ok(Some(DirectUrl { url: url.to_string(), expires_ms: Some(expires_ms) }))
+    }
+    /// Lists `{prefix}b3/`; keys that are not `b3/{hex[0..2]}/{hex}` are skipped.
+    fn list(&self) -> Option<BoxStream<'_, Result<ChunkInfo>>> {
+        let mut parts = self.prefix.clone();
+        parts.push(PathPart::from("b3"));
+        let base = OPath::from_iter(parts);
+        let depth = self.prefix.len() + 3;
+        let s = self.store.list(Some(&base)).map_err(anyhow::Error::from).try_filter_map(move |m| async move {
+            let parts: Vec<String> = m.location.parts().map(|p| p.as_ref().to_string()).collect();
+            if parts.len() != depth {
+                return Ok(None);
+            }
+            let (dir, hex) = (&parts[depth - 2], &parts[depth - 1]);
+            let cid = format!("b3:{hex}");
+            if !near_drive_core::is_valid_cid(&cid) || !hex.starts_with(dir.as_str()) || dir.len() != 2 {
+                return Ok(None);
+            }
+            Ok(Some(ChunkInfo { cid, size: m.size, modified: system_time(&m) }))
+        });
+        Some(Box::pin(s))
+    }
+    /// HEAD (age re-check), then DELETE. S3 has no conditional delete, so a
+    /// re-upload landing between the two is lost; the window is one round trip.
+    async fn delete_if_older(&self, cid: &str, cutoff: SystemTime) -> Result<bool> {
+        let key = self.key(cid)?;
+        match self.store.head(&key).await {
+            Ok(m) if system_time(&m) < cutoff => {}
+            Ok(_) => return Ok(false),
+            Err(e) if not_found(&e) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        match self.store.delete(&key).await {
+            Ok(()) => Ok(true),
+            Err(e) if not_found(&e) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -344,6 +395,15 @@ impl IndexStore for ObjectIndexStore {
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
     }
+
+    /// The first-level "directories" under the index prefix.
+    async fn namespaces(&self) -> Result<Vec<String>> {
+        let base = OPath::from_iter(self.prefix.clone());
+        let r = self.store.list_with_delimiter(Some(&base)).await?;
+        let mut out: Vec<String> = r.common_prefixes.iter().filter_map(|p| p.parts().next_back().map(|p| decode_part(p.as_ref()))).collect();
+        out.sort();
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -403,6 +463,64 @@ mod tests {
         assert_eq!(s.get_range(&cid, 6..100).await.unwrap().unwrap(), &b"world"[..]);
         assert!(s.direct_url(&cid).await.unwrap().is_none());
         assert_eq!(s.key(&cid).unwrap().to_string(), format!("chunks/b3/{}/{}", &cid[3..5], &cid[3..]));
+    }
+
+    #[tokio::test]
+    async fn blob_listing_and_gc_delete() {
+        let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let s = S3BlobStore::with_store(mem.clone(), "chunks/");
+        let other = S3BlobStore::with_store(mem.clone(), "other/");
+        let mut cids = vec![];
+        for i in 0..5u8 {
+            let b = Bytes::from(vec![i; 10 + i as usize]);
+            cids.push(near_drive_core::cid(&b));
+            s.put(&cids[i as usize], b).await.unwrap();
+        }
+        let x = Bytes::from_static(b"elsewhere");
+        other.put(&near_drive_core::cid(&x), x).await.unwrap();
+        // junk under the chunk prefix is ignored
+        for k in ["chunks/b3/zz/notahash", "chunks/b3/ab", "chunks/readme", &format!("chunks/b3/00/{}", &cids[0][3..])] {
+            mem.put(&OPath::from(k), PutPayload::from_static(b"x")).await.unwrap();
+        }
+        let mut ls: Vec<ChunkInfo> = s.list().unwrap().try_collect().await.unwrap();
+        ls.sort_by(|a, b| a.cid.cmp(&b.cid));
+        let mut want = cids.clone();
+        want.sort();
+        assert_eq!(ls.iter().map(|c| c.cid.clone()).collect::<Vec<_>>(), want, "only this prefix's well-formed chunks");
+        let i = cids.iter().position(|c| *c == ls[0].cid).unwrap();
+        assert_eq!(ls[0].size, 10 + i as u64);
+        let now = SystemTime::now();
+        assert!(ls.iter().all(|c| c.modified <= now && now.duration_since(c.modified).unwrap() < Duration::from_secs(60)));
+        // delete only if older than the cutoff (re-checked against the store)
+        assert!(!s.delete_if_older(&cids[0], now - Duration::from_secs(3600)).await.unwrap(), "fresh chunk kept");
+        assert!(s.has(&cids[0]).await.unwrap());
+        let later = now + Duration::from_secs(3600);
+        assert!(s.delete_if_older(&cids[0], later).await.unwrap());
+        assert!(!s.has(&cids[0]).await.unwrap());
+        assert!(!s.delete_if_older(&cids[0], later).await.unwrap(), "already gone");
+        assert_eq!(s.list().unwrap().try_collect::<Vec<_>>().await.unwrap().len(), 4);
+        assert_eq!(other.list().unwrap().try_collect::<Vec<_>>().await.unwrap().len(), 1);
+        // empty prefix lists `b3/` only
+        let root = S3BlobStore::with_store(mem.clone(), "");
+        assert!(root.list().unwrap().try_collect::<Vec<_>>().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn index_namespaces() {
+        let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let idx = ObjectIndexStore::with_store(mem.clone(), "index/");
+        assert!(idx.namespaces().await.unwrap().is_empty());
+        let sk = SigningKey::from_bytes(&[1; 32]);
+        idx.cas_put(&rec("a/b", 1, &sk)).await.unwrap();
+        let mut bob = rec("x", 1, &sk);
+        bob.record.namespace = "bob.near".into();
+        idx.cas_put(&bob).await.unwrap();
+        mem.put(&OPath::from("elsewhere/c.near/x"), PutPayload::from_static(b"{}")).await.unwrap();
+        assert_eq!(idx.namespaces().await.unwrap(), vec!["alice.near", "bob.near"]);
+        // a namespace whose records are all tombstones is listed but empty
+        idx.delete("alice.near", "a/b", 1).await.unwrap();
+        assert_eq!(idx.namespaces().await.unwrap().len(), 2);
+        assert!(idx.list("alice.near", "").await.unwrap().is_empty());
     }
 
     #[test]

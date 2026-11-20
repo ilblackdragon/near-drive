@@ -187,3 +187,47 @@ async fn s3_blobs_presigned_locate_and_cache() {
     let cached = std::fs::read_dir(gw.data_dir.join("cache")).unwrap().count();
     assert!(cached >= 9, "cache has {cached} entries");
 }
+
+#[tokio::test]
+async fn gc_on_real_s3() {
+    use near_drive_gateway::{
+        gc::{self, GcOptions},
+        s3::S3BlobStore,
+        store::BlobStore,
+    };
+    let base = s3_or_skip!();
+    let run = run_id();
+    let dir = tempfile::tempdir().unwrap();
+    let (keys, dev) = dev_keys(&["alice.near"]);
+    let chunks_cfg = s3_with_prefix(&base, &format!("{run}/chunks/"));
+    let storage = json!({"backends": {"s3": chunks_cfg}, "index": s3_with_prefix(&base, &format!("{run}/index/"))});
+    let cfg = gateway_config(dir.path().join("gw"), dev, storage);
+    let gw = start_gateway_with(cfg.clone()).await;
+    let mut alice = client(&gw.url, "alice.near", &keys["alice.near"], Some(RootKey::generate()));
+    alice.chunk_size = 4096;
+    let opts = PutOptions::default();
+    alice.put(&u("near://alice.near/a"), &pattern(1, 0, 9000), &opts).await.unwrap();
+    alice.put(&u("near://alice.near/b"), &pattern(2, 0, 9000), &opts).await.unwrap();
+    let b1 = alice.head(&u("near://alice.near/b")).await.unwrap().unwrap();
+    alice.put(&u("near://alice.near/b"), &pattern(3, 0, 9000), &opts).await.unwrap();
+    alice.put(&u("near://alice.near/c"), &pattern(4, 0, 9000), &opts).await.unwrap();
+    let c1 = alice.head(&u("near://alice.near/c")).await.unwrap().unwrap();
+    alice.delete(&u("near://alice.near/c")).await.unwrap(); // tombstone in the S3 index
+    let blobs = S3BlobStore::new(&serde_json::from_value(chunks_cfg).unwrap()).unwrap();
+
+    let gc_opts = |grace, dry_run| GcOptions { grace, dry_run, ..Default::default() };
+    let r = gc::run_config(&cfg, &gc_opts(std::time::Duration::from_secs(3600), false)).await.unwrap();
+    assert_eq!((r.live_entries, r.backends[0].chunks, r.garbage), (2, 16, 0));
+    let r = gc::run_config(&cfg, &gc_opts(std::time::Duration::ZERO, true)).await.unwrap();
+    assert_eq!((r.garbage, r.deleted), (8, 0));
+    let r = gc::run_config(&cfg, &gc_opts(std::time::Duration::ZERO, false)).await.unwrap();
+    assert_eq!(r.deleted, 8);
+    for h in [&b1, &c1] {
+        assert!(!blobs.has(&h.record.manifest_cid).await.unwrap());
+        for c in &h.manifest.chunks {
+            assert!(!blobs.has(&c.cid).await.unwrap());
+        }
+    }
+    assert_eq!(alice.get(&u("near://alice.near/a")).await.unwrap().1, pattern(1, 0, 9000));
+    assert_eq!(alice.get(&u("near://alice.near/b")).await.unwrap().1, pattern(3, 0, 9000));
+}

@@ -23,7 +23,7 @@ mod large;
 mod net;
 mod resume;
 pub use chain::discover_gateway;
-pub use large::{Located, LocatedChunk};
+pub use large::{Located, LocatedChunk, ObjectWriter};
 pub use net::NetConfig;
 use net::{ok_or_attempt, reject, transport, with_retries, Attempt};
 

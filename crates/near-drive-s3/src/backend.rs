@@ -161,7 +161,17 @@ pub struct GetResult {
     pub range: Option<ByteRange>,
 }
 
+/// An object being written piece by piece (multipart uploads): bytes are
+/// encrypted and uploaded as they arrive; `finish` commits the object.
+pub trait ObjectSink: Send + 'static {
+    fn write(&mut self, data: Vec<u8>) -> impl Future<Output = BResult<()>> + Send;
+    fn finish(self) -> impl Future<Output = BResult<ObjectInfo>> + Send;
+}
+
 pub trait ObjectBackend: Send + Sync + 'static {
+    type Sink: ObjectSink;
+    /// Start a streamed upload of `ns`/`path`.
+    fn begin(&self, ns: &str, path: &str, p: &PutParams) -> BResult<Self::Sink>;
     /// The NEAR account the proxy acts as (its own bucket).
     fn account(&self) -> &str;
     fn head(&self, ns: &str, path: &str) -> impl Future<Output = BResult<Option<ObjectInfo>>> + Send;
@@ -223,7 +233,33 @@ impl ClientBackend {
     }
 }
 
+/// [`ObjectSink`] over the client's incremental [`near_drive_client::ObjectWriter`].
+pub struct ClientSink {
+    w: near_drive_client::ObjectWriter,
+    content_type: Option<String>,
+}
+
+impl ObjectSink for ClientSink {
+    async fn write(&mut self, data: Vec<u8>) -> BResult<()> {
+        self.w.write(&data).await.map_err(classify)
+    }
+
+    async fn finish(self) -> BResult<ObjectInfo> {
+        let size = self.w.size();
+        let rec = self.w.finish().await.map_err(classify)?;
+        Ok(ObjectInfo { size, manifest_cid: rec.manifest_cid, ts_ms: rec.ts_ms, content_type: self.content_type })
+    }
+}
+
 impl ObjectBackend for ClientBackend {
+    type Sink = ClientSink;
+
+    fn begin(&self, ns: &str, path: &str, p: &PutParams) -> BResult<ClientSink> {
+        let opts = PutOptions { public: p.public, content_type: p.content_type.clone(), ..Default::default() };
+        let w = self.client.writer(&uri(ns, path)?, &opts).map_err(classify)?;
+        Ok(ClientSink { w, content_type: p.content_type.clone() })
+    }
+
     fn account(&self) -> &str {
         self.client.account()
     }
@@ -345,5 +381,90 @@ mod tests {
         assert_eq!(RangeSpec::From(0, Some(99)).resolve(10), Ok(ByteRange { start: 0, end: 9 }));
         assert_eq!(RangeSpec::Suffix(30).resolve(10), Ok(ByteRange { start: 0, end: 9 }));
         assert_eq!(RangeSpec::From(10, None).resolve(10), Err(()));
+    }
+}
+
+/// A bucket name mapped onto a NEAR Drive folder, so existing S3 code keeps
+/// its bucket names: `delta-artifacts` -> `near://deltaleague.near/artifacts/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Alias {
+    pub namespace: String,
+    /// Key prefix inside the namespace (empty, or ends with `/`).
+    pub prefix: String,
+}
+
+impl Alias {
+    /// `near://<account>/[<prefix>/]`
+    pub fn parse(target: &str) -> Result<Self, String> {
+        let u = NearUri::parse(target).map_err(|e| e.to_string())?;
+        if !(u.path.is_empty() || u.path.ends_with('/')) {
+            return Err(format!("alias target must be a folder ending with /: {target}"));
+        }
+        Ok(Alias { namespace: u.namespace, prefix: u.path })
+    }
+}
+
+/// [`ObjectBackend`] that resolves bucket aliases before calling `inner`.
+pub struct Aliased<B> {
+    pub inner: B,
+    pub aliases: std::collections::BTreeMap<String, Alias>,
+}
+
+impl<B> Aliased<B> {
+    /// (namespace, path) for an S3 (bucket, key).
+    pub fn resolve(&self, bucket: &str, key: &str) -> (String, String) {
+        match self.aliases.get(bucket) {
+            Some(a) => (a.namespace.clone(), format!("{}{key}", a.prefix)),
+            None => (bucket.to_string(), key.to_string()),
+        }
+    }
+}
+
+impl<B: ObjectBackend> ObjectBackend for Aliased<B> {
+    type Sink = B::Sink;
+
+    fn begin(&self, ns: &str, path: &str, p: &PutParams) -> BResult<B::Sink> {
+        let (ns, path) = self.resolve(ns, path);
+        self.inner.begin(&ns, &path, p)
+    }
+
+    fn account(&self) -> &str {
+        self.inner.account()
+    }
+
+    async fn head(&self, ns: &str, path: &str) -> BResult<Option<ObjectInfo>> {
+        let (ns, path) = self.resolve(ns, path);
+        self.inner.head(&ns, &path).await
+    }
+
+    async fn get(&self, ns: &str, path: &str, range: Option<RangeSpec>) -> BResult<GetResult> {
+        let (ns, path) = self.resolve(ns, path);
+        self.inner.get(&ns, &path, range).await
+    }
+
+    async fn put(&self, ns: &str, path: &str, src: PutSource, p: &PutParams) -> BResult<ObjectInfo> {
+        let (ns, path) = self.resolve(ns, path);
+        self.inner.put(&ns, &path, src, p).await
+    }
+
+    async fn delete(&self, ns: &str, path: &str) -> BResult<bool> {
+        let (ns, path) = self.resolve(ns, path);
+        self.inner.delete(&ns, &path).await
+    }
+
+    async fn list(&self, ns: &str, prefix: &str) -> BResult<Vec<ListItem>> {
+        match self.aliases.get(ns) {
+            None => self.inner.list(ns, prefix).await,
+            Some(a) => {
+                let items = self.inner.list(&a.namespace, &format!("{}{prefix}", a.prefix)).await?;
+                Ok(items
+                    .into_iter()
+                    .filter_map(|mut it| {
+                        it.key = it.key.strip_prefix(&a.prefix)?.to_string();
+                        Some(it)
+                    })
+                    .collect())
+            }
+        }
     }
 }

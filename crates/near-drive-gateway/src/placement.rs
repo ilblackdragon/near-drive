@@ -209,6 +209,8 @@ impl ReadOrder {
 
 /// All storage classes of a gateway plus the read path (with optional cache).
 pub struct Placement {
+    /// Every configured backend, by name.
+    backends: BTreeMap<String, Arc<dyn BlobStore>>,
     classes: BTreeMap<String, Replicated>,
     default_class: String,
     /// Per class: its backends, its previous backends, then all others.
@@ -266,7 +268,7 @@ impl Placement {
         let any_reads = order(format!("default class {default_class}"), class_cfgs[&default_class].backends.clone())?;
         let cache = cfg.cache.as_ref().map(|c| ChunkCache::open(c, data_dir)).transpose()?;
         let mem = MemCache::new(&cfg.small_cache);
-        Ok(Self { classes, default_class, class_reads, any_reads, cache, mem, inline_max: cfg.small_cache.inline_max_bytes })
+        Ok(Self { backends, classes, default_class, class_reads, any_reads, cache, mem, inline_max: cfg.small_cache.inline_max_bytes })
     }
 
     pub fn default_class(&self) -> &str {
@@ -275,6 +277,22 @@ impl Placement {
 
     pub fn class_names(&self) -> impl Iterator<Item = &str> {
         self.classes.keys().map(String::as_str)
+    }
+
+    /// Every configured backend (name, store), by name.
+    pub fn backends(&self) -> impl Iterator<Item = (&str, &Arc<dyn BlobStore>)> {
+        self.backends.iter().map(|(n, b)| (n.as_str(), b))
+    }
+
+    /// Drop a chunk from this gateway's local caches (garbage collection
+    /// deleted it from the backends).
+    pub async fn forget_cached(&self, cid: &str) {
+        if let Some(m) = &self.mem {
+            m.remove(cid);
+        }
+        if let Some(c) = &self.cache {
+            c.remove(cid).await;
+        }
     }
 
     /// Objects with at most this many stored bytes get their chunks inlined in `locate`.

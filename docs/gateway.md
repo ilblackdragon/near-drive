@@ -9,6 +9,11 @@ cargo install --git https://github.com/ilblackdragon/near-drive near-drive-gatew
 near-drive-gateway --config gateway.json
 ```
 
+The config file can also be given as `NEAR_DRIVE_CONFIG=gateway.json`, or the whole config as inline JSON in
+`NEAR_DRIVE_CONFIG_JSON` (handy for containers); setting both a file and the inline JSON is an error.
+`near-drive-gateway [--config X] [serve]` serves (the default); `near-drive-gateway gc` collects garbage
+([below](#garbage-collection)).
+
 ```json
 {
   "listen": "127.0.0.1:8787",
@@ -30,6 +35,7 @@ near-drive-gateway --config gateway.json
 | `storage` | backends, storage classes, index, caches ([below](#storage-backends-classes-and-index)) |
 | `billing` | NEAR AI Cloud credits billing ([below](#billing-near-ai-cloud-credits)) |
 | `cors_origins` | browser origins allowed to call the gateway ([below](#browser-access-cors)) |
+| `gc` | periodic chunk garbage collection, off by default ([below](#garbage-collection)) |
 
 A rule looks like this (an app pays for its users' data):
 
@@ -105,6 +111,42 @@ The optional `storage` section sets up the following.
   - `index_ttl_ms` (0 = off): caches index entries. Writes and deletes through this gateway update it, but with several
     gateways sharing one index a read can be up to the TTL stale, so only raise it for a single writing gateway.
   - `index_max_entries` (100 000).
+
+## Garbage collection
+
+Deleting or overwriting a file only changes the index; the old version's chunks stay in the backends. Chunks can be
+shared (identical public files dedup; `share` writes a new manifest over the same data chunks), so they are reclaimed
+by mark and sweep rather than per file:
+
+- **Mark.** Every live index entry in every namespace is listed and its manifest read; the manifest and its data chunks
+  are live. If any live manifest cannot be read, GC stops before deleting anything.
+- **Sweep.** On each backend that can list its chunks (`fs`, `s3`, within its `prefix`), chunks that are not live
+  *and* were last written more than the **grace period** before the run started are deleted. Chunks are uploaded
+  before the record that references them is committed, and resumable uploads can take long; the grace period
+  (default 24 h) keeps them. Re-uploading a chunk that already exists refreshes its timestamp. Keep the grace period
+  longer than any upload takes from first chunk to commit.
+- **Blob bridges are not swept** (the bridge protocol has no listing); they are reported as skipped. The local
+  `cache` is size-bounded and evicts on its own; a periodic run also drops deleted chunks from its gateway's caches.
+- **Safety.** A run whose index has no live entries at all while the backends hold old chunks is refused (a wrong
+  index config would otherwise delete everything); `--force` overrides. Each deletion re-checks the chunk's age first.
+  Never point two deployments with different indexes at the same backend (bucket + prefix or directory): each would
+  collect the other's chunks.
+
+Run it once (prints a JSON report with per-backend counts and bytes; exit code 1 if a backend had errors):
+
+```sh
+near-drive-gateway --config gateway.json gc --dry-run        # what would be deleted, and how many bytes
+near-drive-gateway --config gateway.json gc --grace 48h      # delete; grace as seconds or 90s / 15m / 24h / 7d
+```
+
+or periodically inside the server:
+
+```json
+"gc": {"interval_secs": 86400, "grace_secs": 86400, "dry_run": false}
+```
+
+GC is safe while gateways serve traffic. With several gateways sharing one index and backends, run it from one place
+(a cron job, or `gc` on a single gateway): concurrent runs do not corrupt anything but duplicate the work.
 
 ## Browser access (CORS)
 

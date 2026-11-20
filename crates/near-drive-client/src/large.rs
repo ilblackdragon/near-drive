@@ -485,3 +485,122 @@ impl Client {
         Ok(())
     }
 }
+
+/// Incremental upload: bytes arrive in pieces (e.g. S3 multipart parts), each
+/// full chunk is sealed and uploaded right away, up to `parallelism` at once.
+/// Memory stays around `(parallelism + 2) × chunk_size`; nothing touches disk.
+/// The last chunk is held back so it can be sealed as the final one, so an
+/// object is only committed by [`ObjectWriter::finish`].
+pub struct ObjectWriter {
+    client: Arc<Client>,
+    uri: NearUri,
+    opts: PutOptions,
+    sealer: Sealer,
+    chunk_size: usize,
+    buf: Vec<u8>,
+    next_idx: u64,
+    size: u64,
+    inflight: std::collections::VecDeque<tokio::task::JoinHandle<Result<(u64, ChunkRef)>>>,
+    refs: Vec<(u64, ChunkRef)>,
+}
+
+impl ObjectWriter {
+    /// Plaintext bytes accepted so far.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub async fn write(&mut self, mut data: &[u8]) -> Result<()> {
+        let cs = self.chunk_size;
+        while !data.is_empty() {
+            // Keep up to one full chunk buffered: it may turn out to be the last.
+            let room = (2 * cs).saturating_sub(self.buf.len()).max(1);
+            let take = room.min(data.len());
+            self.buf.extend_from_slice(&data[..take]);
+            self.size += take as u64;
+            data = &data[take..];
+            while self.buf.len() > cs {
+                let rest = self.buf.split_off(cs);
+                let chunk = std::mem::replace(&mut self.buf, rest);
+                self.spawn(chunk, false).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn spawn(&mut self, pt: Vec<u8>, last: bool) -> Result<()> {
+        while self.inflight.len() >= self.client.parallelism.max(1) {
+            let done = self.inflight.pop_front().expect("non-empty").await??;
+            self.refs.push(done);
+        }
+        let idx = self.next_idx;
+        self.next_idx += 1;
+        let (client, sealer, ns, class) = (self.client.clone(), self.sealer.clone(), self.uri.namespace.clone(), self.opts.class.clone());
+        self.inflight.push_back(tokio::spawn(async move {
+            let (cid, ct) = tokio::task::spawn_blocking(move || -> Result<(String, Vec<u8>)> {
+                let ct = match sealer {
+                    Sealer::Plain => pt,
+                    Sealer::Enc(s) => s.seal(idx, last, &pt)?,
+                };
+                Ok((near_drive_core::cid(&ct), ct))
+            })
+            .await??;
+            let r = client.upload_chunk(&ns, cid, ct.into(), class.as_deref()).await?;
+            Ok((idx, r))
+        }));
+        Ok(())
+    }
+
+    /// Seal the last chunk, wait for every upload, and commit the object.
+    pub async fn finish(mut self) -> Result<PointerRecord> {
+        let tail = std::mem::take(&mut self.buf);
+        self.spawn(tail, true).await?;
+        while let Some(h) = self.inflight.pop_front() {
+            let done = h.await??;
+            self.refs.push(done);
+        }
+        self.refs.sort_by_key(|(i, _)| *i);
+        let manifest = Manifest {
+            version: 1,
+            size: self.size,
+            chunk_size: self.chunk_size as u64,
+            chunks: std::mem::take(&mut self.refs).into_iter().map(|(_, r)| r).collect(),
+            enc: match &self.sealer {
+                Sealer::Plain => None,
+                Sealer::Enc(s) => Some(s.enc_info().clone()),
+            },
+            content_type: self.opts.content_type.clone(),
+        };
+        self.client.commit_manifest(&self.uri, &manifest, self.opts.class.as_deref(), self.opts.expect_seq).await
+    }
+}
+
+impl Drop for ObjectWriter {
+    fn drop(&mut self) {
+        // Abandoned (not finished): stop uploads still running.
+        for h in &self.inflight {
+            h.abort();
+        }
+    }
+}
+
+impl Client {
+    /// Start an incremental upload of `uri` (see [`ObjectWriter`]).
+    pub fn writer(self: &Arc<Self>, uri: &NearUri, opts: &PutOptions) -> Result<ObjectWriter> {
+        NearUri::object(&uri.namespace, &uri.path)?;
+        let cs = self.chunk_size;
+        ensure!(cs > 0 && cs as u64 <= near_drive_core::manifest::MAX_CHUNK_BYTES, "bad chunk_size");
+        Ok(ObjectWriter {
+            client: self.clone(),
+            uri: uri.clone(),
+            opts: opts.clone(),
+            sealer: self.new_sealer(opts)?,
+            chunk_size: cs,
+            buf: Vec::with_capacity(cs),
+            next_idx: 0,
+            size: 0,
+            inflight: Default::default(),
+            refs: vec![],
+        })
+    }
+}

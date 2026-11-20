@@ -106,6 +106,15 @@ impl MemCache {
     pub fn total_bytes(&self) -> u64 {
         self.lru.lock().unwrap().total
     }
+
+    /// Drop a blob (garbage collection deleted it from the backends).
+    pub fn remove(&self, cid: &str) {
+        let mut l = self.lru.lock().unwrap();
+        if let Some((b, t)) = l.entries.remove(cid) {
+            l.order.remove(&t);
+            l.total -= b.len() as u64;
+        }
+    }
 }
 
 /// When it was fetched, and the entry (None = known absent).
@@ -178,6 +187,10 @@ impl IndexStore for CachedIndex {
 
     async fn list(&self, ns: &str, prefix: &str) -> Result<Vec<IndexEntry>> {
         self.inner.list(ns, prefix).await
+    }
+
+    async fn namespaces(&self) -> Result<Vec<String>> {
+        self.inner.namespaces().await
     }
 }
 

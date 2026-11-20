@@ -153,6 +153,70 @@ jobs:
           & "$env:LOCALAPPDATA\NEAR Drive\bin\near-drive-gateway.exe" --version
 
 
+  # Server image (gateway + S3 endpoint): ghcr.io/<owner>/near-drive:<tag> and :latest,
+  # built natively for amd64 and arm64, then merged into one multi-arch tag.
+  image:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, platform: linux/amd64 }
+          - { os: ubuntu-24.04-arm, platform: linux/arm64 }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+      - name: digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-digest-${{ matrix.os }}
+          path: /tmp/digests/*
+
+  image-manifest:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: tag
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          repo=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          docker buildx imagetools create -t "$repo:$TAG" -t "$repo:latest" $(for d in /tmp/digests/*; do echo "$repo@sha256:$(basename $d)"; done)
+          docker buildx imagetools inspect "$repo:$TAG"
+
   # Homebrew formula + winget manifests, committed to main and test-installed.
   packaging:
     needs: publish

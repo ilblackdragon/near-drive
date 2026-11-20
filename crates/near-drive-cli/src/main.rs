@@ -98,6 +98,21 @@ struct ProxyArgs {
     /// Region reported by GetBucketLocation.
     #[arg(long, default_value = "us-east-1")]
     region: String,
+    /// Serve an existing bucket name from a NEAR Drive folder, e.g.
+    /// `delta-artifacts=near://app.near/artifacts/`; repeatable.
+    #[arg(long = "bucket-alias", value_name = "NAME=near://ACCOUNT/PREFIX/")]
+    bucket_aliases: Vec<String>,
+    /// Browser origin allowed to call the endpoint (CORS, e.g. presigned
+    /// uploads from a web page); repeatable, `*` = any.
+    #[arg(long = "cors-origin")]
+    cors_origins: Vec<String>,
+    /// Domain for virtual-host addressing (`<bucket>.<domain>`); repeatable.
+    #[arg(long = "virtual-host-domain")]
+    vhost_domains: Vec<String>,
+    /// Allow listening on a non-loopback address, so other machines can use
+    /// the endpoint (and its presigned URLs). Put it behind TLS.
+    #[arg(long, env = "NEAR_DRIVE_S3_PUBLIC_LISTEN")]
+    public_listen: bool,
 }
 
 #[derive(Subcommand, Clone)]
@@ -397,10 +412,14 @@ impl Ctx {
         Ok(a)
     }
 
-    /// The key that signs gateway requests: `--credentials`, else whatever
-    /// near-cli has for the account (session key preferred).
+    /// The key that signs gateway requests: `NEAR_DRIVE_SECRET_KEY` (services,
+    /// containers), `--credentials`, else whatever near-cli has for the
+    /// account (session key preferred).
     async fn request_key(&mut self) -> Result<(String, SigningKey, Option<nearcli::FoundKey>)> {
         let account = self.account()?;
+        if let Ok(sk) = std::env::var("NEAR_DRIVE_SECRET_KEY") {
+            return Ok((account, keys::parse_secret_key(sk.trim()).context("NEAR_DRIVE_SECRET_KEY")?, None));
+        }
         if let Some(path) = &self.cli.credentials {
             let (cred_account, sk) = keys::NearCredentials::load(path)?;
             if cred_account != account {
@@ -415,7 +434,14 @@ impl Ctx {
 
     async fn client(&mut self) -> Result<Client> {
         let (account, sk, _) = self.request_key().await?;
-        let root = load_root(&self.root_key_path(&account)?)?;
+        let root = match std::env::var("NEAR_DRIVE_ROOT_KEY") {
+            // Services / containers: the root key from a secret instead of a file.
+            Ok(hex_key) => {
+                let b: [u8; 32] = hex::decode(hex_key.trim()).ok().and_then(|v| v.try_into().ok()).context("NEAR_DRIVE_ROOT_KEY must be 64 hex characters")?;
+                Some(RootKey::from_bytes(b))
+            }
+            Err(_) => load_root(&self.root_key_path(&account)?)?,
+        };
         if !(1..=64).contains(&self.cli.chunk_mib) {
             bail!("--chunk-mib must be in 1..=64");
         }
@@ -960,9 +986,14 @@ async fn file_provider_api(c: std::sync::Arc<near_drive_client::Client>, remote:
 
 /// The S3 endpoint (foreground `s3-proxy`, or part of the background service).
 async fn run_s3(ctx: &mut Ctx, proxy: ProxyArgs) -> Result<()> {
-    let ProxyArgs { listen, buckets, public_prefixes, max_body_mib, region, .. } = proxy.clone();
+    let ProxyArgs { listen, buckets, public_prefixes, max_body_mib, region, bucket_aliases, cors_origins, vhost_domains, public_listen, .. } = proxy.clone();
     use near_drive_s3::{backend::ClientBackend, Proxy, ProxyConfig};
-    near_drive_s3::check_loopback(&listen)?;
+    near_drive_s3::check_listen(&listen, public_listen)?;
+    let mut aliases = std::collections::BTreeMap::new();
+    for a in &bucket_aliases {
+        let (name, target) = a.split_once('=').with_context(|| format!("--bucket-alias {a}: expected NAME=near://ACCOUNT/PREFIX/"))?;
+        aliases.insert(name.to_string(), near_drive_s3::backend::Alias::parse(target).map_err(|e| anyhow::anyhow!("--bucket-alias {a}: {e}"))?);
+    }
     let c = ctx.client().await?;
     let creds = s3_credentials(ctx, &proxy)?;
     if c.x25519_public().is_none() && public_prefixes.is_empty() {
@@ -974,9 +1005,15 @@ async fn run_s3(ctx: &mut Ctx, proxy: ProxyArgs) -> Result<()> {
     cfg.public_prefixes = public_prefixes;
     cfg.max_body_bytes = max_body_mib * 1024 * 1024;
     cfg.region = region;
+    cfg.aliases = aliases;
+    cfg.cors_origins = cors_origins;
+    cfg.vhost_domains.extend(vhost_domains);
+    if public_listen && !listen.ip().is_loopback() {
+        eprintln!("warning: serving on {listen} for other machines; put it behind TLS (presigned URLs carry signatures)");
+    }
     let proxy = Proxy::new(cfg, ClientBackend::new(c));
     eprintln!("NEAR Drive S3 proxy for {account} on http://{listen} (bucket = namespace, e.g. http://{listen}/{account}/key)");
-    near_drive_s3::run(listen, proxy).await?;
+    near_drive_s3::run(listen, proxy, public_listen).await?;
     Ok(())
 }
 

@@ -28,8 +28,16 @@ pub fn dev_keys(accounts: &[&'static str]) -> (HashMap<&'static str, SigningKey>
 }
 
 pub async fn start_gateway(data_dir: PathBuf, dev: HashMap<String, Vec<String>>, storage: serde_json::Value) -> Gw {
+    start_gateway_with(gateway_config(data_dir, dev, storage)).await
+}
+
+pub fn gateway_config(data_dir: PathBuf, dev: HashMap<String, Vec<String>>, storage: serde_json::Value) -> Config {
     let storage: StorageConfig = serde_json::from_value(storage).unwrap();
-    let cfg = Config { listen: "127.0.0.1:0".into(), data_dir: data_dir.clone(), dev_keys: dev, storage, ..Default::default() };
+    Config { listen: "127.0.0.1:0".into(), data_dir, dev_keys: dev, storage, ..Default::default() }
+}
+
+pub async fn start_gateway_with(cfg: Config) -> Gw {
+    let data_dir = cfg.data_dir.clone();
     let state = AppState::new(cfg).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());

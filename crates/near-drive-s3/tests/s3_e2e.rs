@@ -30,6 +30,10 @@ struct Env {
 }
 
 async fn start() -> Env {
+    start_cfg(|_| {}).await
+}
+
+async fn start_cfg(f: impl FnOnce(&mut ProxyConfig)) -> Env {
     let gw_dir = tempfile::tempdir().unwrap();
     let alice = SigningKey::generate(&mut rand::rngs::OsRng);
     let mut dev_keys = HashMap::new();
@@ -55,6 +59,7 @@ async fn start() -> Env {
     let mut pcfg = ProxyConfig::new(sigv4::Credentials { access_key: AK.into(), secret_key: SK.into() }, home.path().join("s3-staging"));
     pcfg.public_prefixes = vec!["public/".into()];
     pcfg.extra_buckets = vec!["shared.near".into()];
+    f(&mut pcfg);
     let proxy = Proxy::new(pcfg, ClientBackend::new(client));
     let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", pl.local_addr().unwrap());
@@ -591,4 +596,169 @@ fn walk(p: std::path::PathBuf) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+/// Multipart parts stream into the object: in-order parts never touch the
+/// staging disk, out-of-order parts are staged only until their turn, and
+/// the result is byte-exact with odd part sizes.
+#[tokio::test]
+async fn multipart_streams_out_of_order_and_retries() {
+    let env = start().await;
+    let s3 = &env.s3;
+    let staging = env._home.path().join("s3-staging");
+    let key = "ckpt/streamed.bin";
+    // 5 parts of 150_001 bytes (not a multiple of the 64 KiB chunk size) + a short last part.
+    let sizes = [150_001usize, 150_001, 150_001, 150_001, 150_001, 7];
+    let parts: Vec<Vec<u8>> = sizes.iter().enumerate().map(|(i, n)| data(*n, 100 + i as u32)).collect();
+    let up = s3.create_multipart_upload().bucket(B).key(key).metadata("run", "7").send().await.unwrap();
+    let id = up.upload_id().unwrap().to_string();
+    let put = |n: i32| {
+        let (s3, id, body) = (s3.clone(), id.clone(), parts[(n - 1) as usize].clone());
+        async move { s3.upload_part().bucket(B).key(key).upload_id(id).part_number(n).body(ByteStream::from(body)).send().await.unwrap().e_tag().unwrap().to_string() }
+    };
+    // Part 1 in order: streamed, nothing staged.
+    let e1 = put(1).await;
+    let staged = |d: &std::path::Path| walk(d.to_path_buf()).into_iter().filter(|p| p.extension().is_some_and(|e| e == "part")).count();
+    assert_eq!(staged(&staging), 0, "an in-order part is streamed, not staged");
+    // Parts 4 and 3 arrive early: staged until 2 comes, then drained.
+    let e4 = put(4).await;
+    let e3 = put(3).await;
+    assert_eq!(staged(&staging), 2);
+    let e2 = put(2).await;
+    assert_eq!(staged(&staging), 0, "staged parts drained once their turn came");
+    // Identical retry of a streamed part: accepted. Different bytes: refused.
+    assert_eq!(put(2).await, e2);
+    let e = s3.upload_part().bucket(B).key(key).upload_id(&id).part_number(2).body(ByteStream::from(vec![1u8; 10])).send().await.unwrap_err();
+    assert_eq!(code(&e), "InvalidPart");
+    // The rest concurrently.
+    let (e5, e6) = tokio::join!(put(5), put(6));
+    let lp = s3.list_parts().bucket(B).key(key).upload_id(&id).send().await.unwrap();
+    assert_eq!(lp.parts().iter().map(|p| p.part_number().unwrap()).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6]);
+    // Leaving out a part that was already streamed is refused.
+    let mk = |v: &[(i32, &String)]| CompletedMultipartUpload::builder().set_parts(Some(v.iter().map(|(n, e)| CompletedPart::builder().part_number(*n).e_tag(e.as_str()).build()).collect())).build();
+    let e = s3.complete_multipart_upload().bucket(B).key(key).upload_id(&id).multipart_upload(mk(&[(1, &e1), (3, &e3)])).send().await.unwrap_err();
+    assert_eq!(code(&e), "InvalidPart");
+    s3.complete_multipart_upload()
+        .bucket(B)
+        .key(key)
+        .upload_id(&id)
+        .multipart_upload(mk(&[(1, &e1), (2, &e2), (3, &e3), (4, &e4), (5, &e5), (6, &e6)]))
+        .send()
+        .await
+        .unwrap();
+    let got = s3.get_object().bucket(B).key(key).send().await.unwrap();
+    assert_eq!(got.metadata().unwrap().get("run").map(String::as_str), Some("7"));
+    assert_eq!(body(got).await, parts.concat());
+    let r = s3.get_object().bucket(B).key(key).range("bytes=150000-300003").send().await.unwrap();
+    assert_eq!(body(r).await, parts.concat()[150_000..=300_003]);
+    assert!(s3.list_multipart_uploads().bucket(B).send().await.unwrap().uploads().is_empty());
+    assert_eq!(walk(staging.clone()).len(), 0, "nothing left in staging");
+
+    // Parts sent with gaps in numbering (1, 3) complete from staging at the end.
+    let up = s3.create_multipart_upload().bucket(B).key("gaps").send().await.unwrap();
+    let id = up.upload_id().unwrap().to_string();
+    let a = s3.upload_part().bucket(B).key("gaps").upload_id(&id).part_number(1).body(ByteStream::from(data(70_000, 1))).send().await.unwrap().e_tag().unwrap().to_string();
+    let b = s3.upload_part().bucket(B).key("gaps").upload_id(&id).part_number(3).body(ByteStream::from(data(9, 2))).send().await.unwrap().e_tag().unwrap().to_string();
+    s3.complete_multipart_upload().bucket(B).key("gaps").upload_id(&id).multipart_upload(mk(&[(1, &a), (3, &b)])).send().await.unwrap();
+    let got = body(s3.get_object().bucket(B).key("gaps").send().await.unwrap()).await;
+    assert_eq!(got, [data(70_000, 1), data(9, 2)].concat());
+}
+
+/// deltaleague's setup: existing bucket names served from NEAR Drive folders,
+/// presigned GET / PUT URLs used by plain HTTP clients (GPU workers, browsers),
+/// CORS for the browser upload, and virtual-host addressing on a real domain.
+#[tokio::test]
+async fn bucket_aliases_presigned_urls_cors_and_vhost() {
+    use near_drive_s3::backend::Alias;
+    let env = start_cfg(|c| {
+        c.aliases.insert("delta-artifacts".into(), Alias::parse("near://alice.near/artifacts/").unwrap());
+        c.aliases.insert("delta-private".into(), Alias::parse("near://alice.near/private/").unwrap());
+        c.cors_origins = vec!["https://portal.example".into()];
+        c.vhost_domains.push("s3.test".into());
+    })
+    .await;
+    let s3 = &env.s3;
+    let http = reqwest::Client::new();
+
+    // Existing bucket names work, and land in the NEAR Drive folders.
+    s3.put_object().bucket("delta-artifacts").key("verified/abc").body(ByteStream::from_static(b"model bytes")).send().await.unwrap();
+    s3.put_object().bucket("delta-private").key("jobs/1/input.jsonl").body(ByteStream::from_static(b"prompts")).send().await.unwrap();
+    let mut c = Client::new(&env.gw_url, "alice.near", env.alice.clone(), Some(RootKey::from_bytes([9; 32])));
+    c.chunk_size = 64 * 1024;
+    let u = |s: &str| near_drive_client::near_drive_core::NearUri::parse(s).unwrap();
+    assert_eq!(c.get(&u("near://alice.near/artifacts/verified/abc")).await.unwrap().1, b"model bytes");
+    assert_eq!(c.get(&u("near://alice.near/private/jobs/1/input.jsonl")).await.unwrap().1, b"prompts");
+    let keys: Vec<String> = s3.list_objects_v2().bucket("delta-artifacts").send().await.unwrap().contents().iter().map(|o| o.key().unwrap().to_string()).collect();
+    assert_eq!(keys, vec!["verified/abc"], "listing shows keys relative to the alias");
+    let names: Vec<String> = s3.list_buckets().send().await.unwrap().buckets().iter().map(|b| b.name().unwrap().to_string()).collect();
+    assert!(names.contains(&"delta-artifacts".to_string()) && names.contains(&"delta-private".to_string()), "{names:?}");
+
+    // A worker downloads with a presigned GET (plain HTTP, no redirects) ...
+    let pc = || PresigningConfig::expires_in(Duration::from_secs(7 * 24 * 3600)).unwrap();
+    let get = s3.get_object().bucket("delta-artifacts").key("verified/abc").presigned(pc()).await.unwrap();
+    let no_redirect = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let r = no_redirect.get(get.uri()).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.bytes().await.unwrap().as_ref(), b"model bytes");
+    let r = no_redirect.get(get.uri()).header("range", "bytes=6-10").send().await.unwrap();
+    assert_eq!((r.status().as_u16(), r.bytes().await.unwrap().to_vec()), (206, b"bytes".to_vec()));
+    // ... and uploads its result with a presigned PUT.
+    let put = s3.put_object().bucket("delta-private").key("jobs/1/output.jsonl").presigned(pc()).await.unwrap();
+    let mut req = http.put(put.uri()).body("answers");
+    for (k, v) in put.headers() {
+        req = req.header(k, v);
+    }
+    assert_eq!(req.send().await.unwrap().status(), 200);
+    assert_eq!(c.get(&u("near://alice.near/private/jobs/1/output.jsonl")).await.unwrap().1, b"answers");
+    // A presigned URL only works for what it was signed for.
+    let tampered = put.uri().replace("output.jsonl", "other.jsonl");
+    assert_eq!(http.put(tampered).body("x").send().await.unwrap().status(), 403);
+
+    // Browser upload from the portal: preflight, then the presigned PUT with CORS headers.
+    let pre = http
+        .request(reqwest::Method::OPTIONS, format!("{}/delta-artifacts/staging/up.bin", env.url))
+        .header("origin", "https://portal.example")
+        .header("access-control-request-method", "PUT")
+        .header("access-control-request-headers", "content-type")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pre.status(), 200);
+    assert_eq!(pre.headers()["access-control-allow-origin"], "https://portal.example");
+    assert!(pre.headers()["access-control-allow-methods"].to_str().unwrap().contains("PUT"));
+    let other = http
+        .request(reqwest::Method::OPTIONS, format!("{}/delta-artifacts/staging/up.bin", env.url))
+        .header("origin", "https://evil.example")
+        .header("access-control-request-method", "PUT")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), 403);
+    let up = s3.put_object().bucket("delta-artifacts").key("staging/up.bin").presigned(pc()).await.unwrap();
+    let mut req = http.put(up.uri()).header("origin", "https://portal.example").body(vec![7u8; 200_000]);
+    for (k, v) in up.headers() {
+        req = req.header(k, v);
+    }
+    let r = req.send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["access-control-allow-origin"], "https://portal.example");
+    assert!(r.headers()["access-control-expose-headers"].to_str().unwrap().contains("ETag"));
+
+    // Virtual-host addressing on a configured domain: <bucket>.s3.test
+    let port = env.url.rsplit(':').next().unwrap().to_string();
+    let vconf = aws_sdk_s3::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .endpoint_url(format!("http://s3.test:{port}"))
+        .credentials_provider(AwsCreds::new(AK, SK, None, None, "test"))
+        .force_path_style(false)
+        .build();
+    let vs3 = S3::from_conf(vconf);
+    let vget = vs3.get_object().bucket("delta-artifacts").key("verified/abc").presigned(pc()).await.unwrap();
+    assert!(vget.uri().starts_with(&format!("http://delta-artifacts.s3.test:{port}/verified/abc")), "{}", vget.uri());
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let resolving = reqwest::Client::builder().resolve("delta-artifacts.s3.test", addr).build().unwrap();
+    let r = resolving.get(vget.uri()).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.bytes().await.unwrap().as_ref(), b"model bytes");
 }

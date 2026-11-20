@@ -18,6 +18,7 @@ pub mod backend;
 pub mod credentials;
 pub mod error;
 pub mod multipart;
+pub mod stream;
 pub mod sigv4;
 pub mod xml;
 
@@ -28,7 +29,7 @@ use axum::{
     response::Response,
     Router,
 };
-use backend::{BackendError, GetResult, ListItem, ObjectBackend, ObjectData, ObjectInfo, PutParams, PutSource, RangeSpec};
+use backend::{BackendError, GetResult, ListItem, ObjectBackend, ObjectData, ObjectInfo, ObjectSink, PutParams, PutSource, RangeSpec};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine};
 use error::{S3Error, S3Result};
 use multipart::{Staging, UploadMeta};
@@ -62,6 +63,13 @@ pub struct ProxyConfig {
     pub max_body_bytes: usize,
     /// Region reported by GetBucketLocation. Any region is accepted in signatures.
     pub region: String,
+    /// Bucket names mapped onto NEAR Drive folders (existing bucket names keep working).
+    pub aliases: BTreeMap<String, backend::Alias>,
+    /// Browser origins allowed to call the endpoint (CORS), e.g. for presigned
+    /// uploads from a web page. `*` = any. Empty = no CORS headers.
+    pub cors_origins: Vec<String>,
+    /// Domains for virtual-host addressing: `<bucket>.<domain>`.
+    pub vhost_domains: Vec<String>,
 }
 
 impl ProxyConfig {
@@ -73,14 +81,18 @@ impl ProxyConfig {
             staging_dir,
             max_body_bytes: 5 * 1024 * 1024 * 1024,
             region: "us-east-1".into(),
+            aliases: BTreeMap::new(),
+            cors_origins: vec![],
+            vhost_domains: vec!["localhost".into()],
         }
     }
 }
 
-pub struct Proxy<B> {
+pub struct Proxy<B: ObjectBackend> {
     cfg: ProxyConfig,
-    backend: B,
+    backend: backend::Aliased<B>,
     staging: Staging,
+    sessions: stream::Sessions<B::Sink>,
     started_ms: u64,
 }
 
@@ -94,13 +106,23 @@ pub fn check_loopback(addr: &SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Non-loopback listening is for deployments behind a TLS-terminating proxy
+/// (so presigned URLs work for remote machines); it must be asked for.
+pub fn check_listen(addr: &SocketAddr, public: bool) -> anyhow::Result<()> {
+    if public {
+        return Ok(());
+    }
+    check_loopback(addr).map_err(|e| e.context("pass --public-listen to serve other machines (behind TLS)"))
+}
+
 pub fn router<B: ObjectBackend>(p: Arc<Proxy<B>>) -> Router {
     Router::new().fallback(handle::<B>).with_state(p)
 }
 
-/// Bind `addr` (must be loopback) and serve until the task is dropped.
-pub async fn run<B: ObjectBackend>(addr: SocketAddr, p: Arc<Proxy<B>>) -> anyhow::Result<()> {
-    check_loopback(&addr)?;
+/// Bind `addr` and serve until the task is dropped. Loopback only, unless
+/// `public` (see [`check_listen`]).
+pub async fn run<B: ObjectBackend>(addr: SocketAddr, p: Arc<Proxy<B>>, public: bool) -> anyhow::Result<()> {
+    check_listen(&addr, public)?;
     let l = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(l, router(p)).await?;
     Ok(())
@@ -108,8 +130,11 @@ pub async fn run<B: ObjectBackend>(addr: SocketAddr, p: Arc<Proxy<B>>) -> anyhow
 
 impl<B: ObjectBackend> Proxy<B> {
     pub fn new(cfg: ProxyConfig, backend: B) -> Arc<Self> {
-        Staging::cleanup(&cfg.staging_dir, Duration::from_secs(7 * 24 * 3600));
-        Arc::new(Self { staging: Staging::new(cfg.staging_dir.clone()), cfg, backend, started_ms: now_ms() })
+        // Multipart uploads stream into the object from an in-memory session,
+        // so none survives a restart: drop whatever an earlier run left.
+        Staging::cleanup(&cfg.staging_dir, Duration::ZERO);
+        let backend = backend::Aliased { inner: backend, aliases: cfg.aliases.clone() };
+        Arc::new(Self { staging: Staging::new(cfg.staging_dir.clone()), sessions: Default::default(), cfg, backend, started_ms: now_ms() })
     }
 
     pub fn config(&self) -> &ProxyConfig {
@@ -117,7 +142,35 @@ impl<B: ObjectBackend> Proxy<B> {
     }
 }
 
+/// The request's Origin if CORS allows it.
+fn cors_origin(cfg: &ProxyConfig, h: &HeaderMap) -> Option<HeaderValue> {
+    let origin = h.get(header::ORIGIN)?;
+    let o = origin.to_str().ok()?;
+    cfg.cors_origins.iter().any(|a| a == "*" || a == o).then(|| origin.clone())
+}
+
+fn cors_headers(h: &mut HeaderMap, origin: HeaderValue) {
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    h.insert(header::VARY, HeaderValue::from_static("Origin"));
+    // Browser multipart uploads read the part ETag.
+    h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("ETag, x-amz-request-id, x-amz-version-id, Content-Range, Content-Length"));
+}
+
 async fn handle<B: ObjectBackend>(State(p): State<Arc<Proxy<B>>>, req: Request) -> Response {
+    let origin = cors_origin(&p.cfg, req.headers());
+    // CORS preflight: answered without authentication (browsers send no credentials).
+    if req.method() == Method::OPTIONS {
+        let Some(origin) = origin else { return S3Error::new(StatusCode::FORBIDDEN, "AccessForbidden", "CORSResponse: This CORS request is not allowed.").into_response(req.uri().path(), "0", false) };
+        let mut resp = Response::new(Body::empty());
+        *resp.status_mut() = StatusCode::OK;
+        let h = resp.headers_mut();
+        cors_headers(h, origin);
+        h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, PUT, POST, DELETE, HEAD"));
+        let asked = req.headers().get(header::ACCESS_CONTROL_REQUEST_HEADERS).cloned().unwrap_or(HeaderValue::from_static("*"));
+        h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, asked);
+        h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("3600"));
+        return resp;
+    }
     let rid = hex::encode_upper(rand::random::<[u8; 8]>());
     let is_head = req.method() == Method::HEAD;
     let resource = req.uri().path().to_string();
@@ -132,6 +185,9 @@ async fn handle<B: ObjectBackend>(State(p): State<Arc<Proxy<B>>>, req: Request) 
     let h = resp.headers_mut();
     h.insert("x-amz-request-id", HeaderValue::from_str(&rid).expect("hex"));
     h.insert(header::SERVER, HeaderValue::from_static("near-drive-s3"));
+    if let Some(o) = origin {
+        cors_headers(h, o);
+    }
     resp
 }
 
@@ -195,7 +251,7 @@ fn empty(status: StatusCode) -> Response {
     Response::builder().status(status).body(Body::empty()).expect("valid response")
 }
 
-fn map_backend(e: BackendError) -> S3Error {
+pub(crate) fn map_backend(e: BackendError) -> S3Error {
     match e {
         BackendError::NotFound => S3Error::no_such_key(),
         BackendError::RangeNotSatisfiable { .. } => {
@@ -285,7 +341,7 @@ impl<B: ObjectBackend> Proxy<B> {
         let raw_path = parts.uri.path();
         let raw_query = parts.uri.query().unwrap_or("");
         let auth = sigv4::authenticate(
-            &sigv4::Request { method: method.as_str(), raw_path, raw_query, headers: h },
+            &sigv4::Request { method: method.as_str(), raw_path, raw_query, headers: h, vhost_domains: &self.cfg.vhost_domains },
             &self.cfg.credentials,
             (now_ms() / 1000) as i64,
         )?;
@@ -304,7 +360,8 @@ impl<B: ObjectBackend> Proxy<B> {
         let path = xml::percent_decode_str(raw_path).ok_or_else(|| S3Error::new(StatusCode::BAD_REQUEST, "InvalidURI", "path is not valid UTF-8"))?;
         let host = hstr(h, "host").unwrap_or("");
         let host_name = host.rsplit_once(':').map(|(n, _)| n).unwrap_or(host);
-        let (bucket, key) = match host_name.strip_suffix(".localhost").filter(|b| !b.is_empty()) {
+        let vhost = self.cfg.vhost_domains.iter().find_map(|d| host_name.strip_suffix(&format!(".{d}")).filter(|b| !b.is_empty()));
+        let (bucket, key) = match vhost {
             Some(b) => (Some(b.to_string()), path.trim_start_matches('/').to_string()),
             None => {
                 let p = path.trim_start_matches('/');
@@ -324,7 +381,7 @@ impl<B: ObjectBackend> Proxy<B> {
         if key.is_empty() {
             return self.bucket_op(&method, &bucket, &q, payload).await;
         }
-        if validate_account_id(&bucket).is_err() {
+        if validate_account_id(&bucket).is_err() && !self.cfg.aliases.contains_key(&bucket) {
             return Err(S3Error::no_such_bucket());
         }
         self.object_op(&method, &bucket, &key, &q, h, payload, host).await
@@ -334,17 +391,23 @@ impl<B: ObjectBackend> Proxy<B> {
         self.cfg.public_prefixes.iter().any(|p| key.starts_with(p.as_str()))
     }
 
+    /// Bucket names this endpoint serves: its account, extra namespaces, aliases.
+    fn known_bucket(&self, bucket: &str) -> bool {
+        bucket == self.backend.account() || self.cfg.extra_buckets.iter().any(|b| b == bucket) || self.cfg.aliases.contains_key(bucket)
+    }
+
     fn check_key(&self, bucket: &str, key: &str) -> S3Result<()> {
         if key.ends_with(META_SUFFIX) {
             return Err(S3Error::invalid_argument(format!("keys ending in {META_SUFFIX} are reserved by the NEAR Drive S3 proxy")));
         }
-        NearUri::object(bucket, key).map_err(|e| S3Error::invalid_argument(format!("key is not a valid NEAR Drive path: {e}")))?;
+        let (ns, path) = self.backend.resolve(bucket, key);
+        NearUri::object(&ns, &path).map_err(|e| S3Error::invalid_argument(format!("key is not a valid NEAR Drive path: {e}")))?;
         Ok(())
     }
 
     fn buckets(&self) -> Vec<String> {
         let mut b = vec![self.backend.account().to_string()];
-        for x in &self.cfg.extra_buckets {
+        for x in self.cfg.extra_buckets.iter().chain(self.cfg.aliases.keys()) {
             if !b.contains(x) {
                 b.push(x.clone());
             }
@@ -396,7 +459,7 @@ impl<B: ObjectBackend> Proxy<B> {
             Method::GET => self.list_v1(bucket, q).await,
             Method::POST if q.has("delete") => self.delete_objects(bucket, &payload.data).await,
             Method::DELETE => {
-                if bucket != self.backend.account() && !self.cfg.extra_buckets.iter().any(|b| b == bucket) {
+                if !self.known_bucket(bucket) {
                     return Err(S3Error::access_denied("not your bucket"));
                 }
                 let items = self.list_items(bucket, "").await?;
@@ -428,6 +491,7 @@ impl<B: ObjectBackend> Proxy<B> {
             Method::DELETE if q.has("uploadId") => {
                 let id = q.get("uploadId").unwrap_or("");
                 self.staging.load(id, bucket, key).await?;
+                self.sessions.remove(id);
                 self.staging.abort(id).await?;
                 Ok(empty(StatusCode::NO_CONTENT))
             }
@@ -862,7 +926,21 @@ impl<B: ObjectBackend> Proxy<B> {
             user_meta: user_meta(h),
             initiated_ms: now_ms(),
         };
+        for gone in self.sessions.prune(Duration::from_secs(7 * 24 * 3600)) {
+            let _ = self.staging.abort(&gone).await;
+        }
         let id = self.staging.create(&meta).await?;
+        // Stream parts into the object as they arrive (see stream.rs).
+        let public = self.is_public(key);
+        let stored_ct = if meta.user_meta.is_empty() { meta.content_type.clone() } else { Some(format!("{}{META_MARK}", meta.content_type.as_deref().unwrap_or(""))) };
+        let sink = match self.backend.begin(bucket, key, &PutParams { public, content_type: stored_ct }) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = self.staging.abort(&id).await;
+                return Err(map_backend(e));
+            }
+        };
+        self.sessions.start(&id, sink, self.cfg.staging_dir.join(&id));
         let mut b = Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE, "application/xml");
         if let Some(a) = h.get("x-amz-checksum-algorithm") {
             b = b.header("x-amz-checksum-algorithm", a.clone());
@@ -891,13 +969,13 @@ impl<B: ObjectBackend> Proxy<B> {
                 Some(r) => Some(RangeSpec::parse(r).ok_or_else(|| S3Error::invalid_argument("bad x-amz-copy-source-range"))?),
             };
             let src = self.backend.get(&sb, &sk, range).await.map_err(map_backend)?;
-            let et = self.staging.put_part(id, n, &src.data.into_vec().await?).await?;
+            let et = self.sessions.put_part(id, n, src.data.into_vec().await?).await?;
             return Ok(xml_response(
                 StatusCode::OK,
                 format!("<CopyPartResult xmlns=\"{NS}\"><LastModified>{}</LastModified><ETag>\"{et}\"</ETag></CopyPartResult>", iso8601(now_ms())),
             ));
         }
-        let et = self.staging.put_part(id, n, &payload.data).await?;
+        let et = self.sessions.put_part(id, n, payload.data).await?;
         let mut b = Response::builder().status(StatusCode::OK).header(header::ETAG, format!("\"{et}\""));
         for (n, v) in &payload.checksums {
             b = b.header(n.as_str(), v.as_str());
@@ -915,9 +993,19 @@ impl<B: ObjectBackend> Proxy<B> {
             let et = xml::text(p, "ETag").ok_or_else(S3Error::malformed_xml)?;
             parts.push((n, et.trim_matches('"').to_string()));
         }
-        let path = self.staging.assemble(id, &parts).await?;
-        let info = self.store(bucket, key, PutSource::File(path), meta.content_type, meta.user_meta).await?;
+        let sink = self.sessions.complete(id, &parts).await?;
+        let info = sink.finish().await.map_err(map_backend);
         let _ = self.staging.abort(id).await;
+        let mut info = info?;
+        if !meta.user_meta.is_empty() {
+            let public = self.is_public(key);
+            let side = serde_json::to_vec(&MetaSidecar { for_cid: info.manifest_cid.clone(), meta: meta.user_meta }).expect("serializable");
+            self.backend
+                .put(bucket, &format!("{key}{META_SUFFIX}"), PutSource::Mem(side), &PutParams { public, content_type: Some("application/json".into()) })
+                .await
+                .map_err(map_backend)?;
+        }
+        info.content_type = meta.content_type;
         Ok(xml_response(
             StatusCode::OK,
             format!(
@@ -937,7 +1025,7 @@ impl<B: ObjectBackend> Proxy<B> {
         self.staging.load(id, bucket, key).await?;
         let marker: u32 = q.get("part-number-marker").and_then(|v| v.parse().ok()).unwrap_or(0);
         let max: usize = q.get("max-parts").and_then(|v| v.parse().ok()).unwrap_or(1000).min(1000);
-        let all: Vec<_> = self.staging.parts(id).await?.into_iter().filter(|p| p.number > marker).collect();
+        let all: Vec<_> = self.sessions.parts(id)?.into_iter().filter(|p| p.number > marker).collect();
         let truncated = all.len() > max;
         let shown = &all[..all.len().min(max)];
         let acct = escape(self.backend.account());

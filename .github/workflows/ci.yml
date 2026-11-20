@@ -45,3 +45,25 @@ jobs:
           app=$(find macos/build -name "NEARDrive.app" -type d | head -1)
           test -f "$app/Contents/PlugIns/NEARDriveFileProvider.appex/Contents/Info.plist"
           plutil -p "$app/Contents/PlugIns/NEARDriveFileProvider.appex/Contents/Info.plist" | grep -q com.apple.fileprovider-nonui
+
+  docker:
+    name: server image (build + smoke)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: near-drive:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: smoke
+        run: |
+          docker run --rm near-drive:ci near-drive-gateway --version
+          docker run --rm near-drive:ci near-drive --version
+          docker run -d --name gw -p 127.0.0.1:8787:8787 -e NEAR_DRIVE_CONFIG_JSON='{"listen":"0.0.0.0:8787","data_dir":"/data/gw"}' near-drive:ci
+          for i in $(seq 30); do curl -sf http://127.0.0.1:8787/healthz && break; sleep 1; done
+          curl -sf http://127.0.0.1:8787/healthz

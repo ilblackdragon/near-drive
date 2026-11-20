@@ -59,6 +59,8 @@ pub struct Request<'a> {
     pub raw_path: &'a str,
     pub raw_query: &'a str,
     pub headers: &'a HeaderMap,
+    /// Virtual-host domains (`<bucket>.<domain>`), for SigV2's canonical resource.
+    pub vhost_domains: &'a [String],
 }
 
 fn hmac(key: &[u8], msg: &[u8]) -> [u8; 32] {
@@ -541,7 +543,7 @@ mod v2 {
         let mut out = vec![format!("{}{suffix}", req.raw_path)];
         let host = header_str(req.headers, "host").unwrap_or("");
         let host = host.rsplit_once(':').map(|(n, _)| n).unwrap_or(host);
-        if let Some(b) = host.strip_suffix(".localhost").filter(|b| !b.is_empty()) {
+        if let Some(b) = req.vhost_domains.iter().find_map(|d| host.strip_suffix(&format!(".{d}")).filter(|b| !b.is_empty())) {
             out.push(format!("/{b}{}{suffix}", req.raw_path));
         }
         out
@@ -682,7 +684,7 @@ mod tests {
             ("x-amz-date", "20130524T000000Z"),
             ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"),
         ]);
-        let req = Request { method: "GET", raw_path: "/test.txt", raw_query: "", headers: &h };
+        let req = Request { method: "GET", raw_path: "/test.txt", raw_query: "", headers: &h, vhost_domains: &[] };
         let a = authenticate(&req, &creds(), T).unwrap();
         assert_eq!(a.payload, Payload::Sha256(EMPTY_SHA256.into()));
         // wrong secret
@@ -695,7 +697,7 @@ mod tests {
         assert_eq!(authenticate(&req, &creds(), T + 16 * 60).unwrap_err().code, "RequestTimeTooSkewed");
         assert!(authenticate(&req, &creds(), T + 14 * 60).is_ok());
         // tampered path
-        let req = Request { method: "GET", raw_path: "/test2.txt", raw_query: "", headers: &h };
+        let req = Request { method: "GET", raw_path: "/test2.txt", raw_query: "", headers: &h, vhost_domains: &[] };
         assert_eq!(authenticate(&req, &creds(), T).unwrap_err().code, "SignatureDoesNotMatch");
     }
 
@@ -704,7 +706,7 @@ mod tests {
     fn aws_example_presigned() {
         let h = hm(&[("host", "examplebucket.s3.amazonaws.com")]);
         let q = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404";
-        let req = Request { method: "GET", raw_path: "/test.txt", raw_query: q, headers: &h };
+        let req = Request { method: "GET", raw_path: "/test.txt", raw_query: q, headers: &h, vhost_domains: &[] };
         let a = authenticate(&req, &creds(), T + 100).unwrap();
         assert!(a.presigned);
         assert_eq!(authenticate(&req, &creds(), T + 86_401).unwrap_err().message, "Request has expired");
@@ -724,7 +726,7 @@ mod tests {
             ("content-length", "66824"),
             ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,SignedHeaders=content-encoding;content-length;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-storage-class,Signature=4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9"),
         ]);
-        let req = Request { method: "PUT", raw_path: "/examplebucket/chunkObject.txt", raw_query: "", headers: &h };
+        let req = Request { method: "PUT", raw_path: "/examplebucket/chunkObject.txt", raw_query: "", headers: &h, vhost_domains: &[] };
         let a = authenticate(&req, &creds(), T).unwrap();
         let data = vec![b'a'; 66560];
         let body = client::chunked_signed(&creds(), "20130524T000000Z", "us-east-1", seed, &data, 65536);
@@ -746,10 +748,10 @@ mod tests {
     fn sigv2_presigned() {
         let h = hm(&[("host", "s3.amazonaws.com")]);
         let q = "AWSAccessKeyId=AKIAIOSFODNN7EXAMPLE&Expires=1175139620&Signature=NpgCjnDzrM%2BWFzoENXmpNDUsSn8%3D";
-        let req = Request { method: "GET", raw_path: "/johnsmith/photos/puppy.jpg", raw_query: q, headers: &h };
+        let req = Request { method: "GET", raw_path: "/johnsmith/photos/puppy.jpg", raw_query: q, headers: &h, vhost_domains: &[] };
         assert!(authenticate(&req, &creds(), 1_175_139_000).is_ok());
         assert_eq!(authenticate(&req, &creds(), 1_175_139_621).unwrap_err().message, "Request has expired");
-        let req = Request { method: "GET", raw_path: "/johnsmith/photos/kitten.jpg", raw_query: q, headers: &h };
+        let req = Request { method: "GET", raw_path: "/johnsmith/photos/kitten.jpg", raw_query: q, headers: &h, vhost_domains: &[] };
         assert_eq!(authenticate(&req, &creds(), 1_175_139_000).unwrap_err().code, "SignatureDoesNotMatch");
     }
 

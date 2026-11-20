@@ -99,6 +99,9 @@ Scripts (after `cargo build`):
   drive ...` as an extension, `logout`. Needs `near` and `contracts/build.sh`.
 - `tests/interactive_smoke.py` (pexpect): menus and pickers, put/get/rm, bare paths, `up`/`down` with boto3, folder
   sync through the background service, no prompts without a terminal.
+- `tests/deltaleague_compat.sh`: deltaleague's storage patterns (boto3 upload_file / upload_fileobj from a pipe,
+  presigned GET via httpx without redirects, presigned PUT, CORS, ranges) against the S3 endpoint configured like a
+  service (env keys, bucket aliases);
 - `tests/boto3_smoke.sh`: dev gateway + S3 endpoint driven by boto3 (`PYTHON=` picks the install, `AWS_CLI=` also
   tests `aws s3 cp`).
 - `testvectors/interop.sh`: Rust, TypeScript and Python read each other's objects.
